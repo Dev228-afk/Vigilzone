@@ -34,9 +34,11 @@ class Membership(TimeStamped):
     tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="memberships")
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="memberships")
     role = models.CharField(max_length=20, choices=Role.choices, default=Role.MEMBER)
-
     class Meta:
         unique_together = [("tenant", "user")]
+    
+    def __str__(self):
+        return f"{self.user.username} @ {self.tenant.name} ({self.role})"
 
 class Camera(TimeStamped):
     class Status(models.TextChoices):
