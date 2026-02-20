@@ -1,0 +1,491 @@
+"""
+Alert aggregator – combines K-of-N voting + cooldown + deduper + temporal verifier.
+
+Entity-aware workflow (runtime):
+  1. Detector produces persons/animals + track_id.
+  2. Identity lane tries face/pet crop → embedding.
+  3. IdentityMatcher compares against enrolled vectors (cosine sim).
+  4. IdentityStabilizer converts noisy matches into stable identity
+     per track_id (M-of-L voting + lock + decay).
+  5. Aggregator (this module) consumes identity for severity/suppression:
+       UNKNOWN_PERSON in restricted zone → HIGH
+       KNOWN_OWNER/FAMILY              → LOW/suppress (policy-driven)
+       PET (enrolled)                  → suppress pet alerts
+  6. Alert JSON includes entity{...} and debug identity stats.
+
+Key policies (spec §1-§3):
+  • FIRE_SMOKE uses TWO-STAGE confirm:
+      Stage A: fire_smoke_yolo K-of-N (3/5)
+      Stage B: one of:
+        (a) AnomalyCLIP/AnyAnomaly score ≥ fire_secondary_threshold, OR
+        (b) temporal verifier confirms fire-like behaviour, OR
+        (c) persistence rule: hits ≥ 4 of 5 (stronger K-of-N) if no secondary.
+  • VIOLENCE_FIGHT requires candidate (2/5) + temporal verifier confirm.
+  • FALL requires candidate (2/5) + temporal verifier confirm.
+  • WEAPON_DETECTED: direct K-of-N from weapon_yolo lane.
+"""
+import json
+from pathlib import Path
+from typing import Dict, List, Optional, Callable, Any
+from collections import defaultdict
+from ..common.types import Observation, Alert
+from ..common.timeutil import now_iso_utc
+from ..common.log import setup_logger
+from .voting import KofNVoter
+from .cooldown import CooldownManager
+from .deduper import Deduper
+
+# Identity imports (optional — graceful if missing)
+try:
+    from ..identity.schema import IdentityMatch, EntityCategory
+    from ..identity.policy import IdentityPolicy, PolicyDecision
+    from ..identity.matcher import IdentityMatcher
+    from ..identity.store import EntityStore
+    _IDENTITY_AVAILABLE = True
+except ImportError:
+    _IDENTITY_AVAILABLE = False
+
+
+# Lane → alert type mapping
+LANE_TO_ALERT_TYPE = {
+    "rt_detr": None,              # dynamic — depends on label
+    "yolov8_fallback": None,      # dynamic
+    "person_zone": "INTRUSION_PERSON_IN_ZONE",
+    "fire_smoke": "FIRE_SMOKE",
+    "fire_smoke_yolo": "FIRE_SMOKE",
+    "violence": "VIOLENCE_FIGHT",
+    "violence_candidate": "VIOLENCE_FIGHT",
+    "fall_candidate": "FALL",
+    "weapon_yolo": "WEAPON_DETECTED",
+    "vad_generic": "UNKNOWN_SEVERE_ANOMALY",
+    "anyanomaly": "UNKNOWN_SEVERE_ANOMALY",
+    "anomalyclip": "UNKNOWN_SEVERE_ANOMALY",
+    "temporal_verifier": None,     # never fires directly
+}
+
+# Label → alert type for dynamic lanes
+LABEL_TO_ALERT_TYPE = {
+    "person": "INTRUSION_PERSON_IN_ZONE",
+    "fire": "FIRE_SMOKE",
+    "smoke": "FIRE_SMOKE",
+    "fire_smoke": "FIRE_SMOKE",
+    "weapon": "WEAPON_DETECTED",
+    "knife": "WEAPON_DETECTED",
+    "gun": "WEAPON_DETECTED",
+    "violence": "VIOLENCE_FIGHT",
+    "violence_candidate": "VIOLENCE_FIGHT",
+    "fall": "FALL",
+    "fall_candidate": "FALL",
+    "unknown_anomaly": "UNKNOWN_SEVERE_ANOMALY",
+    "anomaly": "UNKNOWN_SEVERE_ANOMALY",
+}
+
+# Alert type → severity
+ALERT_SEVERITY = {
+    "FIRE_SMOKE": "SEVERE",
+    "VIOLENCE_FIGHT": "SEVERE",
+    "FALL": "SEVERE",
+    "WEAPON_DETECTED": "SEVERE",
+    "INTRUSION_PERSON_IN_ZONE": "HIGH",
+    "UNKNOWN_SEVERE_ANOMALY": "HIGH",
+}
+
+
+class AlertAggregator:
+    """
+    Aggregates observations into confirmed alerts using K-of-N voting,
+    cooldown, session deduplication, and optional temporal verifier.
+    """
+
+    def __init__(self, k: int = 3, n: int = 5, cooldown_s: int = 45,
+                 alerts_dir: str = "alerts",
+                 fire_secondary_threshold: float = 0.55):
+        self.k = k
+        self.n = n
+        self.cooldown_s = cooldown_s
+        self.alerts_dir = Path(alerts_dir)
+        self.alerts_dir.mkdir(parents=True, exist_ok=True)
+
+        # Fire two-stage threshold
+        self.fire_secondary_threshold = fire_secondary_threshold
+
+        # Per camera, per lane voters
+        self.voters: Dict[tuple, KofNVoter] = defaultdict(
+            lambda: KofNVoter(k=self.k, n=self.n)
+        )
+
+        # Cooldown & deduper
+        self.cooldown_mgr = CooldownManager(default_cooldown_s=cooldown_s)
+        self.deduper = Deduper(session_window_s=float(cooldown_s))
+
+        # Real-time callbacks
+        self.alert_callbacks: List[Callable[[Alert], None]] = []
+
+        # In-memory buffer
+        self.alert_buffer: List[Alert] = []
+        self.max_buffer_size = 200
+
+        # Lane vote accumulator per (camera, alert_type) for enriching payload
+        self._lane_votes: Dict[tuple, List[Dict[str, Any]]] = defaultdict(list)
+
+        # Secondary signal cache: (camera_id) → latest AnomalyCLIP / AnyAnomaly score
+        self._secondary_scores: Dict[str, float] = defaultdict(float)
+
+        # Temporal verifier reference (set externally)
+        self.temporal_verifier = None  # type: ignore
+
+        # AnomalyCLIP / AnyAnomaly lane reference for fire two-stage
+        self._anomaly_lanes = {"anomalyclip", "anyanomaly"}
+
+        # ── Identity subsystem (§8-§9) ────────────────────────────────
+        self._identity_enabled = False
+        self._identity_policy = None      # IdentityPolicy
+        self._identity_store = None       # EntityStore
+        # Per-camera latest identity observations: cam_id → {track_id → identity_dict}
+        self._identity_cache: Dict[str, Dict[int, Dict[str, Any]]] = defaultdict(dict)
+
+        self.logger = setup_logger("AlertAggregator")
+        self.alerts_log = self.alerts_dir / "alerts.jsonl"
+
+    # ------------------------------------------------------------------
+    def set_temporal_verifier(self, verifier):
+        """Attach temporal verifier lane for on-demand clip verification."""
+        self.temporal_verifier = verifier
+
+    def set_fire_secondary_threshold(self, threshold: float):
+        self.fire_secondary_threshold = threshold
+
+    def add_alert_callback(self, callback: Callable[[Alert], None]):
+        self.alert_callbacks.append(callback)
+
+    def set_identity(self, policy, store):
+        """Wire identity policy + store into the aggregator."""
+        self._identity_policy = policy
+        self._identity_store = store
+        self._identity_enabled = policy is not None
+        self.logger.info(f"Identity subsystem {'enabled' if self._identity_enabled else 'disabled'}")
+
+    # ------------------------------------------------------------------
+    def _resolve_alert_type(self, obs: Observation) -> str:
+        """Determine alert type from lane + label."""
+        static = LANE_TO_ALERT_TYPE.get(obs.lane)
+        if static is not None:
+            return static
+        # Dynamic: look at label
+        if obs.label:
+            return LABEL_TO_ALERT_TYPE.get(obs.label, "UNKNOWN_SEVERE_ANOMALY")
+        return "UNKNOWN_SEVERE_ANOMALY"
+
+    # ------------------------------------------------------------------
+    def _track_secondary_signal(self, obs: Observation):
+        """Cache recent anomaly scores from AnomalyCLIP / AnyAnomaly for fire two-stage."""
+        if obs.lane in self._anomaly_lanes and obs.score > 0:
+            self._secondary_scores[obs.camera_id] = max(
+                self._secondary_scores.get(obs.camera_id, 0),
+                obs.score,
+            )
+
+    # ------------------------------------------------------------------
+    def _fire_two_stage_check(self, obs: Observation, hits: int, ringbuffer=None) -> Dict[str, Any]:
+        """
+        FIRE_SMOKE two-stage confirmation (spec §1).
+
+        Stage A: fire_smoke_yolo K-of-N passed (caller already verified).
+        Stage B: one of:
+          (a) AnomalyCLIP/AnyAnomaly >= fire_secondary_threshold
+          (b) temporal verifier confirms (optional)
+          (c) persistence: hits >= 4 of 5
+
+        Returns {"confirmed": bool, "reason": str, "secondary_score": float|None}
+        """
+        # Check persistence-based info from the fire lane's debug
+        persistence_hits = 0
+        min_persistence = 2
+        if obs.debug:
+            persistence_hits = obs.debug.get("persistence_hits", 0)
+            min_persistence = obs.debug.get("min_persistence_required", 2)
+
+        # Persistence gate: need at least min_persistence_hits within window
+        if persistence_hits < min_persistence:
+            return {
+                "confirmed": False,
+                "reason": f"persistence_too_low ({persistence_hits}<{min_persistence})",
+                "secondary_score": None,
+            }
+
+        # --- Stage B checks ---
+        secondary_score = self._secondary_scores.get(obs.camera_id, 0.0)
+
+        # (a) Secondary anomaly signal
+        if secondary_score >= self.fire_secondary_threshold:
+            return {
+                "confirmed": True,
+                "reason": f"secondary_anomaly ({secondary_score:.2f}>={self.fire_secondary_threshold})",
+                "secondary_score": secondary_score,
+            }
+
+        # (b) Temporal verifier
+        if self.temporal_verifier is not None and ringbuffer is not None:
+            try:
+                frames = ringbuffer.get_frames_before(obs.ts_utc, seconds=4.0)
+                if frames:
+                    tv_result = self.temporal_verifier.verify_clip(frames, target_label="fire")
+                    if tv_result.get("confirmed", False):
+                        return {
+                            "confirmed": True,
+                            "reason": f"temporal_verified (score={tv_result.get('score', 0):.2f})",
+                            "secondary_score": secondary_score,
+                        }
+            except Exception as e:
+                self.logger.error(f"Fire temporal verify error: {e}")
+
+        # (c) Strong persistence: hits >= 4 of 5
+        if hits >= 4:
+            return {
+                "confirmed": True,
+                "reason": f"strong_persistence ({hits}/5>=4)",
+                "secondary_score": secondary_score,
+            }
+
+        return {
+            "confirmed": False,
+            "reason": f"no_secondary_confirmation (sec={secondary_score:.2f}, hits={hits}/5)",
+            "secondary_score": secondary_score,
+        }
+
+    # ------------------------------------------------------------------
+    def process_observation(
+        self,
+        obs: Observation,
+        evidence_request_callback: Optional[Callable] = None,
+        ringbuffer=None,
+    ) -> Optional[Alert]:
+        """
+        Process an observation through K-of-N → cooldown → deduper → (two-stage / temporal) → fire.
+        Identity-lane observations are cached rather than alert-producing.
+        """
+        # Track secondary anomaly signals for fire two-stage
+        self._track_secondary_signal(obs)
+
+        # ── Identity lane: cache identities, do NOT produce alerts ────
+        if obs.lane == "entity_identity":
+            self._cache_identity_observation(obs)
+            return None
+
+        key = (obs.camera_id, obs.lane)
+        voter = self.voters[key]
+        confirmed, hits = voter.vote(obs.trigger)
+
+        # Accumulate lane votes for payload
+        alert_type = self._resolve_alert_type(obs)
+        vote_key = (obs.camera_id, alert_type)
+        self._lane_votes[vote_key].append({
+            "lane": obs.lane,
+            "score": round(obs.score, 3),
+            "trigger": obs.trigger,
+        })
+        # Keep only last N*2 votes
+        if len(self._lane_votes[vote_key]) > self.n * 2:
+            self._lane_votes[vote_key] = self._lane_votes[vote_key][-self.n * 2:]
+
+        if not confirmed:
+            return None
+
+        # ---- FIRE_SMOKE: two-stage confirm ----
+        fire_stage_b = None
+        if alert_type == "FIRE_SMOKE":
+            fire_stage_b = self._fire_two_stage_check(obs, hits, ringbuffer)
+            if not fire_stage_b["confirmed"]:
+                self.logger.debug(
+                    f"FIRE_SMOKE K-of-N passed but two-stage REJECTED: {fire_stage_b['reason']}"
+                )
+                return None
+
+        # Cooldown check
+        if not self.cooldown_mgr.can_fire(obs.camera_id, alert_type, obs.ts_utc):
+            return None
+
+        self.logger.info(f"🚨 ALERT CONFIRMED: {alert_type} camera={obs.camera_id}")
+
+        # Mark cooldown
+        self.cooldown_mgr.mark_fired(obs.camera_id, alert_type, obs.ts_utc)
+
+        # Session deduplication
+        session_id = self.deduper.get_session_id(
+            obs.camera_id,
+            obs.label or alert_type,
+            obs.ts_utc,
+            obs.track_id,
+        )
+
+        # Optional temporal verification for VIOLENCE / FALL
+        temporal_result = {"confirmed": None, "score": None}
+        if (
+            alert_type in ("VIOLENCE_FIGHT", "FALL")
+            and self.temporal_verifier is not None
+            and ringbuffer is not None
+        ):
+            try:
+                frames = ringbuffer.get_frames_before(obs.ts_utc, seconds=5.0)
+                target = "fall" if alert_type == "FALL" else "violence"
+                temporal_result = self.temporal_verifier.verify_clip(frames, target_label=target)
+            except Exception as e:
+                self.logger.error(f"Temporal verify error: {e}")
+
+        # Evidence export
+        evidence_paths = {"keyframe_path": "", "clip_path": "", "partial_clip": False}
+        if evidence_request_callback:
+            try:
+                evidence_paths = evidence_request_callback(obs.camera_id, alert_type, obs.ts_utc)
+            except Exception as e:
+                self.logger.error(f"Evidence request failed: {e}")
+
+        # Gather lane_votes for payload
+        lane_votes = self._lane_votes.get(vote_key, [])[-self.n:]
+
+        # Weighted confidence average
+        scores = [v["score"] for v in lane_votes if v["trigger"]]
+        avg_conf = sum(scores) / max(len(scores), 1)
+
+        # Build debug info
+        debug_info = dict(obs.debug or {})
+        if fire_stage_b:
+            debug_info["fire_two_stage"] = fire_stage_b
+
+        # ── Resolve entity identity for this alert ────────────────────
+        entity_dict = {"id": None, "name": None, "category": None, "confidence": 0.0}
+        identity_evidence = {}
+        identity_match = None
+        if self._identity_enabled and obs.track_id is not None:
+            identity_match = self._lookup_identity(obs.camera_id, obs.track_id)
+            if identity_match is not None:
+                entity_dict = {
+                    "id": identity_match.get("entity_id"),
+                    "name": identity_match.get("name"),
+                    "category": identity_match.get("category"),
+                    "confidence": identity_match.get("confidence", 0.0),
+                }
+                # §6.1 — identity evidence in alert payload
+                identity_evidence = {
+                    "best_sim": identity_match.get("best_sim", 0.0),
+                    "second_sim": identity_match.get("second_sim", 0.0),
+                    "margin": identity_match.get("margin", 0.0),
+                    "quality_ok": identity_match.get("quality_ok", True),
+                    "locked": identity_match.get("locked", False),
+                }
+
+        if identity_evidence:
+            debug_info["identity"] = identity_evidence
+
+        # ── Apply identity policy (severity override / suppression) ───
+        base_severity = ALERT_SEVERITY.get(alert_type, "HIGH")
+        if self._identity_enabled and self._identity_policy is not None and _IDENTITY_AVAILABLE:
+            id_match_obj = None
+            if identity_match is not None:
+                id_match_obj = IdentityMatch(
+                    entity_id=identity_match.get("entity_id"),
+                    name=identity_match.get("name"),
+                    category=identity_match.get("category", "UNKNOWN_PERSON"),
+                    confidence=identity_match.get("confidence", 0.0),
+                    score=identity_match.get("score", 0.0),
+                )
+            zone_name = obs.zone_name
+            is_restricted = bool(zone_name)  # any zone is treated as restricted for MVP
+            policy_decision = self._identity_policy.apply(
+                alert_type, id_match_obj, zone_name, is_restricted,
+            )
+            if policy_decision.suppress:
+                self.logger.info(
+                    f"Alert SUPPRESSED by identity policy: {policy_decision.reason}"
+                )
+                debug_info["identity_policy"] = {
+                    "action": "suppressed",
+                    "reason": policy_decision.reason,
+                }
+                return None
+            if policy_decision.severity is not None:
+                base_severity = policy_decision.severity
+                debug_info["identity_policy"] = {
+                    "action": "severity_override",
+                    "severity": policy_decision.severity,
+                    "reason": policy_decision.reason,
+                }
+
+        alert = Alert(
+            ts_utc=obs.ts_utc,
+            camera_id=obs.camera_id,
+            type=alert_type,
+            label=obs.label or "",
+            severity=base_severity,
+            confidence=round(avg_conf, 3),
+            k_of_n={"k": self.k, "n": self.n, "hits": hits},
+            session_id=session_id,
+            cooldown_s=self.cooldown_s,
+            evidence=evidence_paths,
+            payload={
+                "bboxes": [obs.bbox] if obs.bbox else [],
+                "zone_name": obs.zone_name,
+                "track_id": obs.track_id,
+                "lane_votes": lane_votes,
+                "temporal_verifier": temporal_result,
+            },
+            entity=entity_dict,
+            debug=debug_info,
+        )
+
+        # Persist + buffer
+        self._write_alert_jsonl(alert)
+        self.alert_buffer.append(alert)
+        if len(self.alert_buffer) > self.max_buffer_size:
+            self.alert_buffer = self.alert_buffer[-self.max_buffer_size:]
+
+        # Reset secondary score cache after fire alert (to not reuse stale scores)
+        if alert_type == "FIRE_SMOKE":
+            self._secondary_scores[obs.camera_id] = 0.0
+
+        # Callbacks
+        for cb in self.alert_callbacks:
+            try:
+                cb(alert)
+            except Exception as e:
+                self.logger.error(f"Alert callback error: {e}")
+
+        return alert
+
+    # ------------------------------------------------------------------
+    def _write_alert_jsonl(self, alert: Alert):
+        try:
+            with open(self.alerts_log, "a") as f:
+                f.write(json.dumps(alert.to_dict()) + "\n")
+        except Exception as e:
+            self.logger.error(f"JSONL write error: {e}")
+
+    def get_recent_alerts(self, limit: int = 200) -> List[Dict]:
+        return [a.to_dict() for a in self.alert_buffer[-limit:]]
+
+    # ------------------------------------------------------------------
+    # Identity helpers
+    # ------------------------------------------------------------------
+    def _cache_identity_observation(self, obs: Observation):
+        """
+        Cache identity results from the entity_identity lane.
+        obs.debug["identities"] is a list of dicts with keys:
+          entity_id, name, category, confidence, score, track_id, bbox
+        """
+        identities = (obs.debug or {}).get("identities", [])
+        cam_cache = self._identity_cache[obs.camera_id]
+        for ident in identities:
+            tid = ident.get("track_id")
+            if tid is not None:
+                cam_cache[tid] = ident
+        # Evict stale entries (keep last 50)
+        if len(cam_cache) > 50:
+            keys = list(cam_cache.keys())
+            for k in keys[:-50]:
+                del cam_cache[k]
+
+    def _lookup_identity(self, camera_id: str, track_id: int) -> Optional[Dict[str, Any]]:
+        """Look up cached identity for a track_id from the entity_identity lane."""
+        cam_cache = self._identity_cache.get(camera_id, {})
+        return cam_cache.get(track_id)
+
