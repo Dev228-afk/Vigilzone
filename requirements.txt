@@ -1,0 +1,46 @@
+# CCTV AI Module (VigilZone) - Requirements
+
+# Core frameworks
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+pydantic>=2.5.3
+
+# Configuration
+pyyaml>=6.0.1
+
+# Computer Vision
+opencv-python>=4.9.0.80
+numpy>=1.24.3
+
+# Deep Learning
+ultralytics>=8.1.20
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Model auto-download
+huggingface_hub>=0.20.0
+
+# Temporal verifier (TorchHub X3D-S)
+pytorchvideo>=0.1.5
+fvcore>=0.1.5
+
+# ONNX Runtime (CPU fallback; install onnxruntime-gpu for GPU)
+onnxruntime>=1.17.0
+# onnxruntime-gpu>=1.17.0   # uncomment for NVIDIA GPU acceleration
+
+# TensorRT (optional, for RT-DETR TRT engine)
+# tensorrt>=8.6               # install from NVIDIA if available
+
+# Video processing (optional, for advanced ffmpeg support)
+# av>=11.0.0
+
+# Utilities
+python-multipart>=0.0.6
+tqdm>=4.66.1
+websockets>=12.0
+
+# Note: Install PyTorch separately for your platform:
+# CPU:      pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+# CUDA 11.8: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+# CUDA 12.1: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# CUDA 12.1: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121

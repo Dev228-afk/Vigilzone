@@ -1,0 +1,23 @@
+# Zone Configuration
+# Define restricted/monitored zones per camera using polygon coordinates
+
+zones:
+  cam1:
+    - name: restricted_1
+      type: restricted
+      points: [[100, 100], [500, 100], [500, 400], [100, 400]]
+    
+    - name: entrance_zone
+      type: restricted
+      points: [[50, 300], [250, 300], [250, 480], [50, 480]]
+
+  test_cam:
+    - name: test_zone
+      type: restricted
+      points: [[200, 150], [600, 150], [600, 450], [200, 450]]
+
+  # Additional zones for other cameras
+  # cam2:
+  #   - name: parking_area
+  #     type: restricted
+  #     points: [[0, 0], [640, 0], [640, 480], [0, 480]]
