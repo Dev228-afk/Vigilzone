@@ -94,12 +94,22 @@ class IdentityPolicy:
 
         # ── Person rules ──────────────────────────────────────────────
         if cat == EntityCategory.KNOWN_PERSON:
-            # §FIX: For intrusion alerts, suppress ALL known persons regardless
-            # of role.  The user enrolled them, so they are authorized.
-            if alert_type == "INTRUSION_PERSON_IN_ZONE":
+            entity = self._get_entity_dict(identity)
+            role = entity.get("role", "") if entity else (identity.name or "")
+            # Use role from identity match context — fallback to entity_id lookup via store
+            # For MVP, role is tracked in the entity record, which the aggregator passes
+            # via the identity object.  Here we just check the category + suppress_roles.
+
+            if alert_type == "INTRUSION_PERSON_IN_ZONE" and is_restricted_zone:
+                # Check if role should suppress
+                if role in self._suppress_roles:
+                    return PolicyDecision(
+                        severity=None, suppress=True,
+                        reason=f"known_{role}_in_restricted_zone_suppressed",
+                    )
                 return PolicyDecision(
-                    severity=None, suppress=True,
-                    reason=f"known_person_suppressed_intrusion",
+                    severity=self._known_family_severity, suppress=False,
+                    reason=f"known_person_in_restricted_zone_severity_{self._known_family_severity}",
                 )
 
             # Known person but not in restricted zone → no override
