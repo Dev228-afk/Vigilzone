@@ -1,5 +1,0 @@
-h5py
-fastprogress
-scikit-learn
-openai-clip
-opencv-python==4.10.0.84
