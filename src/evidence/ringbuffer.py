@@ -91,3 +91,29 @@ class FrameRingBuffer:
         """Get current buffer size"""
         with self._lock:
             return len(self.buffer)
+
+    def get_raw_frames_before(self, ts_utc: str, seconds: float = 8.0,
+                              max_frames: int = 16) -> List[np.ndarray]:
+        """
+        §B4: Get decoded BGR frames (raw np.ndarray) from the ring buffer.
+        Decodes JPEG→BGR for temporal verifier which needs raw frames.
+
+        Args:
+            ts_utc: Reference timestamp
+            seconds: How many seconds before to retrieve
+            max_frames: Maximum number of frames to return
+        Returns:
+            List of BGR np.ndarray frames (newest last)
+        """
+        from ..common.timeutil import timestamp_diff_seconds
+
+        with self._lock:
+            result = []
+            for frame_ts, jpeg_data in self.buffer:
+                diff = timestamp_diff_seconds(frame_ts, ts_utc)
+                if -seconds <= diff <= 0:
+                    img = cv2.imdecode(np.frombuffer(jpeg_data, np.uint8), cv2.IMREAD_COLOR)
+                    if img is not None:
+                        result.append(img)
+            # Return last max_frames
+            return result[-max_frames:] if len(result) > max_frames else result

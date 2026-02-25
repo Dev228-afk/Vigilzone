@@ -25,6 +25,7 @@ Key policies (spec §1-§3):
   • WEAPON_DETECTED: direct K-of-N from weapon_yolo lane.
 """
 import json
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Callable, Any
 from collections import defaultdict
@@ -131,6 +132,11 @@ class AlertAggregator:
         # Secondary signal cache: (camera_id) → latest AnomalyCLIP / AnyAnomaly score
         self._secondary_scores: Dict[str, float] = defaultdict(float)
 
+        # §4.1 — recent detector observations for explainable motion suppression
+        # camera_id → list of recent {ts, label, track_id, identity_category}
+        self._recent_detections: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        self._recent_detections_max = 50
+
         # Temporal verifier reference (set externally)
         self.temporal_verifier = None  # type: ignore
 
@@ -143,6 +149,13 @@ class AlertAggregator:
         self._identity_store = None       # EntityStore
         # Per-camera latest identity observations: cam_id → {track_id → identity_dict}
         self._identity_cache: Dict[str, Dict[int, Dict[str, Any]]] = defaultdict(dict)
+
+        # §4.3 — zone-aware anomaly: cameras with configured zones
+        self._zone_cameras: set = set()  # camera_ids that have zones configured
+
+        # §C5 — debug counters for tuning + diagnostics
+        self._suppression_counters: Dict[str, int] = defaultdict(int)
+        self._last_motion_stats: Dict[str, Dict[str, Any]] = {}  # per camera
 
         self.logger = setup_logger("AlertAggregator")
         self.alerts_log = self.alerts_dir / "alerts.jsonl"
@@ -165,6 +178,12 @@ class AlertAggregator:
         self._identity_enabled = policy is not None
         self.logger.info(f"Identity subsystem {'enabled' if self._identity_enabled else 'disabled'}")
 
+    def set_zone_cameras(self, zones_cfg: Dict[str, Any]):
+        """§4.3 — Record which cameras have zones configured."""
+        for cam_id, zones in zones_cfg.items():
+            if zones:
+                self._zone_cameras.add(cam_id)
+
     # ------------------------------------------------------------------
     def _resolve_alert_type(self, obs: Observation) -> str:
         """Determine alert type from lane + label."""
@@ -184,6 +203,15 @@ class AlertAggregator:
                 self._secondary_scores.get(obs.camera_id, 0),
                 obs.score,
             )
+        # §C5: Track motion stats from anomalyclip for diagnostics
+        if obs.lane == "anomalyclip" and obs.debug:
+            self._last_motion_stats[obs.camera_id] = {
+                "score": obs.score,
+                "motion_area_ratio": obs.debug.get("motion_area_ratio", 0),
+                "persistence_hits": obs.debug.get("persistence_hits", 0),
+                "persistence_window": obs.debug.get("persistence_window", 0),
+                "suppress_reason": obs.debug.get("suppress_reason"),
+            }
 
     # ------------------------------------------------------------------
     def _fire_two_stage_check(self, obs: Observation, hits: int, ringbuffer=None) -> Dict[str, Any]:
@@ -227,9 +255,9 @@ class AlertAggregator:
         # (b) Temporal verifier
         if self.temporal_verifier is not None and ringbuffer is not None:
             try:
-                frames = ringbuffer.get_frames_before(obs.ts_utc, seconds=4.0)
-                if frames:
-                    tv_result = self.temporal_verifier.verify_clip(frames, target_label="fire")
+                raw_frames = ringbuffer.get_raw_frames_before(obs.ts_utc, seconds=4.0, max_frames=16)
+                if raw_frames:
+                    tv_result = self.temporal_verifier.verify_clip(raw_frames, target_label="fire")
                     if tv_result.get("confirmed", False):
                         return {
                             "confirmed": True,
@@ -267,6 +295,9 @@ class AlertAggregator:
         # Track secondary anomaly signals for fire two-stage
         self._track_secondary_signal(obs)
 
+        # §4.1 — track detector observations for explainable motion suppression
+        self._track_detector_observation(obs)
+
         # ── Identity lane: cache identities, do NOT produce alerts ────
         if obs.lane == "entity_identity":
             self._cache_identity_observation(obs)
@@ -301,6 +332,16 @@ class AlertAggregator:
                 )
                 return None
 
+        # §4.1 — Explainable motion suppression for UNKNOWN_SEVERE_ANOMALY
+        if alert_type == "UNKNOWN_SEVERE_ANOMALY":
+            suppress_reason = self._should_suppress_unknown_anomaly(obs)
+            if suppress_reason:
+                self._suppression_counters[suppress_reason] += 1
+                self.logger.debug(
+                    f"UNKNOWN_SEVERE_ANOMALY suppressed: {suppress_reason}"
+                )
+                return None
+
         # Cooldown check
         if not self.cooldown_mgr.can_fire(obs.camera_id, alert_type, obs.ts_utc):
             return None
@@ -326,9 +367,9 @@ class AlertAggregator:
             and ringbuffer is not None
         ):
             try:
-                frames = ringbuffer.get_frames_before(obs.ts_utc, seconds=5.0)
+                raw_frames = ringbuffer.get_raw_frames_before(obs.ts_utc, seconds=5.0, max_frames=16)
                 target = "fall" if alert_type == "FALL" else "violence"
-                temporal_result = self.temporal_verifier.verify_clip(frames, target_label=target)
+                temporal_result = self.temporal_verifier.verify_clip(raw_frames, target_label=target)
             except Exception as e:
                 self.logger.error(f"Temporal verify error: {e}")
 
@@ -356,8 +397,14 @@ class AlertAggregator:
         entity_dict = {"id": None, "name": None, "category": None, "confidence": 0.0}
         identity_evidence = {}
         identity_match = None
-        if self._identity_enabled and obs.track_id is not None:
-            identity_match = self._lookup_identity(obs.camera_id, obs.track_id)
+        if self._identity_enabled:
+            # For INTRUSION alerts, person_zone and entity_identity lanes use
+            # different trackers, so track_id won't match.  Check camera-level
+            # identity cache instead.
+            if alert_type == "INTRUSION_PERSON_IN_ZONE":
+                identity_match = self._any_known_entity_on_camera(obs.camera_id)
+            elif obs.track_id is not None:
+                identity_match = self._lookup_identity(obs.camera_id, obs.track_id)
             if identity_match is not None:
                 entity_dict = {
                     "id": identity_match.get("entity_id"),
@@ -395,6 +442,7 @@ class AlertAggregator:
                 alert_type, id_match_obj, zone_name, is_restricted,
             )
             if policy_decision.suppress:
+                self._suppression_counters[f"identity_policy:{policy_decision.reason}"] += 1
                 self.logger.info(
                     f"Alert SUPPRESSED by identity policy: {policy_decision.reason}"
                 )
@@ -464,6 +512,103 @@ class AlertAggregator:
         return [a.to_dict() for a in self.alert_buffer[-limit:]]
 
     # ------------------------------------------------------------------
+    # §C5 — Diagnostics data for /system/diagnostics
+    # ------------------------------------------------------------------
+    def get_diagnostics(self) -> Dict[str, Any]:
+        """Return suppression counters, motion stats, temporal verifier stats."""
+        tv_stats = {}
+        if self.temporal_verifier is not None and hasattr(self.temporal_verifier, "get_last_run_stats"):
+            tv_stats = self.temporal_verifier.get_last_run_stats()
+
+        return {
+            "suppression_counters": dict(self._suppression_counters),
+            "motion_stats": dict(self._last_motion_stats),
+            "temporal_verifier_stats": tv_stats,
+        }
+
+    # ------------------------------------------------------------------
+    # §4.1 — Explainable motion suppression helpers
+    # ------------------------------------------------------------------
+    def _track_detector_observation(self, obs: Observation):
+        """Cache recent detector observations for motion-explainability check."""
+        detector_lanes = {"rt_detr", "yolov8_fallback", "person_zone"}
+        if obs.lane not in detector_lanes:
+            return
+        if not obs.trigger:
+            return
+
+        # Resolve identity for this detection if available
+        identity_category = None
+        if obs.track_id is not None:
+            ident = self._lookup_identity(obs.camera_id, obs.track_id)
+            if ident:
+                identity_category = ident.get("category")
+
+        entry = {
+            "ts": obs.ts_utc,
+            "label": obs.label,
+            "track_id": obs.track_id,
+            "identity_category": identity_category,
+            "zone_name": obs.zone_name,
+        }
+        dets = self._recent_detections[obs.camera_id]
+        dets.append(entry)
+        if len(dets) > self._recent_detections_max:
+            self._recent_detections[obs.camera_id] = dets[-self._recent_detections_max:]
+
+    def _should_suppress_unknown_anomaly(self, obs: Observation) -> Optional[str]:
+        """
+        §4.1 + §4.3 — Check if motion is explained by benign detections
+        or if zone-aware filtering should suppress.
+        Returns a suppression reason string if should suppress, else None.
+        """
+        # §4.3 — Zone-aware: if camera has zones but anomaly has no zone_name,
+        # suppress (anomaly outside any monitored zone is not actionable)
+        if obs.camera_id in self._zone_cameras and not obs.zone_name:
+            # Check if ANY recent detection was in a zone
+            dets = self._recent_detections.get(obs.camera_id, [])
+            has_zone_activity = False
+            for d in dets[-10:]:
+                if d.get("zone_name"):
+                    has_zone_activity = True
+                    break
+            if not has_zone_activity:
+                return "zone_aware_no_zone_activity"
+
+        dets = self._recent_detections.get(obs.camera_id, [])
+        if not dets:
+            return None
+
+        # Only look at recent detections (last 10 entries)
+        recent = dets[-10:]
+
+        # Benign categories that explain motion
+        benign_categories = {"KNOWN_PERSON", "PET"}
+        benign_labels = {"person", "cat", "dog", "car", "truck", "bus", "bicycle", "motorcycle"}
+
+        benign_count = 0
+        known_names = []
+        for d in recent:
+            label = (d.get("label") or "").lower()
+            id_cat = d.get("identity_category") or ""
+
+            # Known identity explains motion
+            if id_cat in benign_categories:
+                benign_count += 1
+                known_names.append(id_cat)
+                continue
+
+            # Common benign labels (person detected but may not be identified yet)
+            if label in benign_labels:
+                benign_count += 1
+
+        # Suppress if majority of recent detections are benign
+        if benign_count >= len(recent) * 0.5 and benign_count >= 2:
+            return f"motion_explained_by_benign ({benign_count}/{len(recent)} benign: {','.join(set(known_names)) or 'common_objects'})"
+
+        return None
+
+    # ------------------------------------------------------------------
     # Identity helpers
     # ------------------------------------------------------------------
     def _cache_identity_observation(self, obs: Observation):
@@ -488,4 +633,27 @@ class AlertAggregator:
         """Look up cached identity for a track_id from the entity_identity lane."""
         cam_cache = self._identity_cache.get(camera_id, {})
         return cam_cache.get(track_id)
+
+    def _any_known_entity_on_camera(self, camera_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Check if ANY known (enrolled) entity is currently visible on a camera.
+        Returns the best known identity dict if found, else None.
+
+        This is needed because person_zone and entity_identity lanes use
+        different trackers, so track_id matching will fail. Instead, for
+        INTRUSION alerts, we check the identity cache at the camera level.
+        """
+        cam_cache = self._identity_cache.get(camera_id, {})
+        if not cam_cache:
+            return None
+        known_categories = {"KNOWN_PERSON", "PET"}
+        best = None
+        best_conf = 0.0
+        for _tid, ident in cam_cache.items():
+            cat = ident.get("category", "")
+            conf = ident.get("confidence", 0.0)
+            if cat in known_categories and conf > best_conf:
+                best = ident
+                best_conf = conf
+        return best
 

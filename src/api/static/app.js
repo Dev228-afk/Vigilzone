@@ -220,7 +220,7 @@ function renderAlerts() {
         }
 
         // Identity debug info (best_sim, margin, quality_ok, locked)
-        const idDebug = alert.payload && alert.payload.identity;
+        const idDebug = alert.debug && alert.debug.identity;
         let idDebugHtml = "";
         if (idDebug) {
             const parts = [];
@@ -331,7 +331,7 @@ function showAlertDetails(index) {
     }
 
     // Identity debug section in modal
-    const idDebug = p.identity || {};
+    const idDebug = (alert.debug && alert.debug.identity) || {};
     let idDebugSection = "";
     if (Object.keys(idDebug).length > 0) {
         idDebugSection = `
@@ -637,17 +637,33 @@ async function loadEntities() {
             container.innerHTML = '<div class="no-entities">No entities enrolled yet. Use the buttons above to enroll persons or pets.</div>';
             return;
         }
-        container.innerHTML = entities.map(e => {
+
+        // Fetch images for each entity in parallel
+        const imagePromises = entities.map(e => {
+            const eid = e.entity_id || e.id;
+            return fetch(`/entities/${eid}/images`).then(r => r.json()).catch(() => ({ images: [] }));
+        });
+        const imageResults = await Promise.all(imagePromises);
+
+        container.innerHTML = entities.map((e, idx) => {
             const catClass = (e.category || "").includes("PET") ? "PET" : "";
+            const eid = e.entity_id || e.id || "—";
+            const images = imageResults[idx]?.images || [];
+            const thumbsHtml = images.length > 0
+                ? `<div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:8px">${images.slice(0, 5).map(u =>
+                    `<img src="${u}" style="width:48px;height:48px;object-fit:cover;border-radius:4px;border:1px solid #444" alt="enrolled">`
+                ).join("")}${images.length > 5 ? `<span style="color:#888;font-size:11px;align-self:center">+${images.length - 5} more</span>` : ''}</div>`
+                : '<div style="color:#666;font-size:11px;margin-top:4px">No enrollment images</div>';
             return `
             <div class="entity-card ${catClass}">
                 <div class="entity-name">${e.name || "Unnamed"}</div>
                 <div class="entity-meta">
-                    <div><strong>ID:</strong> ${e.entity_id || e.id || "—"}</div>
+                    <div><strong>ID:</strong> ${eid}</div>
                     <div><strong>Category:</strong> ${e.category || "—"}</div>
                     <div><strong>Role:</strong> ${e.role || "—"}</div>
                 </div>
-                <button class="entity-del-btn" onclick="deleteEntity('${e.entity_id || e.id}')">Delete</button>
+                ${thumbsHtml}
+                <button class="entity-del-btn" onclick="deleteEntity('${eid}')">Delete</button>
             </div>`;
         }).join("");
     } catch (e) {
@@ -658,17 +674,191 @@ async function loadEntities() {
 
 function showEnrollForm(type) {
     hideEnrollForms();
-    const form = document.getElementById(`enroll-${type}-form`);
-    if (form) form.classList.add("visible");
+    if (type === 'live') {
+        const form = document.getElementById('enroll-live-form');
+        if (form) {
+            form.style.display = 'block';
+            populateLiveEnrollCameras();
+        }
+        return;
+    }
+    // §A3: For person/pet, use the two-step staging workflow
+    const stagingForm = document.getElementById('enroll-staging-form');
+    if (stagingForm) {
+        stagingForm.style.display = 'block';
+        // Store which type is being enrolled for step 2
+        stagingForm.dataset.enrollType = type;
+    }
 }
 
 function hideEnrollForms() {
-    document.querySelectorAll(".enroll-form").forEach(f => f.classList.remove("visible"));
+    document.querySelectorAll(".enroll-form").forEach(f => {
+        f.classList.remove("visible");
+        f.style.display = "none";
+    });
     // Clear status messages
     document.querySelectorAll(".enroll-status").forEach(el => {
         el.className = "enroll-status";
         el.textContent = "";
     });
+    const preview = document.getElementById("enroll-live-capture-preview");
+    if (preview) preview.innerHTML = "";
+    const stagingPreview = document.getElementById("staging-preview");
+    if (stagingPreview) stagingPreview.innerHTML = "";
+    const stagingThumbs = document.getElementById("staging-thumbs");
+    if (stagingThumbs) stagingThumbs.innerHTML = "";
+    // Reset staging state
+    currentUploadId = null;
+}
+
+// §A1/A3 — Staging upload + two-step enrollment
+let currentUploadId = null;
+
+async function uploadToStaging() {
+    const filesEl = document.getElementById("enroll-staging-files");
+    const statusEl = document.getElementById("enroll-staging-status");
+    const previewEl = document.getElementById("staging-preview");
+
+    if (!filesEl.files || filesEl.files.length === 0) {
+        statusEl.className = "enroll-status error";
+        statusEl.textContent = "Please select at least one image.";
+        return;
+    }
+
+    statusEl.className = "enroll-status";
+    statusEl.style.display = "block";
+    statusEl.style.background = "#333";
+    statusEl.style.color = "#aaa";
+    statusEl.textContent = "Uploading images to staging...";
+
+    const formData = new FormData();
+    for (const f of filesEl.files) {
+        formData.append("files", f);
+    }
+    // If we already have a staging upload, append to it
+    if (currentUploadId) {
+        formData.append("upload_id", currentUploadId);
+    }
+
+    try {
+        const resp = await fetch("/uploads/enroll_images", { method: "POST", body: formData });
+        const data = await resp.json();
+
+        if (data.error) {
+            statusEl.className = "enroll-status error";
+            statusEl.textContent = data.error;
+            return;
+        }
+
+        currentUploadId = data.upload_id;
+        // Use all_files (includes previously uploaded) for preview
+        const allFiles = data.all_files || data.stored;
+        statusEl.className = "enroll-status success";
+        statusEl.textContent = `${allFiles.length} image(s) staged total (added ${data.stored.length} new). You can add more or proceed to Step 2.`;
+
+        // Show ALL preview thumbnails from staging
+        previewEl.innerHTML = allFiles.map(s =>
+            `<img src="${s.url}" style="width:80px;height:80px;object-fit:cover;border-radius:6px;border:2px solid #3a3a6e" alt="${s.filename}">`
+        ).join("");
+
+        // Reset file input so user can pick more files
+        filesEl.value = "";
+
+        // Show step 2
+        const step2 = document.getElementById("enroll-staging-step2");
+        if (step2) {
+            step2.style.display = "block";
+            // Copy thumbnails to step 2
+            const thumbs = document.getElementById("staging-thumbs");
+            thumbs.innerHTML = previewEl.innerHTML;
+
+            // Show/hide role field based on enrollment type
+            const enrollType = document.getElementById("enroll-staging-form").dataset.enrollType;
+            const roleField = document.getElementById("enroll-staging-role-field");
+            if (roleField) {
+                roleField.style.display = enrollType === "person" ? "block" : "none";
+            }
+        }
+    } catch (e) {
+        console.error("Staging upload failed:", e);
+        statusEl.className = "enroll-status error";
+        statusEl.textContent = "Network error during staging upload.";
+    }
+}
+
+async function enrollFromStaging(type) {
+    const statusEl = document.getElementById("enroll-staging-step2-status");
+    const nameEl = document.getElementById("enroll-staging-name");
+
+    if (!currentUploadId) {
+        statusEl.className = "enroll-status error";
+        statusEl.textContent = "No staged images. Upload images first.";
+        return;
+    }
+
+    const name = nameEl.value.trim();
+    if (!name) {
+        statusEl.className = "enroll-status error";
+        statusEl.textContent = "Name is required.";
+        return;
+    }
+
+    statusEl.className = "enroll-status";
+    statusEl.style.display = "block";
+    statusEl.style.background = "#333";
+    statusEl.style.color = "#aaa";
+    statusEl.textContent = "Enrolling from staged images...";
+
+    const body = { upload_id: currentUploadId, name: name };
+    if (type === "person") {
+        body.role = document.getElementById("enroll-staging-role").value;
+    }
+
+    const endpoint = type === "person"
+        ? "/entities/enroll_person_from_upload"
+        : "/entities/enroll_pet_from_upload";
+
+    try {
+        const resp = await fetch(endpoint, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+        });
+        const data = await resp.json();
+
+        if (data.error) {
+            statusEl.className = "enroll-status error";
+            let msg = data.error;
+            if (data.failed_images && data.failed_images.length) {
+                msg += " | Failed: " + data.failed_images.map(f => f.file + "(" + f.reason + ")").join(", ");
+            }
+            statusEl.textContent = msg;
+            return;
+        }
+
+        statusEl.className = "enroll-status success";
+        let msg = `Enrolled "${data.name}" (${data.category}) — ${data.embeddings_stored} embeddings, ${data.saved_images_count} images saved.`;
+        if (data.saved_image_urls && data.saved_image_urls.length) {
+            msg += " Images: ";
+            // Show enrolled image links
+            const thumbs = document.getElementById("staging-thumbs");
+            if (thumbs) {
+                thumbs.innerHTML = data.saved_image_urls.map(u =>
+                    `<img src="${u}" style="width:80px;height:80px;object-fit:cover;border-radius:6px;border:2px solid #4CAF50" alt="enrolled">`
+                ).join("");
+            }
+        }
+        statusEl.textContent = msg;
+
+        await fetch("/identity/reload", { method: "POST" });
+        nameEl.value = "";
+        currentUploadId = null;
+        loadEntities();
+    } catch (e) {
+        console.error("Enrollment from staging failed:", e);
+        statusEl.className = "enroll-status error";
+        statusEl.textContent = "Network error during enrollment.";
+    }
 }
 
 async function submitEnroll(type) {
@@ -751,6 +941,89 @@ async function deleteEntity(entityId) {
     } catch (e) {
         console.error("Delete failed:", e);
         alert("Failed to delete entity.");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// §2.3 — ENROLL FROM LIVE CAMERA (capture-based enrollment)
+// ═══════════════════════════════════════════════════════════════════════
+
+function populateLiveEnrollCameras() {
+    const sel = document.getElementById("enroll-live-camera");
+    sel.innerHTML = '<option value="">-- Select Camera --</option>';
+    for (const cam of cachedCameras) {
+        const opt = document.createElement("option");
+        opt.value = cam.camera_id;
+        opt.textContent = cam.camera_id;
+        sel.appendChild(opt);
+    }
+}
+
+async function captureEnroll(type) {
+    const statusEl = document.getElementById("enroll-live-status");
+    const nameEl = document.getElementById("enroll-live-name");
+    const cameraEl = document.getElementById("enroll-live-camera");
+    const previewEl = document.getElementById("enroll-live-capture-preview");
+
+    const name = nameEl.value.trim();
+    const cameraId = cameraEl.value;
+
+    if (!cameraId) {
+        statusEl.className = "enroll-status error";
+        statusEl.textContent = "Please select a camera.";
+        return;
+    }
+    if (!name) {
+        statusEl.className = "enroll-status error";
+        statusEl.textContent = "Name is required.";
+        return;
+    }
+
+    statusEl.className = "enroll-status";
+    statusEl.style.display = "block";
+    statusEl.style.background = "#333";
+    statusEl.style.color = "#aaa";
+    statusEl.textContent = "Capturing frame and enrolling...";
+
+    const formData = new FormData();
+    formData.append("camera_id", cameraId);
+    formData.append("name", name);
+
+    let endpoint;
+    if (type === "person") {
+        const roleEl = document.getElementById("enroll-live-role");
+        formData.append("role", roleEl.value);
+        endpoint = "/entities/enroll_person_from_camera";
+    } else {
+        endpoint = "/entities/enroll_pet_from_camera";
+    }
+
+    try {
+        const resp = await fetch(endpoint, { method: "POST", body: formData });
+        const data = await resp.json();
+
+        if (data.error) {
+            statusEl.className = "enroll-status error";
+            statusEl.textContent = data.error;
+            return;
+        }
+
+        statusEl.className = "enroll-status success";
+        statusEl.textContent = `Enrolled "${data.name}" (${data.category}) from camera ${data.camera_id} — ${data.embeddings_stored} embedding(s).`;
+
+        // Show captured image preview
+        if (data.capture_image_url) {
+            previewEl.innerHTML = `<img src="${data.capture_image_url}" style="max-width:320px;border-radius:8px;margin-top:8px;border:2px solid #4CAF50" alt="Captured enrollment image">`;
+        }
+
+        // Reload matcher + entities
+        await fetch("/identity/reload", { method: "POST" });
+        nameEl.value = "";
+        loadEntities();
+    } catch (e) {
+        console.error("Capture enrollment failed:", e);
+        statusEl.className = "enroll-status error";
+        statusEl.textContent = "Network error during capture enrollment.";
     }
 }
 
@@ -862,4 +1135,106 @@ function renderIdLiveState(data) {
 
     html += "</tbody></table>";
     document.getElementById("idlive-content").innerHTML = html;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// §C5 — DIAGNOSTICS / DEBUG TAB
+// ═══════════════════════════════════════════════════════════════════════
+
+async function loadDiagnostics() {
+    const container = document.getElementById("diag-content");
+    container.innerHTML = '<div style="color:#aaa;padding:20px">Loading diagnostics...</div>';
+
+    try {
+        const resp = await fetch("/system/diagnostics");
+        if (!resp.ok) {
+            container.innerHTML = '<div class="no-alerts">Diagnostics endpoint unavailable.</div>';
+            return;
+        }
+        const data = await resp.json();
+        renderDiagnostics(data);
+    } catch (e) {
+        console.error("Diagnostics fetch failed:", e);
+        container.innerHTML = '<div class="no-alerts">Network error fetching diagnostics.</div>';
+    }
+}
+
+function renderDiagnostics(data) {
+    const container = document.getElementById("diag-content");
+    let html = "";
+
+    // Suppression counters
+    const supp = data.suppression_counters || {};
+    const suppKeys = Object.keys(supp);
+    html += `<div style="background:#1a1a3a;border:1px solid #2d2d5e;border-radius:8px;padding:16px;margin-bottom:14px">
+        <h3 style="color:#FF9800;font-size:14px;margin-bottom:10px;text-transform:uppercase;letter-spacing:.5px">Suppressed Alerts by Reason</h3>`;
+    if (suppKeys.length === 0) {
+        html += '<div style="color:#555">No suppressed alerts recorded yet.</div>';
+    } else {
+        html += '<table style="width:100%;font-size:12px;border-collapse:collapse">';
+        html += '<tr style="color:#64B5F6"><th style="text-align:left;padding:4px 8px">Reason</th><th style="text-align:right;padding:4px 8px">Count</th></tr>';
+        for (const [reason, count] of Object.entries(supp)) {
+            html += `<tr><td style="padding:4px 8px;color:#bbb;border-bottom:1px solid #1a1a2e">${reason}</td><td style="padding:4px 8px;color:#FF9800;text-align:right;border-bottom:1px solid #1a1a2e">${count}</td></tr>`;
+        }
+        html += '</table>';
+    }
+    html += '</div>';
+
+    // Motion stats
+    const motion = data.motion_stats || {};
+    const motionKeys = Object.keys(motion);
+    html += `<div style="background:#1a1a3a;border:1px solid #2d2d5e;border-radius:8px;padding:16px;margin-bottom:14px">
+        <h3 style="color:#4CAF50;font-size:14px;margin-bottom:10px;text-transform:uppercase;letter-spacing:.5px">Last Motion Stats (per camera)</h3>`;
+    if (motionKeys.length === 0) {
+        html += '<div style="color:#555">No motion stats available yet.</div>';
+    } else {
+        for (const [camId, stats] of Object.entries(motion)) {
+            html += `<div style="margin-bottom:8px"><strong style="color:#64B5F6">${camId}:</strong>
+                area_ratio=${(stats.motion_area_ratio || 0).toFixed(4)},
+                score=${(stats.score || 0).toFixed(3)},
+                persistence=${stats.persistence_hits || 0}/${stats.persistence_window || 0},
+                suppress=${stats.suppress_reason || "none"}</div>`;
+        }
+    }
+    html += '</div>';
+
+    // Temporal verifier stats
+    const tv = data.temporal_verifier_stats || {};
+    html += `<div style="background:#1a1a3a;border:1px solid #2d2d5e;border-radius:8px;padding:16px;margin-bottom:14px">
+        <h3 style="color:#9C27B0;font-size:14px;margin-bottom:10px;text-transform:uppercase;letter-spacing:.5px">Temporal Verifier</h3>`;
+    if (Object.keys(tv).length === 0) {
+        html += '<div style="color:#555">No temporal verifier stats available yet.</div>';
+    } else {
+        html += `<div>Input Shape: <strong style="color:#e0e0e0">${tv.last_input_shape || "N/A"}</strong></div>`;
+        html += `<div>Padding Applied: <strong style="color:#e0e0e0">${tv.padding_applied != null ? tv.padding_applied : "N/A"}</strong></div>`;
+        html += `<div>Device: <strong style="color:#e0e0e0">${tv.device || "N/A"}</strong></div>`;
+        html += `<div>Last Run: <strong style="color:#e0e0e0">${tv.last_run_ts || "N/A"}</strong></div>`;
+        html += `<div>Stub Mode: <strong style="color:#e0e0e0">${tv.stub != null ? tv.stub : "N/A"}</strong></div>`;
+    }
+    html += '</div>';
+
+    // Device info
+    const dev = data.device || {};
+    html += `<div style="background:#1a1a3a;border:1px solid #2d2d5e;border-radius:8px;padding:16px;margin-bottom:14px">
+        <h3 style="color:#64B5F6;font-size:14px;margin-bottom:10px;text-transform:uppercase;letter-spacing:.5px">Device Info</h3>
+        <div class="detail-grid">
+            <div><strong>Torch Device:</strong> ${dev.torch_device || "N/A"}</div>
+            <div><strong>GPU Usable:</strong> ${dev.gpu_usable != null ? dev.gpu_usable : "N/A"}</div>
+            <div><strong>GPU Name:</strong> ${dev.device_name || "N/A"}</div>
+            <div><strong>ORT CUDA:</strong> ${dev.ort_cuda != null ? dev.ort_cuda : "N/A"}</div>
+        </div>
+    </div>`;
+
+    // Lane status
+    const lanes = data.lanes || {};
+    html += `<div style="background:#1a1a3a;border:1px solid #2d2d5e;border-radius:8px;padding:16px;margin-bottom:14px">
+        <h3 style="color:#64B5F6;font-size:14px;margin-bottom:10px;text-transform:uppercase;letter-spacing:.5px">Lane Status</h3>`;
+    for (const [camId, info] of Object.entries(lanes)) {
+        html += `<div style="margin-bottom:8px"><strong style="color:#64B5F6">${camId}:</strong>
+            enabled=[${(info.enabled || []).join(", ")}],
+            disabled=[${(info.disabled || []).join(", ")}]</div>`;
+    }
+    html += '</div>';
+
+    container.innerHTML = html;
 }

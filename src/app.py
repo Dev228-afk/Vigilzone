@@ -33,6 +33,7 @@ from src.ingest.opencv_reader import OpenCVReader
 from src.ingest.ffmpeg_reader import FFmpegReader
 from src.ingest.deepstream_stub import DeepStreamStub
 from src.ingest.live_camera import LiveCameraReader
+from src.ingest.frame_store import LatestFrameStore
 
 # Detection lanes (legacy)
 from src.lanes.person_zone import PersonZoneLane
@@ -143,6 +144,7 @@ class CameraProcessor:
         pet_embedder=None,
         identity_matcher=None,
         identity_stabilizer=None,
+        frame_store: Optional[LatestFrameStore] = None,
     ):
         self.camera_id = camera_cfg["camera_id"]
         self.camera_cfg = camera_cfg
@@ -157,6 +159,7 @@ class CameraProcessor:
         self._pet_embedder = pet_embedder
         self._identity_matcher = identity_matcher
         self._identity_stabilizer = identity_stabilizer
+        self._frame_store = frame_store
 
         self.logger = setup_logger(f"CameraProcessor-{self.camera_id}")
 
@@ -312,6 +315,10 @@ class CameraProcessor:
 
                 # Ring buffer
                 self.ringbuffer.add_frame(frame, ts)
+
+                # §2.2 — update shared LatestFrameStore for API capture
+                if self._frame_store is not None:
+                    self._frame_store.update(self.camera_id, frame, ts)
 
                 now = time.time()
 
@@ -533,9 +540,15 @@ class CCTVAIModule:
         else:
             self.logger.info("Identity subsystem DISABLED (identity.enabled=false)")
 
+        # §4.3 — wire zone config into aggregator for zone-aware anomaly
+        self.aggregator.set_zone_cameras(self.zones_cfg)
+
         self.processors: List[CameraProcessor] = []
         self.api_server: Optional[AlertServer] = None
         self.api_thread: Optional[threading.Thread] = None
+
+        # §2.2 — shared latest-frame store across all cameras
+        self.frame_store = LatestFrameStore()
 
     # ------------------------------------------------------------------
     def start(self):
@@ -567,6 +580,7 @@ class CCTVAIModule:
                     pet_embedder=self.pet_embedder,
                     identity_matcher=self.identity_matcher,
                     identity_stabilizer=self.identity_stabilizer,
+                    frame_store=self.frame_store,
                 )
                 proc.start()
                 self.processors.append(proc)
@@ -600,6 +614,7 @@ class CCTVAIModule:
         self.api_server.set_auto_throttle(self.auto_throttle)
         self.api_server.set_process_video_fn(self.process_uploaded_video)
         self.api_server.set_doctor_report(self.doctor_report)
+        self.api_server.set_frame_store(self.frame_store)
         self.api_server.set_identity_components(
             self.entity_store, self.face_embedder,
             self.pet_embedder, self.identity_matcher,

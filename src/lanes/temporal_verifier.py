@@ -174,37 +174,55 @@ class TemporalVerifierLane(BaseLane):
     # ------------------------------------------------------------------
     # On-demand clip verification
     # ------------------------------------------------------------------
-    def verify_clip(self, frames: List[Tuple[str, bytes]],
-                    target_label: str = "violence") -> Dict[str, Any]:
+    def verify_clip(self, frames_bgr: List[np.ndarray],
+                    target_label: str = "violence",
+                    fps: float = 10.0) -> Dict[str, Any]:
         """
-        Run temporal verification on a clip of JPEG-encoded frames.
+        §B1: Run temporal verification on RAW FRAMES ONLY.
 
         Args:
-            frames: List of (ts_utc, jpeg_bytes) from ring buffer.
-            target_label: What to verify (``violence`` / ``fall``).
+            frames_bgr: List of BGR np.ndarray images (raw, not JPEG bytes).
+            target_label: What to verify (``violence`` / ``fall`` / ``fire``).
+            fps: Source FPS for informational purposes.
 
         Returns:
-            {"confirmed": bool, "score": float}
+            {"confirmed": bool, "score": float, "debug": {...}}
         """
         if not self._initialized:
             self.init()
 
-        if not frames:
-            return {"confirmed": False, "score": 0.0}
+        if not frames_bgr:
+            return {"confirmed": False, "score": 0.0,
+                    "debug": {"input_shape": None, "clip_len": 0, "used_padding": False}}
 
         t0 = time.perf_counter()
 
         if self._stub:
-            result = self._stub_clip_verify(frames)
+            result = self._stub_raw_verify(frames_bgr)
         else:
-            result = self._model_clip_verify(frames, target_label)
+            result = self._model_raw_verify(frames_bgr, target_label)
 
         dt = time.perf_counter() - t0
+        clip_len = result.get("debug", {}).get("clip_len", len(frames_bgr))
         self.logger.debug(
-            f"Clip verify ({len(frames)} frames): confirmed={result['confirmed']}, "
+            f"Clip verify ({clip_len} frames): confirmed={result['confirmed']}, "
             f"score={result['score']:.2f}, {dt*1000:.1f} ms"
         )
+
+        # §C5: Store last run stats for diagnostics
+        self._last_run_stats = {
+            "last_input_shape": result.get("debug", {}).get("input_shape"),
+            "padding_applied": result.get("debug", {}).get("used_padding", False),
+            "device": self._torch_device,
+            "last_run_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "stub": self._stub,
+        }
+
         return result
+
+    def get_last_run_stats(self) -> Dict[str, Any]:
+        """§C5: Return last temporal verifier run stats for diagnostics."""
+        return getattr(self, "_last_run_stats", {})
 
     # --- helpers -------------------------------------------------------
     def _motion_energy(self, frame_bgr: np.ndarray) -> float:
@@ -218,36 +236,88 @@ class TemporalVerifierLane(BaseLane):
         self._prev_gray = gray
         return score
 
-    def _stub_clip_verify(self, frames: List[Tuple[str, bytes]]) -> Dict[str, Any]:
-        """Motion-based clip verification stub."""
+    def _stub_raw_verify(self, frames_bgr: List[np.ndarray]) -> Dict[str, Any]:
+        """Motion-based clip verification stub using raw BGR frames."""
         energies = []
         prev_gray = None
-        for _, jpeg_bytes in frames:
-            img = cv2.imdecode(np.frombuffer(jpeg_bytes, np.uint8), cv2.IMREAD_GRAYSCALE)
-            if img is None:
-                continue
-            img = cv2.GaussianBlur(img, (21, 21), 0)
+        for frame in frames_bgr:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = cv2.GaussianBlur(gray, (21, 21), 0)
             if prev_gray is not None:
-                diff = cv2.absdiff(prev_gray, img)
+                diff = cv2.absdiff(prev_gray, gray)
                 energies.append(float(np.mean(diff)) / 80.0)
-            prev_gray = img
+            prev_gray = gray
 
         if not energies:
-            return {"confirmed": False, "score": 0.0}
+            return {"confirmed": False, "score": 0.0,
+                    "debug": {"input_shape": None, "clip_len": len(frames_bgr), "used_padding": False}}
 
         avg = float(np.mean(energies))
-        return {"confirmed": avg > self.conf_threshold, "score": round(min(avg, 1.0), 3)}
+        return {
+            "confirmed": avg > self.conf_threshold,
+            "score": round(min(avg, 1.0), 3),
+            "debug": {
+                "input_shape": f"stub({len(frames_bgr)} frames)",
+                "clip_len": len(frames_bgr),
+                "used_padding": False,
+            },
+        }
 
-    def _model_clip_verify(self, frames: List[Tuple[str, bytes]],
+    def _pad_and_preprocess_clip(self, frames_bgr: List[np.ndarray],
+                                  clip_len: int = 16) -> Optional[Any]:
+        """
+        §B2/B3: Preprocess raw BGR frames into X3D-compatible tensor.
+
+        Steps:
+        1. Pad by repeating last frame if < clip_len
+        2. Resize to 224x224
+        3. BGR→RGB, float32 [0,1], normalize (Kinetics mean/std)
+        4. Stack → tensor shape (1, 3, T, 224, 224)
+
+        Returns torch.Tensor or None on failure.
+        """
+        import torch
+
+        # §B2: Pad by repeating last frame until clip_len
+        used_padding = len(frames_bgr) < clip_len
+        padded = list(frames_bgr)
+        while len(padded) < clip_len:
+            padded.append(padded[-1].copy())
+        # Take exactly clip_len frames
+        padded = padded[:clip_len]
+
+        imgs = []
+        for frame in padded:
+            # Resize to 256x256 then centre-crop 224x224
+            resized = cv2.resize(frame, (256, 256))
+            y0, x0 = (256 - 224) // 2, (256 - 224) // 2
+            cropped = resized[y0:y0+224, x0:x0+224]
+            # BGR→RGB, float32 [0,1]
+            rgb = cropped[:, :, ::-1].astype(np.float32) / 255.0
+            # Normalize (Kinetics-400 standard values)
+            mean = np.array([0.45, 0.45, 0.45], dtype=np.float32)
+            std = np.array([0.225, 0.225, 0.225], dtype=np.float32)
+            rgb = (rgb - mean) / std
+            imgs.append(rgb)
+
+        # [T, H, W, C] → [C, T, H, W] → [1, C, T, H, W]
+        clip = np.stack(imgs, axis=0)      # [T, H, W, C]
+        clip = clip.transpose(3, 0, 1, 2)  # [C, T, H, W]
+        clip_tensor = torch.from_numpy(clip).unsqueeze(0).to(self._torch_device)
+
+        # §B3: Log tensor shape
+        self.logger.info(
+            f"TemporalVerifier input tensor: {tuple(clip_tensor.shape)} device={self._torch_device}"
+        )
+
+        return clip_tensor, used_padding
+
+    def _model_raw_verify(self, frames_bgr: List[np.ndarray],
                            target_label: str) -> Dict[str, Any]:
         """
-        Run X3D-S forward pass on a clip.
-
-        Preprocessing: decode JPEG → resize 256×256 → centre-crop 224×224 →
-        /255 → normalize(mean, std) → stack → [1, C, T, H, W].
-
-        Output: softmax over Kinetics-400 classes.  Sum probabilities of
-        violence/fall-related classes and compare to conf_threshold.
+        §B1-B5: Run X3D-S on raw BGR frames with proper preprocessing.
+        Never falls back due to clip being too small (we pad instead).
+        Only falls back if model forward pass or preprocessing fails.
         """
         import torch
 
@@ -257,30 +327,13 @@ class TemporalVerifierLane(BaseLane):
         )
 
         try:
-            # Decode and preprocess frames
-            imgs = []
-            for _, jpeg_bytes in frames:
-                img = cv2.imdecode(np.frombuffer(jpeg_bytes, np.uint8), cv2.IMREAD_COLOR)
-                if img is None:
-                    continue
-                img = cv2.resize(img, (256, 256))
-                # Centre crop 224x224
-                y0, x0 = (256 - 224) // 2, (256 - 224) // 2
-                img = img[y0:y0+224, x0:x0+224]
-                img = img[:, :, ::-1].astype(np.float32) / 255.0  # BGR→RGB, 0-1
-                # Normalize (ImageNet-style)
-                mean = np.array([0.45, 0.45, 0.45], dtype=np.float32)
-                std = np.array([0.225, 0.225, 0.225], dtype=np.float32)
-                img = (img - mean) / std
-                imgs.append(img)
+            # §B2/B3: Preprocess with padding
+            result = self._pad_and_preprocess_clip(frames_bgr, clip_len=16)
+            if result is None:
+                raise RuntimeError("Preprocessing returned None")
+            clip_tensor, used_padding = result
 
-            if len(imgs) < 4:
-                return self._stub_clip_verify(frames)
-
-            # [T, H, W, C] → [C, T, H, W]
-            clip = np.stack(imgs, axis=0)  # [T, H, W, C]
-            clip = clip.transpose(3, 0, 1, 2)  # [C, T, H, W]
-            clip_tensor = torch.from_numpy(clip).unsqueeze(0).to(self._torch_device)
+            input_shape = str(tuple(clip_tensor.shape))
 
             with torch.no_grad():
                 logits = self._model(clip_tensor)
@@ -291,8 +344,18 @@ class TemporalVerifierLane(BaseLane):
                 from pytorchvideo.data.kinetics import KINETICS_400_LABELS  # type: ignore
                 labels = KINETICS_400_LABELS
             except ImportError:
-                # Fallback: use stub scoring
-                return self._stub_clip_verify(frames)
+                # Without labels, use argmax + confidence as proxy
+                max_prob = float(np.max(probs))
+                return {
+                    "confirmed": max_prob > self.conf_threshold,
+                    "score": round(min(max_prob, 1.0), 3),
+                    "debug": {
+                        "input_shape": input_shape,
+                        "clip_len": 16,
+                        "used_padding": used_padding,
+                        "note": "kinetics_labels_unavailable",
+                    },
+                }
 
             # Sum probabilities for target labels
             target_score = 0.0
@@ -301,8 +364,17 @@ class TemporalVerifierLane(BaseLane):
                     target_score += float(probs[idx])
 
             confirmed = target_score > self.conf_threshold
-            return {"confirmed": confirmed, "score": round(min(target_score, 1.0), 3)}
+            return {
+                "confirmed": confirmed,
+                "score": round(min(target_score, 1.0), 3),
+                "debug": {
+                    "input_shape": input_shape,
+                    "clip_len": 16,
+                    "used_padding": used_padding,
+                },
+            }
 
         except Exception as e:
+            # §B5: Only fall back to stub if model forward pass or preprocessing fails
             self.logger.warning(f"X3D-S forward pass failed ({e}), falling back to stub")
-            return self._stub_clip_verify(frames)
+            return self._stub_raw_verify(frames_bgr)

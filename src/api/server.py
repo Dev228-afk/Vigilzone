@@ -2,7 +2,7 @@
 FastAPI server for alerts, evidence, live frame feed,
 upload mode (offline video processing), and /metrics.
 """
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Query
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Query, Body
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
@@ -47,6 +47,15 @@ class AlertServer:
         self._upload_dir = Path("uploads")
         self._upload_dir.mkdir(parents=True, exist_ok=True)
 
+        # §A1 — staging uploads directory
+        self._staging_dir = Path("data/staging_uploads")
+        self._staging_dir.mkdir(parents=True, exist_ok=True)
+
+        # §C5 — debug counters for suppression/diagnostics
+        self._suppression_counters: Dict[str, int] = {}
+        self._last_motion_stats: Dict[str, Any] = {}
+        self._last_temporal_stats: Dict[str, Any] = {}
+
         # GPU scheduler + throttle refs (set externally)
         self._gpu_scheduler = None
         self._auto_throttle = None
@@ -64,6 +73,9 @@ class AlertServer:
 
         # Doctor report (set externally)
         self._doctor_report = None
+
+        # §2.2 — shared frame store for camera capture enrollment
+        self._frame_store = None
 
         self._setup_routes()
 
@@ -245,6 +257,252 @@ class AlertServer:
             return result
 
         # ==============================================================
+        # §A1 — STAGING UPLOAD + ENROLL-FROM-UPLOAD WORKFLOW
+        # ==============================================================
+
+        @self.app.post("/uploads/enroll_images")
+        async def upload_enroll_images(
+            files: List[UploadFile] = File(...),
+            upload_id: Optional[str] = Form(None),
+        ):
+            """Upload images to staging area for preview before enrollment.
+            If upload_id is provided, append to existing staging folder."""
+            if upload_id:
+                # Append to existing staging
+                safe_id = Path(upload_id).name
+                stage_dir = self._staging_dir / safe_id
+                if not stage_dir.exists():
+                    return {"error": f"Upload ID '{upload_id}' not found"}
+                # Count existing files to continue numbering
+                existing = list(stage_dir.iterdir())
+                start_idx = len(existing)
+            else:
+                upload_id = f"upl_{uuid.uuid4().hex[:12]}"
+                stage_dir = self._staging_dir / upload_id
+                stage_dir.mkdir(parents=True, exist_ok=True)
+                start_idx = 0
+
+            stored = []
+            for idx, f in enumerate(files):
+                content = await f.read()
+                safe_name = _sanitize_filename(f.filename or "image.jpg")
+                fname = f"{start_idx + idx}_{safe_name}"
+                (stage_dir / fname).write_bytes(content)
+                stored.append({"filename": fname, "url": f"/staging/{upload_id}/{fname}"})
+
+            # Return all files in staging (including previously uploaded)
+            all_files = []
+            for fpath in sorted(stage_dir.iterdir()):
+                if fpath.is_file():
+                    all_files.append({"filename": fpath.name, "url": f"/staging/{upload_id}/{fpath.name}"})
+
+            return {"upload_id": upload_id, "stored": stored, "all_files": all_files}
+
+        @self.app.get("/staging/{upload_id}/{filename}")
+        async def serve_staging_image(upload_id: str, filename: str):
+            """Serve a staged enrollment image for preview."""
+            safe_name = Path(filename).name
+            safe_id = Path(upload_id).name
+            file_path = self._staging_dir / safe_id / safe_name
+            if not file_path.exists():
+                return {"error": "File not found"}
+            return FileResponse(file_path)
+
+        @self.app.post("/entities/enroll_person_from_upload")
+        async def enroll_person_from_upload(
+            upload_id: str = Body(...),
+            name: str = Body(...),
+            role: str = Body("VISITOR"),
+            metadata_json: str = Body("{}"),
+        ):
+            """Enroll person from previously staged images (never reads UploadFile streams)."""
+            if self._entity_store is None or self._face_embedder is None:
+                return {"error": "Identity subsystem not enabled"}
+
+            stage_dir = self._staging_dir / Path(upload_id).name
+            if not stage_dir.exists():
+                return {"error": f"Upload ID '{upload_id}' not found"}
+
+            from ..identity.schema import EntityRecord, EntityCategory
+            enroll_cfg = self._enrollment_cfg
+            min_images = enroll_cfg.get("min_images", 1)
+            max_embeddings = enroll_cfg.get("max_embeddings_per_entity", 10)
+            outlier_z = enroll_cfg.get("outlier_reject_z", 2.5)
+
+            # Load images from disk (robust — no stream issues)
+            image_files = sorted(stage_dir.iterdir())
+            embeddings_list = []
+            failed_images = []
+            for img_path in image_files:
+                if not img_path.is_file():
+                    continue
+                content = img_path.read_bytes()
+                arr = np.frombuffer(content, dtype=np.uint8)
+                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if img is None:
+                    failed_images.append({"file": img_path.name, "reason": "decode_failed"})
+                    continue
+                emb = self._face_embedder.embed_from_crop(img)
+                if emb is None:
+                    failed_images.append({"file": img_path.name, "reason": "no_face_detected"})
+                    continue
+                embeddings_list.append((img_path.name, content, emb))
+
+            if not embeddings_list:
+                return {
+                    "error": "No detectable face found in any uploaded image",
+                    "failed_images": failed_images,
+                }
+
+            if len(embeddings_list) < min_images:
+                return {
+                    "error": f"Need at least {min_images} good face images, got {len(embeddings_list)}",
+                    "faces_detected": len(embeddings_list),
+                    "failed_images": failed_images,
+                }
+
+            # Outlier rejection
+            raw_embs = [e[2] for e in embeddings_list]
+            clean_embs = _outlier_reject(raw_embs, outlier_z)
+            clean_embs = clean_embs[:max_embeddings]
+
+            entity_id = self._entity_store.generate_id()
+            try:
+                meta = json.loads(metadata_json)
+            except Exception:
+                meta = {}
+
+            record = EntityRecord(
+                entity_id=entity_id,
+                name=name,
+                category=EntityCategory.KNOWN_PERSON,
+                role=role.upper(),
+                metadata=meta,
+            )
+            self._entity_store.add_entity(record, {})
+            for emb in clean_embs:
+                self._entity_store.add_embedding(entity_id, "face", emb)
+
+            # Save enrollment images to permanent location
+            img_dir = self._entity_store.enroll_img_dir / entity_id
+            img_dir.mkdir(parents=True, exist_ok=True)
+            saved_filenames = []
+            for fname, content, _ in embeddings_list:
+                (img_dir / fname).write_bytes(content)
+                saved_filenames.append(fname)
+
+            if self._identity_matcher:
+                self._identity_matcher.reload_indices()
+
+            # Delete staging folder on success
+            try:
+                shutil.rmtree(stage_dir)
+            except Exception:
+                pass
+
+            return {
+                "entity_id": entity_id,
+                "name": name,
+                "category": "KNOWN_PERSON",
+                "embeddings_stored": len(clean_embs),
+                "outlier_rejected": len(raw_embs) - len(clean_embs),
+                "saved_images_count": len(saved_filenames),
+                "saved_filenames": saved_filenames,
+                "saved_image_urls": [f"/enroll_images/{entity_id}/{fn}" for fn in saved_filenames],
+                "failed_images": failed_images,
+            }
+
+        @self.app.post("/entities/enroll_pet_from_upload")
+        async def enroll_pet_from_upload(
+            upload_id: str = Body(...),
+            name: str = Body(...),
+            metadata_json: str = Body("{}"),
+        ):
+            """Enroll pet from previously staged images."""
+            if self._entity_store is None or self._pet_embedder is None:
+                return {"error": "Identity subsystem not enabled or pet embedder unavailable"}
+
+            stage_dir = self._staging_dir / Path(upload_id).name
+            if not stage_dir.exists():
+                return {"error": f"Upload ID '{upload_id}' not found"}
+
+            from ..identity.schema import EntityRecord, EntityCategory
+            enroll_cfg = self._enrollment_cfg
+            max_embeddings = enroll_cfg.get("max_embeddings_per_entity", 10)
+            outlier_z = enroll_cfg.get("outlier_reject_z", 2.5)
+
+            image_files = sorted(stage_dir.iterdir())
+            embeddings_list = []
+            failed_images = []
+            for img_path in image_files:
+                if not img_path.is_file():
+                    continue
+                content = img_path.read_bytes()
+                arr = np.frombuffer(content, dtype=np.uint8)
+                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if img is None:
+                    failed_images.append({"file": img_path.name, "reason": "decode_failed"})
+                    continue
+                emb = self._pet_embedder.embed(img)
+                if emb is None:
+                    failed_images.append({"file": img_path.name, "reason": "embedding_failed"})
+                    continue
+                embeddings_list.append((img_path.name, content, emb))
+
+            if not embeddings_list:
+                return {
+                    "error": "Could not compute embedding for any uploaded image",
+                    "failed_images": failed_images,
+                }
+
+            raw_embs = [e[2] for e in embeddings_list]
+            clean_embs = _outlier_reject(raw_embs, outlier_z)
+            clean_embs = clean_embs[:max_embeddings]
+
+            entity_id = self._entity_store.generate_id()
+            try:
+                meta = json.loads(metadata_json)
+            except Exception:
+                meta = {}
+
+            record = EntityRecord(
+                entity_id=entity_id,
+                name=name,
+                category=EntityCategory.PET,
+                role="PET",
+                metadata=meta,
+            )
+            self._entity_store.add_entity(record, {})
+            for emb in clean_embs:
+                self._entity_store.add_embedding(entity_id, "pet_clip", emb)
+
+            img_dir = self._entity_store.enroll_img_dir / entity_id
+            img_dir.mkdir(parents=True, exist_ok=True)
+            saved_filenames = []
+            for fname, content, _ in embeddings_list:
+                (img_dir / fname).write_bytes(content)
+                saved_filenames.append(fname)
+
+            if self._identity_matcher:
+                self._identity_matcher.reload_indices()
+
+            try:
+                shutil.rmtree(stage_dir)
+            except Exception:
+                pass
+
+            return {
+                "entity_id": entity_id,
+                "name": name,
+                "category": "PET",
+                "embeddings_stored": len(clean_embs),
+                "saved_images_count": len(saved_filenames),
+                "saved_filenames": saved_filenames,
+                "saved_image_urls": [f"/enroll_images/{entity_id}/{fn}" for fn in saved_filenames],
+                "failed_images": failed_images,
+            }
+
+        # ==============================================================
         # IDENTITY ENROLLMENT API (spec §6 + calibration §3)
         # ==============================================================
 
@@ -269,6 +527,12 @@ class AlertServer:
                     kept.append(emb)
             return kept if kept else embeddings  # never discard all
 
+        def _sanitize_filename(raw: str) -> str:
+            """Replace illegal characters in filename."""
+            import re
+            name = Path(raw).name
+            return re.sub(r'[<>:"/\\|?*]', '_', name)
+
         @self.app.post("/entities/enroll_person")
         async def enroll_person(
             name: str = Form(...),
@@ -276,43 +540,118 @@ class AlertServer:
             metadata_json: str = Form("{}"),
             files: List[UploadFile] = File(...),
         ):
-            """Enroll a person with multiple face images (min_images enforced)."""
+            """Legacy enroll person — routes through staging workflow internally (§A2)."""
             if self._entity_store is None or self._face_embedder is None:
                 return {"error": "Identity subsystem not enabled"}
 
+            # §A2: persist to staging first, then delegate to staging-based logic
+            upload_id = f"upl_{uuid.uuid4().hex[:12]}"
+            stage_dir = self._staging_dir / upload_id
+            stage_dir.mkdir(parents=True, exist_ok=True)
+            for idx, f in enumerate(files):
+                content = await f.read()
+                safe_name = _sanitize_filename(f.filename or "image.jpg")
+                fname = f"{idx}_{safe_name}"
+                (stage_dir / fname).write_bytes(content)
+
+            # Delegate to the staging-based enrollment logic
+            return await enroll_person_from_upload(
+                upload_id=upload_id,
+                name=name,
+                role=role,
+                metadata_json=metadata_json,
+            )
+
+        @self.app.post("/entities/enroll_pet")
+        async def enroll_pet(
+            name: str = Form(...),
+            metadata_json: str = Form("{}"),
+            files: List[UploadFile] = File(...),
+        ):
+            """Legacy enroll pet — routes through staging workflow internally (§A2)."""
+            if self._entity_store is None or self._pet_embedder is None:
+                return {"error": "Identity subsystem not enabled or pet embedder unavailable"}
+
+            # §A2: persist to staging first, then delegate
+            upload_id = f"upl_{uuid.uuid4().hex[:12]}"
+            stage_dir = self._staging_dir / upload_id
+            stage_dir.mkdir(parents=True, exist_ok=True)
+            for idx, f in enumerate(files):
+                content = await f.read()
+                safe_name = _sanitize_filename(f.filename or "image.jpg")
+                fname = f"{idx}_{safe_name}"
+                (stage_dir / fname).write_bytes(content)
+
+            return await enroll_pet_from_upload(
+                upload_id=upload_id,
+                name=name,
+                metadata_json=metadata_json,
+            )
+
+        @self.app.delete("/entities/{entity_id}")
+        async def delete_entity(entity_id: str):
+            """Remove an enrolled entity."""
+            if self._entity_store is None:
+                return {"error": "Identity subsystem not enabled"}
+            removed = self._entity_store.remove_entity(entity_id)
+            if self._identity_matcher and removed:
+                self._identity_matcher.reload_indices()
+            return {"removed": removed, "entity_id": entity_id}
+
+        # §1.4 — verification endpoints for enrollment images
+        @self.app.get("/entities/{entity_id}/images")
+        async def list_entity_images(entity_id: str):
+            """Return list of saved enrollment image URLs for an entity."""
+            if self._entity_store is None:
+                return {"error": "Identity subsystem not enabled"}
+            img_dir = self._entity_store.enroll_img_dir / entity_id
+            if not img_dir.exists():
+                return {"entity_id": entity_id, "images": []}
+            filenames = sorted(f.name for f in img_dir.iterdir() if f.is_file())
+            urls = [f"/enroll_images/{entity_id}/{fn}" for fn in filenames]
+            return {"entity_id": entity_id, "images": urls, "filenames": filenames}
+
+        @self.app.get("/enroll_images/{entity_id}/{filename}")
+        async def serve_enroll_image(entity_id: str, filename: str):
+            """Serve a saved enrollment image file."""
+            if self._entity_store is None:
+                return {"error": "Identity subsystem not enabled"}
+            # Sanitize to prevent path traversal
+            safe_name = Path(filename).name
+            file_path = self._entity_store.enroll_img_dir / entity_id / safe_name
+            if not file_path.exists():
+                return {"error": "File not found"}
+            return FileResponse(file_path)
+
+        # ==============================================================
+        # §2.1 — CAMERA CAPTURE ENROLLMENT (from live feed)
+        # ==============================================================
+
+        @self.app.post("/entities/enroll_person_from_camera")
+        async def enroll_person_from_camera(
+            camera_id: str = Form(...),
+            name: str = Form(...),
+            role: str = Form("VISITOR"),
+            metadata_json: str = Form("{}"),
+        ):
+            """Capture a frame from a live camera and enroll a person."""
+            if self._entity_store is None or self._face_embedder is None:
+                return {"error": "Identity subsystem not enabled"}
+            if self._frame_store is None:
+                return {"error": "Frame store not available — no cameras running"}
+
+            frame, ts = self._frame_store.get(camera_id)
+            if frame is None:
+                return {"error": f"No recent frame available for camera '{camera_id}'"}
+
             from ..identity.schema import EntityRecord, EntityCategory
 
+            # Extract face embedding from captured frame
+            emb = self._face_embedder.embed_from_crop(frame)
+            if emb is None:
+                return {"error": "No detectable face in captured frame. Try again when a face is visible."}
+
             enroll_cfg = self._enrollment_cfg
-            min_images = enroll_cfg.get("min_images", 3)
-            max_embeddings = enroll_cfg.get("max_embeddings_per_entity", 10)
-            outlier_z = enroll_cfg.get("outlier_reject_z", 2.5)
-
-            embeddings_list = []
-            for f in files:
-                img_bytes = await f.read()
-                arr = np.frombuffer(img_bytes, dtype=np.uint8)
-                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                if img is None:
-                    continue
-                emb = self._face_embedder.embed_from_crop(img)
-                if emb is not None:
-                    embeddings_list.append(emb)
-
-            if not embeddings_list:
-                return {"error": "No detectable face found in any uploaded image"}
-
-            if len(embeddings_list) < min_images:
-                return {
-                    "error": f"Need at least {min_images} good face images, got {len(embeddings_list)}",
-                    "faces_detected": len(embeddings_list),
-                }
-
-            # Outlier rejection
-            embeddings_list = _outlier_reject(embeddings_list, outlier_z)
-
-            # Cap at max
-            embeddings_list = embeddings_list[:max_embeddings]
-
             entity_id = self._entity_store.generate_id()
             try:
                 meta = json.loads(metadata_json)
@@ -326,67 +665,52 @@ class AlertServer:
                 role=role.upper(),
                 metadata=meta,
             )
-            # Store each embedding individually (multi-embed)
             self._entity_store.add_entity(record, {})
-            for emb in embeddings_list:
-                self._entity_store.add_embedding(entity_id, "face", emb)
+            self._entity_store.add_embedding(entity_id, "face", emb)
 
-            # Save enrollment images for audit
+            # Save captured frame as enrollment image
             img_dir = self._entity_store.enroll_img_dir / entity_id
             img_dir.mkdir(parents=True, exist_ok=True)
-            for i, f in enumerate(files):
-                await f.seek(0)
-                content = await f.read()
-                (img_dir / f"{i}_{f.filename}").write_bytes(content)
+            safe_ts = (ts or "capture").replace(":", "-").replace(" ", "_")
+            fname = f"capture_{safe_ts}.jpg"
+            _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            (img_dir / fname).write_bytes(buf.tobytes())
 
-            # Rebuild matcher indices
             if self._identity_matcher:
                 self._identity_matcher.reload_indices()
 
-            return {"entity_id": entity_id, "name": name, "category": "KNOWN_PERSON",
-                    "embeddings_stored": len(embeddings_list),
-                    "outlier_rejected": 0}
+            return {
+                "entity_id": entity_id,
+                "name": name,
+                "category": "KNOWN_PERSON",
+                "embeddings_stored": 1,
+                "source": "camera_capture",
+                "camera_id": camera_id,
+                "saved_filenames": [fname],
+                "capture_image_url": f"/enroll_images/{entity_id}/{fname}",
+            }
 
-        @self.app.post("/entities/enroll_pet")
-        async def enroll_pet(
+        @self.app.post("/entities/enroll_pet_from_camera")
+        async def enroll_pet_from_camera(
+            camera_id: str = Form(...),
             name: str = Form(...),
             metadata_json: str = Form("{}"),
-            files: List[UploadFile] = File(...),
         ):
-            """Enroll a pet with multiple images (min_images enforced)."""
+            """Capture a frame from a live camera and enroll a pet."""
             if self._entity_store is None or self._pet_embedder is None:
                 return {"error": "Identity subsystem not enabled or pet embedder unavailable"}
+            if self._frame_store is None:
+                return {"error": "Frame store not available — no cameras running"}
+
+            frame, ts = self._frame_store.get(camera_id)
+            if frame is None:
+                return {"error": f"No recent frame available for camera '{camera_id}'"}
 
             from ..identity.schema import EntityRecord, EntityCategory
 
-            enroll_cfg = self._enrollment_cfg
-            min_images = enroll_cfg.get("min_images", 3)
-            max_embeddings = enroll_cfg.get("max_embeddings_per_entity", 10)
-            outlier_z = enroll_cfg.get("outlier_reject_z", 2.5)
-
-            embeddings_list = []
-            for f in files:
-                img_bytes = await f.read()
-                arr = np.frombuffer(img_bytes, dtype=np.uint8)
-                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                if img is None:
-                    continue
-                emb = self._pet_embedder.embed(img)
-                if emb is not None:
-                    embeddings_list.append(emb)
-
-            if not embeddings_list:
-                return {"error": "Could not compute embedding for any uploaded image"}
-
-            if len(embeddings_list) < min_images:
-                return {
-                    "error": f"Need at least {min_images} good pet images, got {len(embeddings_list)}",
-                    "embeddings_detected": len(embeddings_list),
-                }
-
-            # Outlier rejection
-            embeddings_list = _outlier_reject(embeddings_list, outlier_z)
-            embeddings_list = embeddings_list[:max_embeddings]
+            emb = self._pet_embedder.embed(frame)
+            if emb is None:
+                return {"error": "Could not compute pet embedding from captured frame."}
 
             entity_id = self._entity_store.generate_id()
             try:
@@ -402,32 +726,29 @@ class AlertServer:
                 metadata=meta,
             )
             self._entity_store.add_entity(record, {})
-            for emb in embeddings_list:
-                self._entity_store.add_embedding(entity_id, "pet_clip", emb)
+            self._entity_store.add_embedding(entity_id, "pet_clip", emb)
 
-            # Save enrollment images for audit
+            # Save captured frame
             img_dir = self._entity_store.enroll_img_dir / entity_id
             img_dir.mkdir(parents=True, exist_ok=True)
-            for i, f in enumerate(files):
-                await f.seek(0)
-                content = await f.read()
-                (img_dir / f"{i}_{f.filename}").write_bytes(content)
+            safe_ts = (ts or "capture").replace(":", "-").replace(" ", "_")
+            fname = f"capture_{safe_ts}.jpg"
+            _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            (img_dir / fname).write_bytes(buf.tobytes())
 
             if self._identity_matcher:
                 self._identity_matcher.reload_indices()
 
-            return {"entity_id": entity_id, "name": name, "category": "PET",
-                    "embeddings_stored": len(embeddings_list)}
-
-        @self.app.delete("/entities/{entity_id}")
-        async def delete_entity(entity_id: str):
-            """Remove an enrolled entity."""
-            if self._entity_store is None:
-                return {"error": "Identity subsystem not enabled"}
-            removed = self._entity_store.remove_entity(entity_id)
-            if self._identity_matcher and removed:
-                self._identity_matcher.reload_indices()
-            return {"removed": removed, "entity_id": entity_id}
+            return {
+                "entity_id": entity_id,
+                "name": name,
+                "category": "PET",
+                "embeddings_stored": 1,
+                "source": "camera_capture",
+                "camera_id": camera_id,
+                "saved_filenames": [fname],
+                "capture_image_url": f"/enroll_images/{entity_id}/{fname}",
+            }
 
         @self.app.get("/entities")
         async def list_entities(category: Optional[str] = Query(None)):
@@ -460,11 +781,14 @@ class AlertServer:
         # ==============================================================
         @self.app.get("/system/diagnostics")
         async def system_diagnostics():
-            """Return device info, ORT providers, lane status, missing assets."""
+            """Return device info, ORT providers, lane status, missing assets, suppression counters, motion stats."""
             result: Dict[str, Any] = {
                 "device": {},
                 "lanes": {},
                 "missing_assets": [],
+                "suppression_counters": {},
+                "motion_stats": {},
+                "temporal_verifier_stats": {},
             }
 
             # Device info from doctor report
@@ -485,6 +809,13 @@ class AlertServer:
                     {"config_key": m.config_key, "path": m.expected_path, "fix": m.fix_hint}
                     for m in self._doctor_report.missing
                 ]
+
+            # §C5: suppression counters and motion stats from aggregator
+            if self._aggregator:
+                diag = self._aggregator.get_diagnostics()
+                result["suppression_counters"] = diag.get("suppression_counters", {})
+                result["motion_stats"] = diag.get("motion_stats", {})
+                result["temporal_verifier_stats"] = diag.get("temporal_verifier_stats", {})
 
             # Lane status from camera processors
             for proc in self._camera_processors:
@@ -533,6 +864,10 @@ class AlertServer:
     def set_doctor_report(self, report):
         """Attach startup doctor report for /system/diagnostics."""
         self._doctor_report = report
+
+    def set_frame_store(self, frame_store):
+        """§2.2 — attach shared LatestFrameStore for camera capture enrollment."""
+        self._frame_store = frame_store
 
     def set_identity_components(self, store, face_embedder, pet_embedder, matcher,
                                stabilizer=None, enrollment_cfg=None):

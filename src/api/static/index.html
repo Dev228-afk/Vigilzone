@@ -222,6 +222,7 @@
         <button class="tab-btn active" data-tab="alerts" onclick="switchTab('alerts')">Alerts</button>
         <button class="tab-btn" data-tab="entities" onclick="switchTab('entities')">Entities</button>
         <button class="tab-btn" data-tab="idlive" onclick="switchTab('idlive')">Identity Live</button>
+        <button class="tab-btn" data-tab="debug" onclick="switchTab('debug')">Debug</button>
     </div>
 
     <!-- Sidebar: cameras -->
@@ -288,12 +289,83 @@
                 <div class="entity-actions">
                     <button class="entity-action-btn primary" onclick="showEnrollForm('person')">+ Enroll Person</button>
                     <button class="entity-action-btn primary" onclick="showEnrollForm('pet')">+ Enroll Pet</button>
+                    <button class="entity-action-btn" style="border-color:#FF9800;color:#FF9800" onclick="showEnrollForm('live')">Enroll from Live</button>
                 </div>
             </div>
 
-            <!-- Enroll Person Form -->
+            <!-- §A1/A3 — Staging Upload + Enroll from Upload (two-step) -->
+            <div class="enroll-form" id="enroll-staging-form" style="display:none">
+                <h3>Step 1: Upload Images</h3>
+                <div class="enroll-field">
+                    <label>Select face/pet images (you can upload multiple times to add more)</label>
+                    <input type="file" id="enroll-staging-files" accept="image/*" multiple>
+                </div>
+                <div class="enroll-submit">
+                    <button class="entity-action-btn primary" onclick="uploadToStaging()">Upload / Add More Images</button>
+                    <button class="entity-action-btn" onclick="hideEnrollForms()">Cancel</button>
+                </div>
+                <div class="enroll-status" id="enroll-staging-status"></div>
+                <div id="staging-preview" style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap"></div>
+            </div>
+
+            <div class="enroll-form" id="enroll-staging-step2" style="display:none">
+                <h3>Step 2: Confirm & Enroll</h3>
+                <div id="staging-thumbs" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px"></div>
+                <div class="enroll-field">
+                    <label>Name *</label>
+                    <input type="text" id="enroll-staging-name" placeholder="e.g. John Doe">
+                </div>
+                <div class="enroll-field" id="enroll-staging-role-field">
+                    <label>Role</label>
+                    <select id="enroll-staging-role">
+                        <option value="VISITOR">Visitor</option>
+                        <option value="OWNER">Owner</option>
+                        <option value="FAMILY">Family</option>
+                        <option value="EMPLOYEE">Employee</option>
+                        <option value="CONTRACTOR">Contractor</option>
+                    </select>
+                </div>
+                <div class="enroll-submit">
+                    <button class="entity-action-btn primary" id="staging-enroll-person-btn" onclick="enrollFromStaging('person')">Enroll as Person</button>
+                    <button class="entity-action-btn primary" style="background:#FF9800;border-color:#FF9800" id="staging-enroll-pet-btn" onclick="enrollFromStaging('pet')">Enroll as Pet</button>
+                    <button class="entity-action-btn" onclick="hideEnrollForms()">Cancel</button>
+                </div>
+                <div class="enroll-status" id="enroll-staging-step2-status"></div>
+            </div>
+
+            <!-- §2.3 — Enroll from Live Camera -->
+            <div class="enroll-form" id="enroll-live-form" style="display:none">
+                <h3>Enroll from Live Camera</h3>
+                <div class="enroll-field">
+                    <label>Camera</label>
+                    <select id="enroll-live-camera" class="idlive-cam-select"></select>
+                </div>
+                <div class="enroll-field">
+                    <label>Name *</label>
+                    <input type="text" id="enroll-live-name" placeholder="e.g. John Doe">
+                </div>
+                <div class="enroll-field">
+                    <label>Role (person only)</label>
+                    <select id="enroll-live-role">
+                        <option value="VISITOR">Visitor</option>
+                        <option value="OWNER">Owner</option>
+                        <option value="FAMILY">Family</option>
+                        <option value="EMPLOYEE">Employee</option>
+                        <option value="CONTRACTOR">Contractor</option>
+                    </select>
+                </div>
+                <div class="enroll-submit">
+                    <button class="entity-action-btn primary" onclick="captureEnroll('person')">Capture &amp; Enroll (Person)</button>
+                    <button class="entity-action-btn primary" style="background:#FF9800;border-color:#FF9800" onclick="captureEnroll('pet')">Capture &amp; Enroll (Pet)</button>
+                    <button class="entity-action-btn" onclick="hideEnrollForms()">Cancel</button>
+                </div>
+                <div class="enroll-status" id="enroll-live-status"></div>
+                <div id="enroll-live-capture-preview" style="margin-top:10px"></div>
+            </div>
+
+            <!-- Legacy Enroll Person Form (hidden, kept for backwards compat) -->
             <div class="enroll-form" id="enroll-person-form">
-                <h3>Enroll Person</h3>
+                <h3>Enroll Person (Direct Upload)</h3>
                 <div class="enroll-field">
                     <label>Name *</label>
                     <input type="text" id="enroll-person-name" placeholder="e.g. John Doe">
@@ -355,6 +427,17 @@
             </div>
             <div id="idlive-content">
                 <div class="idlive-empty">Select a camera to view per-track identity states.</div>
+            </div>
+        </div>
+
+        <!-- ========== DEBUG / DIAGNOSTICS TAB (§C5) ========== -->
+        <div class="tab-content" id="tab-debug">
+            <div class="alerts-header">
+                <h2>System Diagnostics</h2>
+                <button class="entity-action-btn" onclick="loadDiagnostics()">Refresh</button>
+            </div>
+            <div id="diag-content" style="font-size:13px;color:#bbb">
+                <div class="no-alerts">Click Refresh to load diagnostics data.</div>
             </div>
         </div>
     </div>
