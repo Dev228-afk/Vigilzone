@@ -21,6 +21,13 @@ class MyTenantSerializer(serializers.Serializer):
     id = serializers.IntegerField()
     name = serializers.CharField()
     role = serializers.CharField()
+    
+    def to_representation(self, instance):
+        return {
+            "id": instance.tenant.id,
+            "name": instance.tenant.name,
+            "role": instance.role,
+        }
 
 class MemberUserSerializer(serializers.ModelSerializer):
     class Meta:
