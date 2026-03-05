@@ -34,9 +34,11 @@ class Membership(TimeStamped):
     tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="memberships")
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="memberships")
     role = models.CharField(max_length=20, choices=Role.choices, default=Role.MEMBER)
-
     class Meta:
         unique_together = [("tenant", "user")]
+    
+    def __str__(self):
+        return f"{self.user.username} @ {self.tenant.name} ({self.role})"
 
 class Camera(TimeStamped):
     class Status(models.TextChoices):
@@ -100,3 +102,53 @@ class AuditLog(TimeStamped):
     target_type = models.CharField(max_length=64)  # e.g., incident, camera
     target_id = models.CharField(max_length=64, blank=True)
     meta = models.JSONField(default=dict, blank=True)
+
+import secrets
+from django.utils import timezone
+from datetime import timedelta
+
+class Invitation(TimeStamped):
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        ACCEPTED = "accepted", "Accepted"
+        REVOKED = "revoked", "Revoked"
+        EXPIRED = "expired", "Expired"
+
+    tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="invitations")
+    email = models.EmailField()
+    role = models.CharField(max_length=20, choices=Membership.Role.choices, default=Membership.Role.MEMBER)
+
+    invited_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name="sent_invitations")
+    token = models.CharField(max_length=64, unique=True, default="", blank=True)
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.PENDING)
+
+    expires_at = models.DateTimeField()
+
+    accepted_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name="accepted_invitations")
+    accepted_at = models.DateTimeField(null=True, blank=True)
+
+    def save(self, *args, **kwargs):
+        if not self.token:
+            self.token = secrets.token_urlsafe(32)
+        if not self.expires_at:
+            self.expires_at = timezone.now() + timedelta(days=7)
+        super().save(*args, **kwargs)
+
+    def is_valid(self):
+        return self.status == self.Status.PENDING and timezone.now() < self.expires_at
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["tenant", "email"],
+                condition=models.Q(status="pending", expires_at__gt=timezone.now()),
+                name="unique_pending_invitation_per_tenant_email"
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["email", "status"]),
+            models.Index(fields=["tenant", "status"]),
+        ]
+
+    def __str__(self):
+        return f"Invite {self.email} -> {self.tenant.name} ({self.role}) [{self.status}]"

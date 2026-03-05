@@ -43,7 +43,7 @@ INSTALLED_APPS = [
     "django.contrib.staticfiles",
     "rest_framework",
     "corsheaders",
-    "api"
+    "api",
 ]
 
 MIDDLEWARE = [
@@ -143,7 +143,7 @@ USE_TZ = True
 
 # CORS so your React app can call the API in dev
 CORS_ALLOWED_ORIGINS = [
-    "http://localhost:5173",  # Vite
+    "http://localhost:5000",  # Vite
     "http://localhost:3000",  # CRA
 ]
 CORS_ALLOW_CREDENTIALS = True
