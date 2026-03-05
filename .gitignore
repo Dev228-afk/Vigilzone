@@ -22,3 +22,17 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Models (local weights)
+*.pt
+models/
+
+# Data and Evidence
+evidence/
+data/
+alerts/
+backend/server/profiles/
+backend/server/db.sqlite3
+
+# Frontend build artifacts
+frontend/
