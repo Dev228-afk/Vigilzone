@@ -15,9 +15,8 @@ class MembershipAdmin(admin.ModelAdmin):
 
 @admin.register(Profile)
 class ProfileAdmin(admin.ModelAdmin):
-    list_display = ("id", "user", "tenant", "profile_pic", "created_at")
-    search_fields = ("user__username", "tenant__name")
-    list_filter = ("tenant",)
+    list_display = ("id", "user", "bio")
+    search_fields = ("user__username",)
 
 admin.site.register(Camera)
 admin.site.register(Incident)
@@ -31,5 +30,3 @@ class InvitationAdmin(admin.ModelAdmin):
     list_filter = ("status", "role", "tenant")
     search_fields = ("email", "tenant__name")
     readonly_fields = ("token", "created_at", "updated_at")
-
-
