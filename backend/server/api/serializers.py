@@ -17,19 +17,10 @@ class TenantSerializer(serializers.ModelSerializer):
             return membership.role
         return None
 
-class MyTenantSerializer(serializers.ModelSerializer):
-    id = serializers.IntegerField(source="tenant.id")
-    name = serializers.CharField(source="tenant.name")
-
-    def get_role(self, obj):
-        request = self.context.get("request")
-        if not request:
-            return None
-        user = request.user
-        if user.is_superuser:
-            return "owner"
-        m = Membership.objects.filter(user=user, tenant=obj).first()
-        return m.role if m else None
+class MyTenantSerializer(serializers.Serializer):
+    id = serializers.IntegerField()
+    name = serializers.CharField()
+    role = serializers.CharField()
 
 class MemberUserSerializer(serializers.ModelSerializer):
     class Meta:
@@ -82,8 +73,8 @@ class ProfileSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Profile
-        fields = ["id", "user", "tenant", "profile_pic", "created_at"]
-        read_only_fields = ["id", "user", "created_at"]
+        fields = ["id", "user", "bio"]
+        read_only_fields = ["id", "user"]
 
 class InvitationCreateSerializer(serializers.ModelSerializer):
     class Meta:
