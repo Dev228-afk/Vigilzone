@@ -23,10 +23,15 @@ import {
 import { ThemeToggle } from "./ThemeToggle";
 import { LogOut } from "lucide-react";
 import { logout } from "@/lib/auth";
+import { useAuth } from "@/auth/AuthProvider";
 
 export default function NavBar() {
   const [location, setLocation] = useLocation();
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const { user, role } = useAuth();
+  
+  // Format role for display (capitalize first letter)
+  const displayRole = role ? role.charAt(0).toUpperCase() + role.slice(1) : "Member";
 
   const navItems = [
     { path: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
@@ -82,12 +87,12 @@ export default function NavBar() {
         <div className="flex items-center gap-2 sm:gap-3">
           <ThemeToggle />
           <div className="text-right hidden sm:block">
-            <p className="text-sm font-medium">John Doe</p>
-            <p className="text-xs text-muted-foreground">Administrator</p>
+            <p className="text-sm font-medium">{user?.username || "User"}</p>
+            <p className="text-xs text-muted-foreground">{displayRole}</p>
           </div>
           <Avatar data-testid="avatar-user" className="hidden xs:flex">
             <AvatarFallback className="bg-primary text-primary-foreground">
-              JD
+              {user?.username ? user.username.slice(0, 2).toUpperCase() : "U"}
             </AvatarFallback>
           </Avatar>
           <Button
@@ -148,7 +153,7 @@ export default function NavBar() {
                   <div className="flex items-center gap-3 px-4">
                     <Avatar>
                       <AvatarFallback className="bg-primary text-primary-foreground">
-                        JD
+                        {user?.username ? user.username.slice(0, 2).toUpperCase() : "U"}
                       </AvatarFallback>
                     </Avatar>
                     <Button
@@ -165,9 +170,9 @@ export default function NavBar() {
                       Logout
                     </Button>
                     <div>
-                      <p className="text-sm font-medium">John Doe</p>
+                      <p className="text-sm font-medium">{user?.username || "User"}</p>
                       <p className="text-xs text-muted-foreground">
-                        Administrator
+                        {displayRole}
                       </p>
                     </div>
                   </div>

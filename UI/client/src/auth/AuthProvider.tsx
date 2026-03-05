@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useMemo, useCallback } from "react";
+import React, { createContext, useContext, useMemo, useCallback, useEffect } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useLocation } from "wouter";
 import { api } from "@/lib/api";
@@ -7,24 +7,47 @@ import { logout as logoutFn } from "@/lib/auth";
 import { getSelectedTenantId, setSelectedTenantId } from "@/lib/tenant";
 import { roleAtLeast, type TenantRole } from "@/lib/rbac";
 
-type AuthContextResponse = {
-  user: { id: number | string; username: string };
-  tenant: { id: number | string; name: string } | null;
-  role: TenantRole | null;
+// Type for /tenants/mine/ response
+type TenantMembership = {
+  id: number;
+  name: string;
+  role: TenantRole;
 };
 
-async function fetchAuthContext(): Promise<AuthContextResponse> {
-  const { data } = await api.get("/auth/context/"); // implement on backend
-  return data;
-}
+// Full user type from /auth/context/ endpoint
+export type AuthUser = {
+  id: number;
+  username: string;
+  email: string;
+  is_superuser: boolean;
+  is_staff: boolean;
+};
+
+// Response type for /auth/context/ endpoint
+type AuthContextResponse = {
+  user: AuthUser;
+  tenant: { id: number; name: string } | null;
+  role: TenantRole | null;
+};
 
 function hasToken() {
   return !!localStorage.getItem("accessToken") || !!sessionStorage.getItem("accessToken");
 }
 
+async function fetchAuthContext(): Promise<AuthContextResponse> {
+  const { data } = await api.get("/auth/context/");
+  return data;
+}
+
+// Also keep fetchMyTenants as fallback
+async function fetchMyTenants(): Promise<TenantMembership[]> {
+  const { data } = await api.get("/tenants/mine/");
+  return data;
+}
+
 type AuthValue = {
-  user: AuthContextResponse["user"] | null;
-  tenant: AuthContextResponse["tenant"];
+  user: AuthUser | null;
+  tenant: { id: number | string; name: string } | null;
   tenantId: string | null;
   role: TenantRole | null;
 
@@ -42,20 +65,66 @@ const AuthContext = createContext<AuthValue | undefined>(undefined);
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [, setLocation] = useLocation();
-  const tenantId = getSelectedTenantId();
   const tokenPresent = hasToken();
 
-  const q = useQuery({
-    queryKey: ["authContext", tenantId],
+  // Fetch auth context (user + tenant + role)
+  const { data: authContext, isLoading: isLoadingContext } = useQuery({
+    queryKey: ["authContext"],
     queryFn: fetchAuthContext,
-    enabled: tokenPresent && !!tenantId,
+    enabled: tokenPresent,
     retry: false,
-    staleTime: 30_000,
+    staleTime: 60_000,
   });
 
-  const user = q.data?.user ?? null;
-  const tenant = q.data?.tenant ?? null;
-  const role = q.data?.role ?? null;
+  // Fetch user's tenant memberships as fallback
+  const { data: memberships } = useQuery({
+    queryKey: ["myTenants"],
+    queryFn: fetchMyTenants,
+    enabled: tokenPresent && !authContext,
+    retry: false,
+    staleTime: 60_000,
+  });
+
+  // Get current tenantId from storage
+  const tenantId = getSelectedTenantId();
+
+  // Auto-select tenant if user has only one (from memberships)
+  useEffect(() => {
+    if (memberships && memberships.length === 1 && !tenantId) {
+      setSelectedTenantId(String(memberships[0].id));
+    }
+  }, [memberships, tenantId]);
+
+  // Get user from auth context
+  const user = useMemo(() => {
+    return authContext?.user ?? null;
+  }, [authContext]);
+
+  // Get tenant and role from auth context or fallback to memberships
+  const currentTenant = useMemo(() => {
+    if (authContext?.tenant) {
+      return { id: authContext.tenant.id, name: authContext.tenant.name };
+    }
+    if (!tenantId || !memberships) return null;
+    const membership = memberships.find(m => String(m.id) === String(tenantId));
+    return membership ? { id: membership.id, name: membership.name } : null;
+  }, [authContext, tenantId, memberships]);
+
+  const role = useMemo(() => {
+    if (authContext?.role) {
+      return authContext.role;
+    }
+    if (!tenantId || !memberships) return null;
+    const membership = memberships.find(m => String(m.id) === String(tenantId));
+    return membership?.role ?? null;
+  }, [authContext, tenantId, memberships]);
+
+  // Set tenant from auth context if we have one but no tenantId selected
+  useEffect(() => {
+    if (authContext?.tenant && !tenantId) {
+      setSelectedTenantId(String(authContext.tenant.id));
+    }
+  }, [authContext, tenantId]);
 
   const setTenantId = useCallback((id: string | null) => {
     setSelectedTenantId(id);
@@ -74,17 +143,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const value = useMemo<AuthValue>(
     () => ({
       user,
-      tenant,
-      tenantId,
+      tenant: currentTenant,
+      tenantId: tenantId || (authContext?.tenant ? String(authContext.tenant.id) : null),
       role,
-      isLoading: q.isLoading,
-      isAuthenticated: tokenPresent && !!user,
+      isLoading: isLoadingContext,
+      isAuthenticated: tokenPresent && !!authContext,
       setTenantId,
       atLeast,
       logout,
-      refetch: () => q.refetch(),
+      refetch: () => queryClient.invalidateQueries({ queryKey: ["authContext"] }),
     }),
-    [user, tenant, tenantId, role, q.isLoading, tokenPresent, setTenantId, atLeast, logout, q]
+    [user, currentTenant, tenantId, authContext, role, isLoadingContext, tokenPresent, setTenantId, atLeast, logout]
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

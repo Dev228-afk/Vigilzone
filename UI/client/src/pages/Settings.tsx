@@ -6,11 +6,13 @@ import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { useAuth } from "@/auth/AuthProvider";
 
 export default function Settings() {
+  const { user } = useAuth();
   const [profile, setProfile] = useState({
-    fullName: "John Doe",
-    email: "john.doe@example.com",
+    fullName: user?.username || "",
+    email: user?.email || "",
     currentPassword: "",
     newPassword: "",
   });
