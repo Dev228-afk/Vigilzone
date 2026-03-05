@@ -8,7 +8,22 @@ User = get_user_model()
 class RegisterSerializer(serializers.Serializer):
     username = serializers.CharField(max_length=150)
     email = serializers.EmailField()
-    password = serializers.CharField(write_only=True)
+    password = serializers.CharField(write_only=True, min_length=8)
+
+    def validate_username(self, value):
+        if User.objects.filter(username=value).exists():
+            raise serializers.ValidationError("A user with that username already exists.")
+        return value
+
+    def validate_email(self, value):
+        # Email uniqueness is not enforced in Django by default
+        # But we can add validation if needed
+        return value
+
+    def validate_password(self, value):
+        if len(value) < 8:
+            raise serializers.ValidationError("Password must be at least 8 characters long.")
+        return value
 
     def create(self, validated_data):
         return User.objects.create_user(
