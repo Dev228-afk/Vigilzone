@@ -36,3 +36,4 @@ backend/server/db.sqlite3
 
 # Frontend build artifacts
 frontend/
+UI/client/node_modules/
