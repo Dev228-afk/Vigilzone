@@ -3,7 +3,7 @@ from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from api.views import (
     TenantViewSet, MembershipViewSet, CameraViewSet, IncidentViewSet,
-    DetectionViewSet, AlertViewSet, AuditLogViewSet, ProfileViewSet
+    DetectionViewSet, AlertViewSet, AuditLogViewSet, ProfileViewSet, auth_context, InvitationViewSet
 )
 
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
@@ -18,15 +18,18 @@ router.register(r"detections", DetectionViewSet, basename="detection")
 router.register(r"alerts", AlertViewSet, basename="alert")
 router.register(r"audit", AuditLogViewSet, basename="audit")
 router.register(r"profile", ProfileViewSet, basename="profile")
+router.register(r"invitations", InvitationViewSet, basename="invitation")
+
 
 urlpatterns = [
     path("admin/", admin.site.urls),
     path("api/", include(router.urls)),
     # keep your JWT endpoints here if you've added them
 ]
-# !AUTH TOKENS
+# !AUTH
 urlpatterns += [
     path("api/auth/token/", TokenObtainPairView.as_view(), name="token_obtain_pair"),
     path("api/auth/refresh/", TokenRefreshView.as_view(), name="token_refresh"),
     path("api/auth/register/", RegisterView.as_view(), name="register"),
+    path("auth/context/", auth_context),
 ]

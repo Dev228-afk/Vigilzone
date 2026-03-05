@@ -1,5 +1,6 @@
 from rest_framework import serializers
-from .models import Tenant, Membership, Camera, Incident, Detection, Alert, AuditLog, Profile
+from .models import Tenant, Membership, Camera, Incident, Detection, Alert, AuditLog, Profile, Invitation
+from django.contrib.auth.models import User
 
 class TenantSerializer(serializers.ModelSerializer):
     role = serializers.SerializerMethodField()
@@ -10,10 +11,15 @@ class TenantSerializer(serializers.ModelSerializer):
 
     def get_role(self, obj):
         user = self.context["request"].user
-        if user.is_superuser:
-            return "owner"
-        m = Membership.objects.filter(user=user, tenant=obj).first()
-        return m.role if m else None
+        memberships = Membership.objects.filter(tenant=obj)
+        if memberships.exists():
+            membership = memberships.first()
+            return membership.role
+        return None
+
+class MyTenantSerializer(serializers.ModelSerializer):
+    id = serializers.IntegerField(source="tenant.id")
+    name = serializers.CharField(source="tenant.name")
 
     def get_role(self, obj):
         request = self.context.get("request")
@@ -25,15 +31,26 @@ class TenantSerializer(serializers.ModelSerializer):
         m = Membership.objects.filter(user=user, tenant=obj).first()
         return m.role if m else None
 
+class MemberUserSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = User
+        fields = ["id", "username", "email"]
+
 class MembershipSerializer(serializers.ModelSerializer):
+    user = MemberUserSerializer(read_only=True)
+
     class Meta:
         model = Membership
-        fields = "__all__"
+        fields = ["id", "tenant", "user", "role", "created_at", "updated_at"]
+        read_only_fields = ["id", "tenant", "created_at", "updated_at"]
 
+    def to_representation(self, instance):
+        print("USING NESTED MEMBERSHIP SERIALIZER")
+        return super().to_representation(instance)
 class CameraSafeSerializer(serializers.ModelSerializer):
     class Meta:
         model = Camera
-        exclude = ("rtsp_url",)  # don’t leak RTSP in public responses
+        exclude = ("rtsp_url",)  # don't leak RTSP in public responses
 
 class CameraAdminSerializer(serializers.ModelSerializer):
     class Meta:
@@ -67,3 +84,30 @@ class ProfileSerializer(serializers.ModelSerializer):
         model = Profile
         fields = ["id", "user", "tenant", "profile_pic", "created_at"]
         read_only_fields = ["id", "user", "created_at"]
+
+class InvitationCreateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Invitation
+        fields = ["id", "email", "role"]
+
+    def validate_role(self, value):
+        valid = {c[0] for c in Membership.Role.choices}
+        if value not in valid:
+            raise serializers.ValidationError("Invalid role.")
+        return value
+
+
+class PendingInvitationSerializer(serializers.ModelSerializer):
+    tenant = serializers.SerializerMethodField()
+    invited_by = serializers.SerializerMethodField()
+    email = serializers.EmailField(read_only=True)
+
+    class Meta:
+        model = Invitation
+        fields = ["id", "tenant", "email", "role", "invited_by", "expires_at"]
+
+    def get_tenant(self, obj):
+        return {"id": obj.tenant.id, "name": obj.tenant.name}
+
+    def get_invited_by(self, obj):
+        return obj.invited_by.username if obj.invited_by else None

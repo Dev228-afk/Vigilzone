@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import Tenant, Membership, Camera, Incident, Detection, Alert, AuditLog, Profile
+from .models import Tenant, Membership, Camera, Incident, Detection, Alert, AuditLog, Profile, Invitation
 
 @admin.register(Tenant)
 class TenantAdmin(admin.ModelAdmin):
@@ -24,3 +24,12 @@ admin.site.register(Incident)
 admin.site.register(Detection)
 admin.site.register(Alert)
 admin.site.register(AuditLog)
+
+@admin.register(Invitation)
+class InvitationAdmin(admin.ModelAdmin):
+    list_display = ("id", "tenant", "email", "role", "status", "invited_by", "expires_at", "created_at")
+    list_filter = ("status", "role", "tenant")
+    search_fields = ("email", "tenant__name")
+    readonly_fields = ("token", "created_at", "updated_at")
+
+
