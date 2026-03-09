@@ -2,27 +2,35 @@ import { useQuery } from "@tanstack/react-query";
 import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import StatsCard from "@/components/StatsCard";
-import { Activity, Cpu, Database, Wifi, WifiOff, HardDrive, Clock } from "lucide-react";
+import { Activity, Cpu, Database, Wifi, WifiOff, HardDrive, Clock, AlertTriangle, CheckCircle, XCircle } from "lucide-react";
 import { api } from "@/lib/api";
+
+interface DebugData {
+  django: { uptime_seconds: number; db_ok: boolean; debug_mode: boolean };
+  ai: {
+    service: string;
+    version: string;
+    uptime_seconds: number;
+    device: { torch_device?: string; gpu_name?: string; gpu_usable?: boolean };
+    cameras: Array<{ camera_id: string; active: boolean; lanes: string[] }>;
+    webhooks: number;
+    diagnostics: Record<string, unknown>;
+  } | null;
+  ai_cameras: { cameras?: Array<{ camera_id: string; frame_count: number; fps: number; connected?: boolean; last_error?: string; last_frame_ts?: string }> } | null;
+  /* New fields from improved debug_system */
+  ai_reachable?: boolean;
+  ai_error?: string;
+  ai_base_used?: string;
+  ai_urls_tried?: string[];
+  django_cameras?: Array<{ id: number; name: string; status: string; ai_camera_id: string; stream_path: string }>;
+}
 
 export default function Debug() {
   const debugQ = useQuery({
     queryKey: ["debug-system"],
     queryFn: async () => {
       const { data } = await api.get("/debug/system/");
-      return data as {
-        django: { uptime_seconds: number; db_ok: boolean; debug_mode: boolean };
-        ai: {
-          service: string;
-          version: string;
-          uptime_seconds: number;
-          device: { torch_device?: string; gpu_name?: string; gpu_usable?: boolean };
-          cameras: Array<{ camera_id: string; active: boolean; lanes: string[] }>;
-          webhooks: number;
-          diagnostics: Record<string, unknown>;
-        } | null;
-        ai_cameras: { cameras?: Array<{ camera_id: string; frame_count: number; fps: number; connected?: boolean; last_error?: string; last_frame_ts?: string }> } | null;
-      };
+      return data as DebugData;
     },
     refetchInterval: 10_000,
     retry: false,
@@ -31,7 +39,10 @@ export default function Debug() {
   const d = debugQ.data;
   const ai = d?.ai;
   const django = d?.django;
-  const cams = d?.ai_cameras?.cameras ?? ai?.cameras ?? [];
+
+  // Camera data: prefer AI cameras, fall back to django_cameras
+  const aiCams = d?.ai_cameras?.cameras ?? ai?.cameras ?? [];
+  const djangoCams = d?.django_cameras ?? [];
 
   const djangoUptime = django?.uptime_seconds
     ? `${Math.floor(django.uptime_seconds / 3600)}h ${Math.floor((django.uptime_seconds % 3600) / 60)}m`
@@ -63,6 +74,53 @@ export default function Debug() {
         <StatsCard title="Database" value={django?.db_ok ? "OK" : "Error"} icon={Database} />
       </div>
 
+      {/* AI Connectivity Status */}
+      {d && d.ai_reachable !== undefined && (
+        <Card className="p-5 space-y-3">
+          <h2 className="text-lg font-semibold flex items-center gap-2">
+            {d.ai_reachable ? (
+              <CheckCircle className="w-5 h-5 text-green-500" />
+            ) : (
+              <XCircle className="w-5 h-5 text-red-500" />
+            )}
+            AI Connectivity
+          </h2>
+          <div className="text-sm space-y-2">
+            <div className="flex items-center gap-2">
+              <span className="text-muted-foreground">Reachable:</span>
+              <Badge variant={d.ai_reachable ? "default" : "destructive"}>
+                {d.ai_reachable ? "Yes" : "No"}
+              </Badge>
+            </div>
+            {d.ai_base_used && (
+              <div>
+                <span className="text-muted-foreground">Connected via:</span>{" "}
+                <code className="text-xs bg-muted px-1.5 py-0.5 rounded">{d.ai_base_used}</code>
+              </div>
+            )}
+            {d.ai_error && (
+              <div className="flex items-start gap-2 bg-destructive/10 text-destructive p-3 rounded-lg">
+                <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+                <div>
+                  <p className="text-sm font-medium">AI Error</p>
+                  <p className="text-xs mt-1">{d.ai_error}</p>
+                </div>
+              </div>
+            )}
+            {d.ai_urls_tried && d.ai_urls_tried.length > 0 && (
+              <div>
+                <span className="text-muted-foreground text-xs">URLs tried:</span>
+                <div className="flex flex-wrap gap-1 mt-1">
+                  {d.ai_urls_tried.map((url, idx) => (
+                    <code key={idx} className="text-[11px] bg-muted px-1.5 py-0.5 rounded">{url}</code>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        </Card>
+      )}
+
       {/* AI Service */}
       <Card className="p-5 space-y-3">
         <h2 className="text-lg font-semibold flex items-center gap-2">
@@ -90,14 +148,19 @@ export default function Debug() {
             </div>
           </div>
         ) : (
-          <p className="text-muted-foreground text-sm">AI service unavailable</p>
+          <div className="text-sm text-muted-foreground">
+            <p>AI service data not available.</p>
+            {d?.ai_error && (
+              <p className="mt-1 text-xs text-destructive">{d.ai_error}</p>
+            )}
+          </div>
         )}
       </Card>
 
-      {/* Camera Health Table */}
+      {/* Camera Health Table — AI cameras or Django fallback */}
       <Card className="p-5 space-y-3">
         <h2 className="text-lg font-semibold">Camera Ingest Health</h2>
-        {Array.isArray(cams) && cams.length > 0 ? (
+        {Array.isArray(aiCams) && aiCams.length > 0 ? (
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead>
@@ -111,7 +174,7 @@ export default function Debug() {
                 </tr>
               </thead>
               <tbody>
-                {cams.map((cam: any) => (
+                {aiCams.map((cam: any) => (
                   <tr key={cam.camera_id} className="border-b last:border-0">
                     <td className="py-2 pr-4 font-medium">{cam.camera_id}</td>
                     <td className="py-2 pr-4">
@@ -137,6 +200,38 @@ export default function Debug() {
                     <td className="py-2 text-muted-foreground text-xs truncate max-w-[200px]">
                       {cam.last_error || "—"}
                     </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : djangoCams.length > 0 ? (
+          /* Fallback: show Django-registered cameras when AI is unreachable */
+          <div className="overflow-x-auto">
+            <div className="flex items-center gap-2 mb-3 text-xs text-muted-foreground">
+              <AlertTriangle className="w-3.5 h-3.5" />
+              Showing cameras from database (AI ingest data unavailable)
+            </div>
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b text-left text-muted-foreground">
+                  <th className="pb-2 pr-4">Camera</th>
+                  <th className="pb-2 pr-4">Status</th>
+                  <th className="pb-2 pr-4">AI Camera ID</th>
+                  <th className="pb-2">Stream Path</th>
+                </tr>
+              </thead>
+              <tbody>
+                {djangoCams.map((cam) => (
+                  <tr key={cam.id} className="border-b last:border-0">
+                    <td className="py-2 pr-4 font-medium">{cam.name}</td>
+                    <td className="py-2 pr-4">
+                      <Badge variant={cam.status === "active" ? "default" : "secondary"} className="text-xs">
+                        {cam.status}
+                      </Badge>
+                    </td>
+                    <td className="py-2 pr-4 text-xs">{cam.ai_camera_id || "—"}</td>
+                    <td className="py-2 text-xs">{cam.stream_path || "—"}</td>
                   </tr>
                 ))}
               </tbody>

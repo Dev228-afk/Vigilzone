@@ -7,6 +7,7 @@ from api.views import (
     dashboard_summary, KnownEntityViewSet,
     notification_settings, notification_test, notification_register_device,
     debug_system,
+    streams_list, streams_detail, streams_snapshot,
 )
 
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
@@ -47,6 +48,12 @@ urlpatterns += [
 # Debug (§7)
 urlpatterns += [
     path("api/debug/system/", debug_system, name="debug-system"),
+]
+# Streams (§B — WebRTC/HLS URL endpoints)
+urlpatterns += [
+    path("api/streams/", streams_list, name="streams-list"),
+    path("api/streams/<int:camera_id>/", streams_detail, name="streams-detail"),
+    path("api/streams/<int:camera_id>/snapshot/", streams_snapshot, name="streams-snapshot"),
 ]
 # AI Integration (proxy + webhook)
 urlpatterns += [
