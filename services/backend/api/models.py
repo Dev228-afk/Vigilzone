@@ -72,6 +72,10 @@ class Camera(TimeStamped):
         max_length=200, blank=True, default="",
         help_text="Identifier used by the AI module for this camera",
     )
+    stream_path = models.CharField(
+        max_length=200, blank=True, default="",
+        help_text="MediaMTX stream path for WebRTC/HLS (e.g. 'webcam')",
+    )
     # Per-camera AI settings (§3 false-positive reduction)
     min_confidence = models.FloatField(default=0.35, help_text="Detection confidence threshold 0-1")
     min_bbox_area = models.IntegerField(default=400, help_text="Min bounding box area in pixels")

@@ -24,12 +24,6 @@ import {
 } from "lucide-react";
 import { api } from "@/lib/api";
 
-/* ── Static demo images ──────────────────────────────────────── */
-import frontDoorImg from "@assets/generated_images/Front_door_camera_view_eee34996.png";
-import livingRoomImg from "@assets/generated_images/Living_room_camera_view_c398b56c.png";
-import garageImg from "@assets/generated_images/Garage_camera_view_63ee9c11.png";
-import backyardImg from "@assets/generated_images/Backyard_camera_view_1f8a55c4.png";
-
 /* ── Types ──────────────────────────────────────────────────── */
 interface AiCamera {
   camera_id: string;
@@ -37,9 +31,21 @@ interface AiCamera {
   fps?: number;
   resolution?: string;
   active_tracks?: number;
-  imageUrl?: string;
   location?: string;
   [key: string]: unknown;
+}
+
+interface StreamInfo {
+  id: number;
+  name: string;
+  site: string;
+  status: string;
+  ai_camera_id: string;
+  stream_path: string;
+  camera_type: string;
+  webrtc_url: string;
+  whep_url: string;
+  hls_url: string;
 }
 
 interface AiAlert {
@@ -79,10 +85,10 @@ interface AiEntity {
 
 /* ── Demo data (shown when AI module is offline) ──────────── */
 const DEMO_CAMERAS: AiCamera[] = [
-  { camera_id: "front_door", status: "active", fps: 24.8, resolution: "1920x1080", active_tracks: 2, imageUrl: frontDoorImg, location: "Entrance" },
-  { camera_id: "living_room", status: "active", fps: 29.7, resolution: "1920x1080", active_tracks: 1, imageUrl: livingRoomImg, location: "Interior" },
-  { camera_id: "garage", status: "active", fps: 15.2, resolution: "1280x720", active_tracks: 0, imageUrl: garageImg, location: "Garage" },
-  { camera_id: "backyard", status: "active", fps: 22.1, resolution: "1920x1080", active_tracks: 3, imageUrl: backyardImg, location: "Outdoor" },
+  { camera_id: "front_door", status: "active", fps: 24.8, resolution: "1920x1080", active_tracks: 2, location: "Entrance" },
+  { camera_id: "living_room", status: "active", fps: 29.7, resolution: "1920x1080", active_tracks: 1, location: "Interior" },
+  { camera_id: "garage", status: "active", fps: 15.2, resolution: "1280x720", active_tracks: 0, location: "Garage" },
+  { camera_id: "backyard", status: "active", fps: 22.1, resolution: "1920x1080", active_tracks: 3, location: "Outdoor" },
 ];
 
 const DEMO_ALERTS: AiAlert[] = [
@@ -135,6 +141,7 @@ function entityIcon(type: string) {
 /* ── Component ──────────────────────────────────────────────── */
 export default function LiveAI() {
   const [cameras, setCameras] = useState<AiCamera[]>([]);
+  const [streams, setStreams] = useState<StreamInfo[]>([]);
   const [alerts, setAlerts] = useState<AiAlert[]>([]);
   const [entities, setEntities] = useState<AiEntity[]>([]);
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
@@ -142,23 +149,19 @@ export default function LiveAI() {
   const [loading, setLoading] = useState(true);
   const [isLive, setIsLive] = useState(false); // true = connected to real AI
 
-  /* ── Determine demo image for a camera ─────────────────────── */
-  const cameraImage = useCallback((camId: string) => {
-    const cam = cameras.find((c) => c.camera_id === camId);
-    if (cam?.imageUrl) return cam.imageUrl;
-    // Fallback mapping for known demo camera IDs
-    const map: Record<string, string> = {
-      front_door: frontDoorImg,
-      living_room: livingRoomImg,
-      garage: garageImg,
-      backyard: backyardImg,
-    };
-    return map[camId] ?? null;
-  }, [cameras]);
-
   /* ── Fetch data — real AI first, fallback to demo ──────────── */
   const fetchData = useCallback(async () => {
     setLoading(true);
+
+    // Always fetch streams from Django (no AI dependency)
+    try {
+      const streamRes = await api.get("/streams/");
+      const streamData: StreamInfo[] = Array.isArray(streamRes.data) ? streamRes.data : [];
+      setStreams(streamData);
+    } catch {
+      setStreams([]);
+    }
+
     try {
       const [camRes, alertRes] = await Promise.all([
         api.get("/ai/cameras/"),
@@ -222,76 +225,17 @@ export default function LiveAI() {
     return () => clearInterval(iv);
   }, [fetchData]);
 
-  /* ── Live frame fetching via authenticated blob URLs ─────────── */
-  const [liveBlobUrl, setLiveBlobUrl] = useState<string | null>(null);
-  const [displayFps, setDisplayFps] = useState<number>(0);
-
-  useEffect(() => {
-    if (!isLive || !selectedCamera) {
-      setLiveBlobUrl(null);
-      setDisplayFps(0);
-      return;
-    }
-    let cancelled = false;
-    let prevUrl: string | null = null;
-    let frameCount = 0;
-    let fpsStart = performance.now();
-
-    // Adaptive fetch — immediately queue next frame after current one arrives.
-    // We request a downscaled JPEG (quality=50, maxw=640) for fast display.
-    // The AI inference pipeline still processes the full-resolution frame.
-    const TARGET_INTERVAL = 200; // ms — aim for ~5 FPS display
-
-    const fetchFrame = async () => {
-      if (cancelled) return;
-      const t0 = performance.now();
-      try {
-        const resp = await api.get(`/ai/frame/${selectedCamera}/`, {
-          responseType: "blob",
-          params: { t: Date.now(), quality: 50, maxw: 640 },
-        });
-        if (cancelled) return;
-        const url = URL.createObjectURL(resp.data);
-        setLiveBlobUrl((old) => {
-          if (old) URL.revokeObjectURL(old);
-          return url;
-        });
-        prevUrl = url;
-
-        // FPS measurement
-        frameCount++;
-        const elapsed = performance.now() - fpsStart;
-        if (elapsed >= 1000) {
-          setDisplayFps(frameCount / (elapsed / 1000));
-          frameCount = 0;
-          fpsStart = performance.now();
-        }
-      } catch {
-        // frame fetch failed — leave previous image
-      }
-
-      if (cancelled) return;
-      // Schedule next fetch: honour minimum interval so we don't flood
-      const fetchTime = performance.now() - t0;
-      const delay = Math.max(TARGET_INTERVAL - fetchTime, 50);
-      setTimeout(fetchFrame, delay);
-    };
-
-    fetchFrame();
-    return () => {
-      cancelled = true;
-      if (prevUrl) URL.revokeObjectURL(prevUrl);
-    };
-  }, [isLive, selectedCamera]);
-
-  /* ── Snapshot URL (live blob) or static image (demo) ───────── */
-  const snapshotUrl = selectedCamera
-    ? isLive
-      ? liveBlobUrl
-      : cameraImage(selectedCamera)
-    : null;
+  /* ── Derive WebRTC URL for the selected camera ────────────── */
+  const getStreamUrl = useCallback((camId: string): string | null => {
+    // Match by ai_camera_id or stream_path
+    const match = streams.find(
+      (s) => s.ai_camera_id === camId || s.stream_path === camId
+    );
+    return match?.webrtc_url ?? null;
+  }, [streams]);
 
   const selectedCam = cameras.find((c) => c.camera_id === selectedCamera);
+  const selectedStreamUrl = selectedCamera ? getStreamUrl(selectedCamera) : null;
 
   /* ── Render ─────────────────────────────────────────────────── */
   return (
@@ -381,7 +325,11 @@ export default function LiveAI() {
                 <div className="divide-y">
                   {cameras.map((cam) => {
                     const isSelected = selectedCamera === cam.camera_id;
-                    const preview = cameraImage(cam.camera_id);
+                    const stream = streams.find(
+                      (s) => s.ai_camera_id === cam.camera_id || s.stream_path === cam.camera_id
+                    );
+                    // Use snapshot endpoint for thumbnails (cached, no AI dependency)
+                    const thumbUrl = stream ? `/api/streams/${stream.id}/snapshot/` : null;
                     return (
                       <button
                         key={cam.camera_id}
@@ -393,8 +341,8 @@ export default function LiveAI() {
                         <div className="flex gap-3">
                           {/* Thumbnail */}
                           <div className="w-20 h-14 rounded overflow-hidden bg-muted shrink-0">
-                            {preview ? (
-                              <img src={preview} alt={cam.camera_id} className="w-full h-full object-cover" />
+                            {thumbUrl ? (
+                              <img src={thumbUrl} alt={cam.camera_id} className="w-full h-full object-cover" />
                             ) : (
                               <div className="w-full h-full flex items-center justify-center text-muted-foreground">
                                 <Camera className="w-5 h-5" />
@@ -459,43 +407,47 @@ export default function LiveAI() {
             </div>
           </CardHeader>
           <CardContent>
-            {snapshotUrl ? (
-              <div className="relative">
-                <img
-                  key={selectedCamera}
-                  src={snapshotUrl}
-                  alt={`Snapshot from ${selectedCamera}`}
-                  className="w-full rounded-lg border bg-muted object-cover aspect-video"
-                  onError={(e) => {
-                    // If live snapshot fails, try demo image
-                    const demoImg = cameraImage(selectedCamera!);
-                    if (demoImg && (e.target as HTMLImageElement).src !== demoImg) {
-                      (e.target as HTMLImageElement).src = demoImg;
-                    }
-                  }}
-                />
-                {/* Overlay info */}
-                <div className="absolute bottom-3 left-3 flex gap-2">
-                  <Badge variant="secondary" className="bg-black/60 text-white border-0 text-xs">
-                    {selectedCam?.resolution ?? "1920x1080"}
-                  </Badge>
-                  <Badge variant="secondary" className="bg-black/60 text-white border-0 text-xs">
-                    {isLive && displayFps > 0
-                      ? `${displayFps.toFixed(1)} FPS`
-                      : `${selectedCam?.fps?.toFixed(1) ?? "—"} FPS`}
-                  </Badge>
-                  {(selectedCam?.active_tracks ?? 0) > 0 && (
+            {selectedCamera ? (
+              selectedStreamUrl ? (
+                <div className="relative">
+                  <iframe
+                    key={selectedCamera}
+                    src={selectedStreamUrl}
+                    title={`Live feed — ${selectedCamera}`}
+                    className="w-full rounded-lg border bg-muted aspect-video"
+                    allow="autoplay; encrypted-media"
+                    sandbox="allow-scripts allow-same-origin"
+                  />
+                  {/* Overlay info */}
+                  <div className="absolute bottom-3 left-3 flex gap-2">
                     <Badge variant="secondary" className="bg-black/60 text-white border-0 text-xs">
-                      {selectedCam?.active_tracks} tracks
+                      {selectedCam?.resolution ?? "1920x1080"}
                     </Badge>
-                  )}
+                    <Badge variant="secondary" className="bg-black/60 text-white border-0 text-xs">
+                      {selectedCam?.fps?.toFixed(1) ?? "—"} FPS
+                    </Badge>
+                    {(selectedCam?.active_tracks ?? 0) > 0 && (
+                      <Badge variant="secondary" className="bg-black/60 text-white border-0 text-xs">
+                        {selectedCam?.active_tracks} tracks
+                      </Badge>
+                    )}
+                  </div>
+                  <div className="absolute top-3 right-3">
+                    <span className="text-[11px] bg-black/60 text-white px-2 py-0.5 rounded">
+                      WebRTC
+                    </span>
+                  </div>
                 </div>
-                <div className="absolute top-3 right-3">
-                  <span className="text-[11px] bg-black/60 text-white px-2 py-0.5 rounded">
-                    {new Date().toLocaleTimeString()}
-                  </span>
+              ) : (
+                <div className="aspect-video flex items-center justify-center bg-muted rounded-lg text-muted-foreground">
+                  <div className="text-center">
+                    <Camera className="w-12 h-12 mx-auto mb-2 opacity-40" />
+                    <p className="text-sm font-medium">Feed unavailable</p>
+                    <p className="text-xs mt-1">No stream URL mapped for this camera.</p>
+                    <p className="text-xs">Check camera stream_path in Settings → Cameras.</p>
+                  </div>
                 </div>
-              </div>
+              )
             ) : (
               <div className="aspect-video flex items-center justify-center bg-muted rounded-lg text-muted-foreground">
                 <div className="text-center">

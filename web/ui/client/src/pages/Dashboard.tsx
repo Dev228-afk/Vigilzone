@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import { useLocation } from "wouter";
 import { useQuery } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
@@ -8,7 +8,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import CameraFeed from "@/components/CameraFeed";
 import AlertCard from "@/components/AlertCard";
 import StatsCard from "@/components/StatsCard";
-import { Maximize2, Pause, Play, Activity, Clock, TrendingUp, User, Dog, Car } from "lucide-react";
+import { Maximize2, Activity, Clock, TrendingUp, User, Dog, Car } from "lucide-react";
 import { PieChart, Pie, Cell, ResponsiveContainer, Legend, Tooltip } from "recharts";
 import { api } from "@/lib/api";
 
@@ -44,7 +44,6 @@ const CustomPieLabel = ({ cx, cy, midAngle, innerRadius, outerRadius, percentage
 
 export default function Dashboard() {
   const [, setLocation] = useLocation();
-  const [isPaused, setIsPaused] = useState(false);
   const [zoneFilter, setZoneFilter] = useState("all");
 
   /* ── Queries ──────────────────────────────────────────────── */
@@ -67,6 +66,21 @@ export default function Dashboard() {
     retry: false,
   });
 
+  /** Streams endpoint — returns WebRTC / HLS URLs per camera (no AI dependency) */
+  const streamsQ = useQuery({
+    queryKey: ["streams"],
+    queryFn: async () => {
+      const { data } = await api.get("/streams/");
+      return data as Array<{
+        id: number; name: string; site: string; status: string;
+        ai_camera_id: string; stream_path: string; camera_type: string;
+        webrtc_url: string; whep_url: string; hls_url: string;
+      }>;
+    },
+    refetchInterval: 30_000,
+    retry: false,
+  });
+
   const entitiesQ = useQuery({
     queryKey: ["ai-entities-dash"],
     queryFn: async () => {
@@ -80,26 +94,25 @@ export default function Dashboard() {
 
   /* ── Derived data ────────────────────────────────────────── */
   const d = dashboardQ.data;
+  const streams = streamsQ.data ?? [];
 
-  // Live snapshot ticker — refreshes every 3 seconds
-  const [frameTick, setFrameTick] = useState(0);
-  useEffect(() => {
-    if (isPaused) return;
-    const t = setInterval(() => setFrameTick((n) => n + 1), 3000);
-    return () => clearInterval(t);
-  }, [isPaused]);
+  // Build a lookup: camera id → stream info
+  const streamMap = new Map(streams.map((s) => [s.id, s]));
 
-  const cameras = (d?.cameras ?? []).map((c) => ({
-    id: c.id,
-    name: c.name,
-    location: c.site || "Unknown",
-    status: (c.status === "active" ? "active" : "offline") as "active" | "offline",
-    ai_camera_id: c.ai_camera_id,
-    // Live AI frame if camera has an ai_camera_id, else static fallback
-    imageUrl: c.ai_camera_id
-      ? `/api/ai/frame/${c.ai_camera_id}/?quality=50&maxw=640&t=${frameTick}`
-      : frontDoorImg,
-  }));
+  const cameras = (d?.cameras ?? []).map((c) => {
+    const stream = streamMap.get(c.id);
+    return {
+      id: c.id,
+      name: c.name,
+      location: c.site || "Unknown",
+      status: (c.status === "active" ? "active" : "offline") as "active" | "offline",
+      ai_camera_id: c.ai_camera_id,
+      // WebRTC iframe URL — primary live feed (no AI dependency)
+      streamUrl: stream?.webrtc_url ?? undefined,
+      // Static fallback image if no stream available
+      imageUrl: frontDoorImg,
+    };
+  });
 
   const alerts = (d?.recent_incidents ?? []).slice(0, 5).map((inc) => ({
     id: inc.id,
@@ -163,12 +176,13 @@ export default function Dashboard() {
           <div>
             <h2 className="text-lg font-semibold mb-4">Live Feeds</h2>
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-1 gap-3">
-              {(cameras.length > 0 ? cameras : [{ name: "No cameras", location: "-", status: "offline" as const, imageUrl: frontDoorImg }]).map((camera, idx) => (
+              {(cameras.length > 0 ? cameras : [{ name: "No cameras", location: "-", status: "offline" as const, streamUrl: undefined, imageUrl: frontDoorImg }]).map((camera, idx) => (
                 <CameraFeed
                   key={idx}
                   name={camera.name}
                   location={camera.location}
                   status={camera.status}
+                  streamUrl={camera.streamUrl}
                   imageUrl={camera.imageUrl}
                   timestamp={new Date().toLocaleTimeString()}
                 />
@@ -179,10 +193,6 @@ export default function Dashboard() {
             <Button variant="outline" className="flex-1" data-testid="button-fullscreen">
               <Maximize2 className="w-4 h-4 mr-2" />
               View Fullscreen
-            </Button>
-            <Button variant="outline" className="flex-1" onClick={() => setIsPaused(!isPaused)} data-testid="button-pause-stream">
-              {isPaused ? <Play className="w-4 h-4 mr-2" /> : <Pause className="w-4 h-4 mr-2" />}
-              {isPaused ? "Resume" : "Pause"} Stream
             </Button>
           </div>
         </div>

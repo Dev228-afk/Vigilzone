@@ -14,6 +14,7 @@ from .models import (
 from .serializers import (
     TenantSerializer, MyTenantSerializer, MembershipSerializer,
     CameraSafeSerializer, CameraAdminSerializer, CameraWriteSerializer,
+    CameraStreamSerializer,
     IncidentSerializer, DetectionSerializer, AlertSerializer, AuditLogSerializer,
     ProfileSerializer, InvitationCreateSerializer, PendingInvitationSerializer,
     KnownEntitySerializer, CameraZoneSerializer, NotificationChannelSerializer,
@@ -673,6 +674,96 @@ class InvitationViewSet(viewsets.ModelViewSet):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# §B  STREAM ENDPOINTS (WebRTC/HLS URLs)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def streams_list(request):
+    """GET /api/streams/ — list cameras with derived WebRTC/HLS URLs."""
+    tenant = get_active_tenant(request)
+    if not assert_member(request, tenant):
+        raise PermissionDenied()
+    cameras = Camera.objects.filter(tenant=tenant).order_by("name")
+    return Response(CameraStreamSerializer(cameras, many=True).data)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def streams_detail(request, camera_id):
+    """GET /api/streams/<camera_id>/ — single camera stream URLs."""
+    tenant = get_active_tenant(request)
+    if not assert_member(request, tenant):
+        raise PermissionDenied()
+    try:
+        camera = Camera.objects.get(pk=camera_id, tenant=tenant)
+    except Camera.DoesNotExist:
+        return Response({"error": "Camera not found"}, status=status.HTTP_404_NOT_FOUND)
+    return Response(CameraStreamSerializer(camera).data)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def streams_snapshot(request, camera_id):
+    """GET /api/streams/<camera_id>/snapshot/ — grab a still frame via FFmpeg from RTSP."""
+    import subprocess
+    import tempfile
+    import time as _time
+
+    tenant = get_active_tenant(request)
+    if not assert_member(request, tenant):
+        raise PermissionDenied()
+    try:
+        camera = Camera.objects.get(pk=camera_id, tenant=tenant)
+    except Camera.DoesNotExist:
+        return Response({"error": "Camera not found"}, status=status.HTTP_404_NOT_FOUND)
+
+    # Determine RTSP source
+    stream_path = camera.stream_path or camera.ai_camera_id or f"cam_{camera.pk}"
+    rtsp_url = camera.rtsp_url or f"rtsp://mediamtx:8554/{stream_path}"
+
+    # Simple cache: store last snapshot per camera in memory
+    cache_key = f"_snapshot_{camera.pk}"
+    cached = getattr(streams_snapshot, '_cache', {}).get(cache_key)
+    now = _time.time()
+    if cached and (now - cached['ts']) < 3.0:
+        from django.http import HttpResponse
+        return HttpResponse(cached['data'], content_type='image/jpeg')
+
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-rtsp_transport", "tcp",
+                "-i", rtsp_url,
+                "-frames:v", "1",
+                "-q:v", "5",
+                "-f", "image2", "-vcodec", "mjpeg",
+                "pipe:1",
+            ],
+            capture_output=True, timeout=8,
+        )
+        if result.returncode != 0 or not result.stdout:
+            return Response({"error": "Failed to capture frame"}, status=status.HTTP_502_BAD_GATEWAY)
+
+        # Cache it
+        if not hasattr(streams_snapshot, '_cache'):
+            streams_snapshot._cache = {}
+        streams_snapshot._cache[cache_key] = {'ts': now, 'data': result.stdout}
+
+        from django.http import HttpResponse
+        resp = HttpResponse(result.stdout, content_type='image/jpeg')
+        resp['Cache-Control'] = 'no-store'
+        return resp
+    except FileNotFoundError:
+        return Response({"error": "ffmpeg not installed on backend"}, status=status.HTTP_501_NOT_IMPLEMENTED)
+    except subprocess.TimeoutExpired:
+        return Response({"error": "RTSP snapshot timed out"}, status=status.HTTP_504_GATEWAY_TIMEOUT)
+    except Exception as exc:
+        return Response({"error": str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # §4  NOTIFICATION SETTINGS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -793,10 +884,27 @@ _DJANGO_START = timezone.now()
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def debug_system(request):
-    """GET /api/debug/system/ — aggregated system diagnostics."""
+    """GET /api/debug/system/ — aggregated system diagnostics with AI fallbacks."""
     import requests as http_client
 
-    ai_base = os.getenv("AI_BASE_INTERNAL", "http://127.0.0.1:8080")
+    # Try multiple AI base URLs in order
+    ai_base_env = os.getenv("AI_BASE_INTERNAL", "")
+    ai_candidates = [
+        url for url in [
+            ai_base_env,
+            "http://ai:8080",
+            "http://127.0.0.1:8080",
+            "http://localhost:8080",
+        ] if url
+    ]
+    # Deduplicate while preserving order
+    seen = set()
+    ai_urls = []
+    for u in ai_candidates:
+        u = u.rstrip("/")
+        if u not in seen:
+            seen.add(u)
+            ai_urls.append(u)
 
     # Django info
     django_uptime = (timezone.now() - _DJANGO_START).total_seconds()
@@ -809,21 +917,49 @@ def debug_system(request):
     except Exception:
         pass
 
-    # AI info (best effort)
+    # AI info — try each URL until one works
+    ai_reachable = False
+    ai_error = None
+    ai_base_used = None
     ai_status = None
     ai_cameras = None
-    try:
-        r = http_client.get(f"{ai_base}/api/v1/system/status", timeout=3)
-        if r.status_code == 200:
-            ai_status = r.json()
-    except Exception:
-        pass
-    try:
-        r = http_client.get(f"{ai_base}/api/v1/cameras", timeout=3)
-        if r.status_code == 200:
-            ai_cameras = r.json()
-    except Exception:
-        pass
+
+    for base_url in ai_urls:
+        try:
+            r = http_client.get(f"{base_url}/api/v1/health", timeout=3)
+            if r.status_code == 200:
+                ai_reachable = True
+                ai_base_used = base_url
+                break
+        except Exception:
+            continue
+
+    if ai_reachable and ai_base_used:
+        try:
+            r = http_client.get(f"{ai_base_used}/api/v1/system/status", timeout=5)
+            if r.status_code == 200:
+                ai_status = r.json()
+        except Exception as exc:
+            ai_error = f"status fetch failed: {exc}"
+        try:
+            r = http_client.get(f"{ai_base_used}/api/v1/cameras", timeout=5)
+            if r.status_code == 200:
+                ai_cameras = r.json()
+        except Exception:
+            pass
+    else:
+        ai_error = f"AI unreachable at all candidates: {ai_urls}"
+
+    # Fallback camera data from Django DB
+    django_cameras = None
+    if not ai_cameras:
+        tenant = get_active_tenant(request, required=False)
+        if tenant:
+            django_cameras = list(
+                Camera.objects.filter(tenant=tenant).values(
+                    "id", "name", "status", "ai_camera_id", "stream_path"
+                )
+            )
 
     return Response({
         "django": {
@@ -833,4 +969,9 @@ def debug_system(request):
         },
         "ai": ai_status,
         "ai_cameras": ai_cameras,
+        "ai_reachable": ai_reachable,
+        "ai_error": ai_error,
+        "ai_base_used": ai_base_used,
+        "ai_urls_tried": ai_urls,
+        "django_cameras": django_cameras,
     })

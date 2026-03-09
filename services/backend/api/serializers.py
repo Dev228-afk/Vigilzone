@@ -53,6 +53,33 @@ class CameraSafeSerializer(serializers.ModelSerializer):
         model = Camera
         exclude = ("rtsp_url",)  # don't leak RTSP in public responses
 
+
+class CameraStreamSerializer(serializers.ModelSerializer):
+    """Read-only serializer that exposes stream URLs derived from stream_path."""
+    webrtc_url = serializers.SerializerMethodField()
+    whep_url = serializers.SerializerMethodField()
+    hls_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Camera
+        fields = ["id", "name", "site", "status", "ai_camera_id", "stream_path",
+                  "camera_type", "webrtc_url", "whep_url", "hls_url"]
+
+    def _stream_path(self, obj):
+        return obj.stream_path or obj.ai_camera_id or f"cam_{obj.pk}"
+
+    def get_webrtc_url(self, obj):
+        p = self._stream_path(obj)
+        return f"/webrtc/{p}" if p else None
+
+    def get_whep_url(self, obj):
+        p = self._stream_path(obj)
+        return f"/webrtc/{p}/whep" if p else None
+
+    def get_hls_url(self, obj):
+        p = self._stream_path(obj)
+        return f"/hls/{p}" if p else None
+
 class CameraAdminSerializer(serializers.ModelSerializer):
     class Meta:
         model = Camera
@@ -73,7 +100,7 @@ class CameraWriteSerializer(serializers.ModelSerializer):
     class Meta:
         model = Camera
         fields = [
-            "id", "name", "site", "rtsp_url", "ai_camera_id", "status",
+            "id", "name", "site", "rtsp_url", "ai_camera_id", "stream_path", "status",
             "camera_type", "min_confidence", "min_bbox_area",
             "k_of_n_k", "k_of_n_n", "cooldown_s",
             "created_at", "updated_at", "tenant",
