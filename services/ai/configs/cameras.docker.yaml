@@ -1,0 +1,32 @@
+# Camera Configuration — Docker deployment (MediaMTX RTSP)
+# This config is used when running via docker-compose.
+# The webcam_publisher service publishes to mediamtx:8554/webcam.
+
+cameras:
+  # ---- RTSP camera from MediaMTX (primary for Docker) ----
+  - camera_id: webcam
+    rtsp_url: "rtsp://mediamtx:8554/webcam"
+    ingest_backend: opencv
+    sample_hz:
+      detector: 5
+      anomaly: 2
+      temporal: 0.5
+      identity: 3
+    enabled_lanes:
+      - rt_detr
+      - yolov8_fallback
+      - yolo_pose
+      - fire_smoke_yolo
+      - violence_candidate
+      - fall_candidate
+      - weapon_yolo
+      - anyanomaly
+      - anomalyclip
+      - temporal_verifier
+      - person_zone
+      - entity_identity
+    k_of_n: [4, 7]
+    cooldown_s: 30
+    evidence:
+      pre_s: 5
+      post_s: 5

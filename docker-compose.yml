@@ -1,0 +1,100 @@
+version: "3.9"
+
+services:
+  # ── Django REST API ─────────────────────────────────────────
+  backend:
+    build:
+      context: ./services/backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - DJANGO_DEBUG=${DJANGO_DEBUG:-1}
+      - SECRET_KEY=${SECRET_KEY:-django-insecure-dev-only-change-me}
+      - ALLOWED_HOSTS=${ALLOWED_HOSTS:-localhost,127.0.0.1,backend,nginx}
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-http://localhost:8085,http://localhost:3000}
+      - AI_BASE_INTERNAL=${AI_BASE_INTERNAL:-http://ai:8080}
+      - AI_WEBHOOK_SECRET=${AI_WEBHOOK_SECRET:-vigilzone-webhook-secret}
+      - AI_WEBHOOK_TOKEN=${AI_WEBHOOK_TOKEN:-}
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-http://backend:8000}
+    volumes:
+      - backend-db:/app/db
+    depends_on:
+      - ai
+    networks:
+      - vigilzone
+    restart: unless-stopped
+
+  # ── MediaMTX RTSP server ────────────────────────────────────
+  # Receives RTSP publish from webcam_publisher and serves it
+  # to the AI module (and anyone else) via RTSP on port 8554.
+  mediamtx:
+    image: bluenviron/mediamtx:latest-ffmpeg
+    ports:
+      - "8554:8554"     # RTSP
+      - "8889:8889"     # WebRTC (optional, for browser preview)
+      - "8888:8888"     # HLS   (optional, for browser preview)
+    environment:
+      - MTX_PROTOCOLS=tcp
+    networks:
+      - vigilzone
+    restart: unless-stopped
+
+  # ── Webcam → RTSP publisher ─────────────────────────────────
+  # Linux: captures /dev/video0 with v4l2 and publishes to MediaMTX.
+  # Fallback: generates an SMPTE test pattern if no webcam is available.
+  webcam_publisher:
+    build:
+      context: ./services/webcam_publisher
+      dockerfile: Dockerfile
+    depends_on:
+      - mediamtx
+    devices:
+      - /dev/video0:/dev/video0   # Linux host webcam (ignored if absent)
+    environment:
+      - RTSP_TARGET=rtsp://mediamtx:8554/webcam
+      - INPUT_DEVICE=/dev/video0
+      - FALLBACK_MODE=${WEBCAM_FALLBACK:-testsrc}
+    networks:
+      - vigilzone
+    restart: unless-stopped
+
+  # ── AI FastAPI microservice ─────────────────────────────────
+  ai:
+    build:
+      context: ./services/ai
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    volumes:
+      - ai-evidence:/app/evidence
+      - ai-data:/app/data
+    environment:
+      - PYTHONUNBUFFERED=1
+    depends_on:
+      - mediamtx
+    networks:
+      - vigilzone
+    restart: unless-stopped
+
+  # ── Nginx reverse proxy + UI static files ───────────────────
+  nginx:
+    build:
+      context: .
+      dockerfile: web/ui/Dockerfile
+    ports:
+      - "8085:8085"
+    depends_on:
+      - backend
+    networks:
+      - vigilzone
+    restart: unless-stopped
+
+volumes:
+  backend-db:
+  ai-evidence:
+  ai-data:
+
+networks:
+  vigilzone:
+    driver: bridge
