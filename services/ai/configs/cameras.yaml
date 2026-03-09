@@ -1,0 +1,106 @@
+# Camera Configuration — matches spec §4
+# Supports: RTSP streams, local video files, live webcam
+# ingest_backend: opencv | ffmpeg | live_camera | deepstream
+# source_type: rtsp | live_camera
+
+cameras:
+  # ---- Option 1: RTSP camera ----
+  # Uncomment and set your RTSP URL to use an IP / network camera
+  # - camera_id: cam1
+  #   rtsp_url: "rtsp://admin:password@192.168.1.100:554/stream1"
+  #   ingest_backend: opencv
+  #   sample_hz:
+  #     detector: 2
+  #     anomaly: 0.5
+  #     temporal: 0.2
+  #   k_of_n: [3, 5]
+  #   cooldown_s: 45
+  #   enabled_lanes:
+  #     - rt_detr
+  #     - yolov8_fallback
+  #     - fire_smoke_yolo
+  #     - anyanomaly
+  #     - anomalyclip
+  #     - temporal_verifier
+  #     - person_zone
+  #   evidence:
+  #     pre_s: 5
+  #     post_s: 5
+
+  # ---- Option 2: Live webcam (active by default) ----
+  - camera_id: cam_live
+    source_type: live_camera
+    camera_index: 0               # 0 = default webcam
+    ingest_backend: live_camera
+    sample_hz:
+      detector: 5
+      anomaly: 2
+      temporal: 0.5
+      identity: 3
+    enabled_lanes:
+      - rt_detr
+      - yolov8_fallback
+      - yolo_pose
+      - fire_smoke_yolo
+      - violence_candidate
+      - fall_candidate
+      - weapon_yolo
+      - anyanomaly
+      - anomalyclip
+      - temporal_verifier
+      - person_zone
+      - entity_identity
+    k_of_n: [4, 7]
+    cooldown_s: 30
+    evidence:
+      pre_s: 5
+      post_s: 5
+
+  # ---- Test mode: local video file ----
+  # - camera_id: test_cam
+  #   rtsp_url: "test_video.mp4"
+  #   ingest_backend: opencv
+  #   sample_hz:
+  #     detector: 2
+  #     anomaly: 0.5
+  #     temporal: 0.2
+  #   enabled_lanes:
+  #     - yolov8_fallback
+  #     - fire_smoke_yolo
+  #     - person_zone
+  #   k_of_n: [3, 5]
+  #   cooldown_s: 45
+  #   evidence:
+  #     pre_s: 5
+  #     post_s: 5
+
+  # ---- Docker mode: RTSP from MediaMTX ----
+  # Uncomment this and comment out cam_live above when using docker-compose.
+  # The webcam_publisher service pushes the host webcam (or test pattern)
+  # to rtsp://mediamtx:8554/webcam, which the AI module reads here.
+  # - camera_id: webcam
+  #   rtsp_url: "rtsp://mediamtx:8554/webcam"
+  #   ingest_backend: opencv
+  #   sample_hz:
+  #     detector: 5
+  #     anomaly: 2
+  #     temporal: 0.5
+  #     identity: 3
+  #   enabled_lanes:
+  #     - rt_detr
+  #     - yolov8_fallback
+  #     - yolo_pose
+  #     - fire_smoke_yolo
+  #     - violence_candidate
+  #     - fall_candidate
+  #     - weapon_yolo
+  #     - anyanomaly
+  #     - anomalyclip
+  #     - temporal_verifier
+  #     - person_zone
+  #     - entity_identity
+  #   k_of_n: [4, 7]
+  #   cooldown_s: 30
+  #   evidence:
+  #     pre_s: 5
+  #     post_s: 5
