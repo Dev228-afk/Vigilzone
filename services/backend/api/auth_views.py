@@ -1,8 +1,18 @@
 from rest_framework import serializers, views, status
 from rest_framework.response import Response
 from django.contrib.auth import get_user_model
+from django.conf import settings
+from django.db import transaction
+
+from .models import Tenant, Membership
 
 User = get_user_model()
+
+# Feature flag — when True a personal Tenant + owner Membership are created
+# alongside the new user so they never get stuck on "Select community".
+AUTO_CREATE_TENANT_ON_REGISTER = getattr(
+    settings, "AUTO_CREATE_TENANT_ON_REGISTER", True
+)
 
 
 class RegisterSerializer(serializers.Serializer):
@@ -37,9 +47,26 @@ class RegisterView(views.APIView):
     permission_classes = []
     authentication_classes = []
 
+    @transaction.atomic
     def post(self, request):
         serializer = RegisterSerializer(data=request.data)
         if serializer.is_valid():
-            serializer.save()
-            return Response({"message": "User registered successfully"}, status=status.HTTP_201_CREATED)
+            user = serializer.save()
+
+            tenant_payload = None
+            if AUTO_CREATE_TENANT_ON_REGISTER:
+                tenant_name = f"{user.username}'s Community"
+                tenant = Tenant.objects.create(name=tenant_name)
+                Membership.objects.create(
+                    user=user, tenant=tenant, role=Membership.Role.OWNER,
+                )
+                tenant_payload = {"id": tenant.id, "name": tenant.name}
+
+            return Response(
+                {
+                    "message": "User registered successfully",
+                    "tenant": tenant_payload,
+                },
+                status=status.HTTP_201_CREATED,
+            )
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)

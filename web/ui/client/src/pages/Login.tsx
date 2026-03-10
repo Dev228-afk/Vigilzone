@@ -8,7 +8,9 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
 import { Shield } from "lucide-react";
 import { login } from "@/lib/auth";
-import { getUserTenants } from "@/lib/user";
+import { api } from "@/lib/api";
+import { setSelectedTenantId } from "@/lib/tenant";
+import { queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 
 export default function Login() {
@@ -31,27 +33,33 @@ export default function Login() {
       setLoading(true);
 
       await login(username, password);
-      const tenants = await getUserTenants();
 
-      if (Array.isArray(tenants) && tenants.length > 0) {
+      // Fetch auth context to discover tenant membership
+      const { data: ctx } = await api.get("/auth/context/");
+
+      if (ctx.tenant) {
+        // Backend returned a tenant (either from header or auto-selected single membership)
+        setSelectedTenantId(String(ctx.tenant.id));
+        queryClient.invalidateQueries();
         toast({
           title: "Welcome back!",
           description: "Redirecting to your dashboard…",
         });
-        setTimeout(() => setLocation("/dashboard"), 800);
+        setTimeout(() => setLocation("/dashboard"), 400);
       } else {
+        // No tenant resolved — send to community selection
         toast({
           title: "One more step",
           description: "Please select your community.",
         });
-        setTimeout(() => setLocation("/select-community"), 800);
+        setTimeout(() => setLocation("/select-community"), 400);
       }
     } catch (err) {
       console.error(err);
       toast({
         title: "Login failed",
         description: "Invalid email/username or password.",
-        variant: "destructive", // works if your Toast supports it
+        variant: "destructive",
       });
     } finally {
       setLoading(false);

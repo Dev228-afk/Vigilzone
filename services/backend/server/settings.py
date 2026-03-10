@@ -167,6 +167,11 @@ STATIC_URL = "static/"
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
+# ── VigilZone feature flags ──────────────────────────────────
+AUTO_CREATE_TENANT_ON_REGISTER = bool(
+    int(os.getenv("AUTO_CREATE_TENANT_ON_REGISTER", "1"))
+)
+
 # ── Email (§4 Notifications) ──────────────────────────────────
 # Dev: console backend (prints emails to stdout).
 # Production: set SENDGRID_API_KEY or SMTP env vars.

@@ -1,9 +1,9 @@
 # ── Create VigilZone Context Zip ────────────────────────────
-# Packages all key source files into a single zip for sharing
-# context with AI assistants, code reviewers, etc.
-# ────────────────────────────────────────────────────────────
+# Packages the repository into a zip while excluding large model
+# weights, virtual envs, node_modules, caches, and logs.
+# Usage: run from any PowerShell prompt; adjust $root/ $zipOut if needed.
 
-$ErrorActionPreference = "SilentlyContinue"
+$ErrorActionPreference = "Stop"
 $root = "c:\Users\devan\OneDrive\Desktop\yolov12-cls\vigilzone-monolith"
 $zipOut = "c:\Users\devan\OneDrive\Desktop\yolov12-cls\vigilzone-context.zip"
 $tempDir = "$env:TEMP\vigilzone-context"
@@ -13,111 +13,67 @@ if (Test-Path $tempDir) { Remove-Item $tempDir -Recurse -Force }
 if (Test-Path $zipOut)  { Remove-Item $zipOut -Force }
 New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
 
-# Collect file list (relative to monorepo root)
-$relPaths = @(
-    # Docker & config
-    "docker-compose.yml",
-    ".env.example",
-    "README.md",
+# Exclude patterns (directories and globs)
+$excludeDirs = @('node_modules', '\\.venv', '\\venv', '__pycache__')
+$excludeFilePatterns = @('*.log')
 
-    # Backend — Django
-    "services/backend/Dockerfile",
-    "services/backend/requirements.txt",
-    "services/backend/manage.py",
-    "services/backend/server/settings.py",
-    "services/backend/server/urls.py",
-    "services/backend/server/wsgi.py",
-    "services/backend/api/models.py",
-    "services/backend/api/serializers.py",
-    "services/backend/api/views.py",
-    "services/backend/api/urls.py",
-    "services/backend/api/admin.py",
-    "services/backend/api/apps.py",
-    "services/backend/ai_integration/views.py",
-    "services/backend/ai_integration/urls.py",
-    "services/backend/ai_integration/proxy.py",
-    "services/backend/ai_integration/apps.py",
-    "services/backend/ai_integration/management/commands/register_ai_webhook.py",
-    "services/backend/ai_integration/management/commands/close_stale_incidents.py",
+# Common model weight extensions to exclude
+$excludeExt = @('.pt','.onnx','.pth','.bin','.mat','.tar','.tgz','.zip','.ckpt')
 
-    # AI service
-    "services/ai/Dockerfile",
-    "services/ai/requirements.txt",
-    "services/ai/run.py",
-    "services/ai/configs/cameras.yaml",
-    "services/ai/configs/cameras.docker.yaml",
-    "services/ai/configs/models.yaml",
-    "services/ai/configs/zones.yaml",
-    "services/ai/configs/policy.yaml",
-    "services/ai/src/api/server.py",
-    "services/ai/src/common/config.py",
-    "services/ai/src/app.py",
+# Also exclude very large files by size (MB)
+$maxSizeMB = 50
 
-    # Webcam publisher
-    "services/webcam_publisher/Dockerfile",
-    "services/webcam_publisher/entrypoint.sh",
+Write-Host "Scanning files under $root (this may take a while)..." -ForegroundColor Cyan
 
-    # UI — React/Vite
-    "web/ui/vite.config.ts",
-    "web/ui/package.json",
-    "web/ui/tsconfig.json",
-    "web/ui/client/src/main.tsx",
-    "web/ui/client/src/App.tsx",
-    "web/ui/client/src/index.css",
-    "web/ui/client/src/lib/api.ts",
-    "web/ui/client/src/lib/memberships.ts",
-    "web/ui/client/src/lib/invitations.ts",
-    "web/ui/client/src/auth/AuthProvider.tsx",
-    "web/ui/client/src/pages/Dashboard.tsx",
-    "web/ui/client/src/pages/LiveAI.tsx",
-    "web/ui/client/src/pages/Cameras.tsx",
-    "web/ui/client/src/pages/Incidents.tsx",
-    "web/ui/client/src/pages/IncidentDetails.tsx",
-    "web/ui/client/src/pages/Reports.tsx",
-    "web/ui/client/src/pages/Settings.tsx",
-    "web/ui/client/src/pages/Community.tsx",
-    "web/ui/client/src/pages/Entities.tsx",
-    "web/ui/client/src/pages/Login.tsx",
-    "web/ui/client/src/pages/Register.tsx",
-    "web/ui/client/src/pages/ForgotPassword.tsx",
-    "web/ui/client/src/pages/SelectCommunity.tsx",
-    "web/ui/client/src/components/NavBar.tsx",
+$files = Get-ChildItem -Path $root -Recurse -File -Force -ErrorAction SilentlyContinue |
+    Where-Object {
+        $full = $_.FullName
+        # Skip the output zip itself
+        if ($full -ieq $zipOut) { return $false }
 
-    # Nginx
-    "deploy/nginx/nginx.conf",
+        # Exclude if any excluded dir is in the path
+        foreach ($token in $excludeDirs) {
+            if ($full -match [regex]::Escape($token)) { return $false }
+        }
 
-    # Tests
-    "tests/acceptance.sh",
-    "tests/acceptance.ps1"
-)
+        # Exclude log files
+        foreach ($pat in $excludeFilePatterns) {
+            if ($full -like $pat) { return $false }
+        }
+
+        # Exclude by extension
+        if ($excludeExt -contains $_.Extension.ToLower()) { return $false }
+
+        # Exclude by size
+        if ($_.Length -gt ($maxSizeMB * 1MB)) { return $false }
+
+        return $true
+    }
 
 $copied = 0
-$missing = 0
-foreach ($rel in $relPaths) {
-    $src = Join-Path $root ($rel -replace '/', '\')
-    if (Test-Path $src) {
-        $dest = Join-Path $tempDir $rel
+$skipped = 0
+foreach ($f in $files) {
+    try {
+        $relPath = $f.FullName.Substring($root.Length).TrimStart('\','/')
+        $dest = Join-Path $tempDir $relPath
         $destDir = Split-Path $dest -Parent
-        if (-not (Test-Path $destDir)) {
-            New-Item -ItemType Directory -Path $destDir -Force | Out-Null
-        }
-        Copy-Item $src $dest -Force
+        if (-not (Test-Path $destDir)) { New-Item -ItemType Directory -Path $destDir -Force | Out-Null }
+        Copy-Item -LiteralPath $f.FullName -Destination $dest -Force
         $copied++
-    } else {
-        $missing++
-        Write-Host "  SKIP (not found): $rel" -ForegroundColor DarkYellow
+    } catch {
+        Write-Host "SKIP (error copying): $($f.FullName) — $($_.Exception.Message)" -ForegroundColor Yellow
+        $skipped++
     }
 }
 
-# Also include instructions.md from ai_module if it exists
-$inst = "c:\Users\devan\OneDrive\Desktop\yolov12-cls\ai_module\instructions.md"
-if (Test-Path $inst) {
-    $destInst = Join-Path $tempDir "instructions.md"
-    Copy-Item $inst $destInst -Force
+# Optionally include top-level helper docs if present (legacy)
+$legacyInst = "c:\Users\devan\OneDrive\Desktop\yolov12-cls\ai_module\instructions.md"
+if (Test-Path $legacyInst) {
+    Copy-Item $legacyInst (Join-Path $tempDir 'instructions.md') -Force
     $copied++
 }
 
-Write-Host "`nFiles copied: $copied, skipped: $missing" -ForegroundColor Cyan
+Write-Host "`nFiles copied: $copied, skipped: $skipped" -ForegroundColor Cyan
 
 # Create zip
 Compress-Archive -Path "$tempDir\*" -DestinationPath $zipOut -Force
