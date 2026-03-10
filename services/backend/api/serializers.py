@@ -1,4 +1,5 @@
 from rest_framework import serializers
+from django.utils.text import slugify
 from .models import (
     Tenant, Membership, Camera, CameraZone, Incident, Detection,
     Alert, AuditLog, Profile, Invitation, KnownEntity, NotificationChannel,
@@ -129,6 +130,16 @@ class CameraWriteSerializer(serializers.ModelSerializer):
             attrs["rtsp_url"] = attrs.pop("streamUrl")
         else:
             attrs.pop("streamUrl", None)
+
+        # ── Auto-derive stream_path when empty ──────────────────────
+        if not attrs.get("stream_path"):
+            # Prefer ai_camera_id, then slugified name, then leave for
+            # model.save() to handle with cam_{pk} fallback
+            if attrs.get("ai_camera_id"):
+                attrs["stream_path"] = attrs["ai_camera_id"]
+            elif attrs.get("name"):
+                attrs["stream_path"] = slugify(attrs["name"])
+
         return attrs
 
     def to_representation(self, instance):

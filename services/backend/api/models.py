@@ -83,6 +83,16 @@ class Camera(TimeStamped):
     k_of_n_n = models.IntegerField(default=5, help_text="K-of-N persistence: out of N")
     cooldown_s = models.IntegerField(default=45, help_text="Alert cooldown seconds")
 
+    def save(self, *args, **kwargs):
+        """Auto-derive stream_path if empty (ensures MediaMTX URLs always resolve)."""
+        if not self.stream_path:
+            from django.utils.text import slugify
+            if self.ai_camera_id:
+                self.stream_path = self.ai_camera_id
+            elif self.name:
+                self.stream_path = slugify(self.name)
+        super().save(*args, **kwargs)
+
 
 class CameraZone(TimeStamped):
     """Intrusion / monitoring zone polygon for a camera."""

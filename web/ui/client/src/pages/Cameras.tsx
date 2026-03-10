@@ -20,6 +20,7 @@ interface Camera {
   status: "active" | "inactive";
   rtsp_url?: string;
   ai_camera_id: string;
+  stream_path?: string;
   created_at: string;
   tenant?: number;
 }
@@ -27,7 +28,7 @@ interface Camera {
 export default function Cameras() {
   const { toast } = useToast();
   const [isDialogOpen, setIsDialogOpen] = useState(false);
-  const [newCamera, setNewCamera] = useState({ name: "", site: "", rtsp_url: "", ai_camera_id: "" });
+  const [newCamera, setNewCamera] = useState({ name: "", site: "", rtsp_url: "", ai_camera_id: "", stream_path: "" });
 
   /* ── Fetch cameras ─────────────────────────────────────────── */
   const camerasQ = useQuery({
@@ -47,6 +48,7 @@ export default function Cameras() {
         site: cam.site,
         rtsp_url: cam.rtsp_url,
         ai_camera_id: cam.ai_camera_id,
+        stream_path: cam.stream_path,
         status: "active",
       });
       // Auto-sync to AI module if we have an RTSP URL
@@ -64,7 +66,7 @@ export default function Cameras() {
     onSuccess: () => {
       toast({ title: "Camera added" });
       queryClient.invalidateQueries({ queryKey: ["cameras"] });
-      setNewCamera({ name: "", site: "", rtsp_url: "", ai_camera_id: "" });
+      setNewCamera({ name: "", site: "", rtsp_url: "", ai_camera_id: "", stream_path: "" });
       setIsDialogOpen(false);
     },
     onError: () => {
@@ -170,6 +172,19 @@ export default function Cameras() {
                   data-testid="input-ai-camera-id"
                 />
               </div>
+              <div className="space-y-2">
+                <Label htmlFor="stream-path">Stream Path (optional)</Label>
+                <Input
+                  id="stream-path"
+                  placeholder="e.g., webcam — auto-derived from name if empty"
+                  value={newCamera.stream_path}
+                  onChange={(e) => setNewCamera({ ...newCamera, stream_path: e.target.value })}
+                  data-testid="input-stream-path"
+                />
+                <p className="text-xs text-muted-foreground">
+                  MediaMTX path used for WebRTC/HLS. Leave blank to auto-derive from the camera name.
+                </p>
+              </div>
             </div>
             <DialogFooter>
               <Button variant="outline" onClick={handleTestConnection} data-testid="button-test-connection">
@@ -190,6 +205,7 @@ export default function Cameras() {
               <TableHead>Camera Name</TableHead>
               <TableHead>Location</TableHead>
               <TableHead>AI Camera ID</TableHead>
+              <TableHead>Stream Path</TableHead>
               <TableHead>Status</TableHead>
               <TableHead>Added On</TableHead>
               <TableHead className="text-right">Actions</TableHead>
@@ -198,7 +214,7 @@ export default function Cameras() {
           <TableBody>
             {cameras.length === 0 && (
               <TableRow>
-                <TableCell colSpan={6} className="text-center text-muted-foreground py-8">
+                <TableCell colSpan={7} className="text-center text-muted-foreground py-8">
                   No cameras registered yet. Click "Add Camera" to get started.
                 </TableCell>
               </TableRow>
@@ -210,6 +226,11 @@ export default function Cameras() {
                 <TableCell>
                   {camera.ai_camera_id ? (
                     <Badge variant="outline">{camera.ai_camera_id}</Badge>
+                  ) : "—"}
+                </TableCell>
+                <TableCell>
+                  {camera.stream_path ? (
+                    <Badge variant="outline">{camera.stream_path}</Badge>
                   ) : "—"}
                 </TableCell>
                 <TableCell>

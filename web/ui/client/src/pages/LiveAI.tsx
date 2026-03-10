@@ -23,6 +23,7 @@ import {
   Zap,
 } from "lucide-react";
 import { api } from "@/lib/api";
+import AuthImage from "@/components/AuthImage";
 
 /* ── Types ──────────────────────────────────────────────────── */
 interface AiCamera {
@@ -342,7 +343,17 @@ export default function LiveAI() {
                           {/* Thumbnail */}
                           <div className="w-20 h-14 rounded overflow-hidden bg-muted shrink-0">
                             {thumbUrl ? (
-                              <img src={thumbUrl} alt={cam.camera_id} className="w-full h-full object-cover" />
+                              <AuthImage
+                                src={thumbUrl}
+                                alt={cam.camera_id}
+                                className="w-full h-full object-cover"
+                                refreshInterval={15_000}
+                                fallback={
+                                  <div className="w-full h-full flex items-center justify-center text-muted-foreground">
+                                    <Camera className="w-5 h-5" />
+                                  </div>
+                                }
+                              />
                             ) : (
                               <div className="w-full h-full flex items-center justify-center text-muted-foreground">
                                 <Camera className="w-5 h-5" />
@@ -583,10 +594,11 @@ export default function LiveAI() {
                       </p>
                     </div>
                     {alert.evidence?.keyframe && (
-                      <img
-                        src={`/api/ai/evidence/${alert.evidence.keyframe}`}
+                      <AuthImage
+                        src={`/ai/evidence/${alert.evidence.keyframe}`}
                         alt="evidence"
                         className="w-16 h-12 object-cover rounded border shrink-0"
+                        refreshInterval={0}
                       />
                     )}
                   </div>

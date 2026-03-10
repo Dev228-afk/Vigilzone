@@ -845,6 +845,13 @@ class CCTVAIModule:
             stabilizer=self.identity_stabilizer,
             enrollment_cfg=self.models_cfg.get("identity", {}).get("enrollment", {}),
         )
+        # Provide shared context so register can hot-create CameraProcessors
+        self.api_server.set_app_context({
+            "evidence_exporter": self.evidence_exporter,
+            "models_cfg": self.models_cfg,
+            "zones_cfg": self.zones_cfg,
+            "anyanomaly_client": getattr(self, "anyanomaly_client", None),
+        })
         self.api_thread = threading.Thread(target=self.api_server.run, daemon=True)
         self.api_thread.start()
 
