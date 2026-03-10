@@ -330,7 +330,8 @@ export default function LiveAI() {
                       (s) => s.ai_camera_id === cam.camera_id || s.stream_path === cam.camera_id
                     );
                     // Use snapshot endpoint for thumbnails (cached, no AI dependency)
-                    const thumbUrl = stream ? `/api/streams/${stream.id}/snapshot/` : null;
+                    // URL is relative to axios baseURL (/api), so no /api prefix here
+                    const thumbUrl = stream ? `/streams/${stream.id}/snapshot/` : null;
                     return (
                       <button
                         key={cam.camera_id}

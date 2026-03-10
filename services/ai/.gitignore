@@ -59,6 +59,9 @@ Thumbs.db
 
 # Runtime data (generated at runtime)
 data/entities.db
+data/entities.db-shm
+data/entities.db-wal
+data/webhooks.json
 data/embeddings/*
 data/enroll_images/*
 data/staging_uploads/*
@@ -74,3 +77,6 @@ uploads/*
 
 # Archives
 *.zip
+
+# Runtime-cloned repos (auto-fetched by Doctor at startup)
+third_party/

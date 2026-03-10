@@ -17,10 +17,19 @@ interface CameraFeedProps {
 
 /**
  * Determines if a URL needs authenticated fetching (API route).
+ * Handles both "/api/..." (full path) and "/streams/..." (relative to baseURL).
  * Static imports (data URLs, relative assets) can be used directly.
  */
 function isApiUrl(url: string): boolean {
-  return url.startsWith("/api/");
+  return url.startsWith("/api/") || url.startsWith("/streams/") || url.startsWith("/ai/");
+}
+
+/**
+ * Strip leading "/api" when present so axios baseURL ("/api") doesn't double it.
+ */
+function normalizeForAxios(url: string): string {
+  if (url.startsWith("/api/")) return url.slice(4); // "/api/streams/..." → "/streams/..."
+  return url;
 }
 
 export default function CameraFeed({ name, location, status, imageUrl, streamUrl, timestamp }: CameraFeedProps) {
@@ -43,7 +52,7 @@ export default function CameraFeed({ name, location, status, imageUrl, streamUrl
 
     (async () => {
       try {
-        const resp = await api.get(imageUrl, { responseType: "blob" });
+        const resp = await api.get(normalizeForAxios(imageUrl), { responseType: "blob" });
         if (cancelled) return;
         const url = URL.createObjectURL(resp.data);
         if (prevBlobRef.current) URL.revokeObjectURL(prevBlobRef.current);

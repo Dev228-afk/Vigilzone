@@ -716,10 +716,16 @@ def streams_detail(request, camera_id):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def streams_snapshot(request, camera_id):
-    """GET /api/streams/<camera_id>/snapshot/ — grab a still frame via FFmpeg from RTSP."""
+    """
+    GET /api/streams/<camera_id>/snapshot/
+    Grab a still frame.  Pipeline:
+      1. ffmpeg from RTSP (fast, no AI dependency)
+      2. AI module fallback — auto-detect which endpoint exists
+    Returns image/jpeg with X-Snapshot-Source header.
+    """
     import subprocess
-    import tempfile
     import time as _time
+    import requests as http_client
 
     tenant = get_active_tenant(request)
     if not assert_member(request, tenant):
@@ -729,18 +735,34 @@ def streams_snapshot(request, camera_id):
     except Camera.DoesNotExist:
         return Response({"error": "Camera not found"}, status=status.HTTP_404_NOT_FOUND)
 
-    # Determine RTSP source
-    stream_path = camera.stream_path or camera.ai_camera_id or f"cam_{camera.pk}"
+    # ── Identifiers ──────────────────────────────────────────
+    ai_cam_id = camera.ai_camera_id or f"cam_{camera.pk}"
+    stream_path = camera.stream_path or ai_cam_id
     rtsp_url = camera.rtsp_url or f"rtsp://mediamtx:8554/{stream_path}"
+    ai_base = os.getenv("AI_BASE_INTERNAL", "http://127.0.0.1:8080")
 
-    # Simple cache: store last snapshot per camera in memory
+    # ── In-memory cache (3 s TTL) ────────────────────────────
     cache_key = f"_snapshot_{camera.pk}"
-    cached = getattr(streams_snapshot, '_cache', {}).get(cache_key)
+    if not hasattr(streams_snapshot, "_cache"):
+        streams_snapshot._cache = {}
+    cached = streams_snapshot._cache.get(cache_key)
     now = _time.time()
-    if cached and (now - cached['ts']) < 3.0:
+    if cached and (now - cached["ts"]) < 3.0:
         from django.http import HttpResponse
-        return HttpResponse(cached['data'], content_type='image/jpeg')
+        resp = HttpResponse(cached["data"], content_type="image/jpeg")
+        resp["Cache-Control"] = "no-store"
+        resp["X-Snapshot-Source"] = cached.get("source", "cache")
+        return resp
 
+    def _make_jpeg_response(data: bytes, source: str):
+        from django.http import HttpResponse
+        streams_snapshot._cache[cache_key] = {"ts": _time.time(), "data": data, "source": source}
+        resp = HttpResponse(data, content_type="image/jpeg")
+        resp["Cache-Control"] = "no-store"
+        resp["X-Snapshot-Source"] = source
+        return resp
+
+    # ── Step 1: ffmpeg from RTSP ─────────────────────────────
     try:
         result = subprocess.run(
             [
@@ -751,26 +773,37 @@ def streams_snapshot(request, camera_id):
                 "-f", "image2", "-vcodec", "mjpeg",
                 "pipe:1",
             ],
-            capture_output=True, timeout=8,
+            capture_output=True,
+            timeout=8,
         )
-        if result.returncode != 0 or not result.stdout:
-            return Response({"error": "Failed to capture frame"}, status=status.HTTP_502_BAD_GATEWAY)
-
-        # Cache it
-        if not hasattr(streams_snapshot, '_cache'):
-            streams_snapshot._cache = {}
-        streams_snapshot._cache[cache_key] = {'ts': now, 'data': result.stdout}
-
-        from django.http import HttpResponse
-        resp = HttpResponse(result.stdout, content_type='image/jpeg')
-        resp['Cache-Control'] = 'no-store'
-        return resp
+        if result.returncode == 0 and result.stdout:
+            return _make_jpeg_response(result.stdout, "ffmpeg")
     except FileNotFoundError:
-        return Response({"error": "ffmpeg not installed on backend"}, status=status.HTTP_501_NOT_IMPLEMENTED)
+        pass   # ffmpeg not installed — fall through to AI
     except subprocess.TimeoutExpired:
-        return Response({"error": "RTSP snapshot timed out"}, status=status.HTTP_504_GATEWAY_TIMEOUT)
-    except Exception as exc:
-        return Response({"error": str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        pass   # RTSP timed out — fall through to AI
+    except Exception:
+        pass
+
+    # ── Step 2: AI module fallback (auto-detect endpoint) ────
+    ai_endpoints = [
+        f"{ai_base}/frame/{ai_cam_id}",
+        f"{ai_base}/api/v1/cameras/{ai_cam_id}/snapshot",
+        f"{ai_base}/api/v1/cameras/{ai_cam_id}/frame",
+    ]
+    for endpoint in ai_endpoints:
+        try:
+            ai_resp = http_client.get(endpoint, timeout=2)
+            ct = ai_resp.headers.get("Content-Type", "")
+            if ai_resp.status_code == 200 and "image" in ct and ai_resp.content:
+                return _make_jpeg_response(ai_resp.content, f"ai_fallback:{endpoint}")
+        except Exception:
+            continue
+
+    return Response(
+        {"error": "Snapshot unavailable — ffmpeg and AI fallback both failed"},
+        status=status.HTTP_502_BAD_GATEWAY,
+    )
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

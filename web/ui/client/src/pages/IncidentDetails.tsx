@@ -83,7 +83,7 @@ export default function IncidentDetails() {
   const clipUrl = (incident?.details as any)?.clip_url ?? "";
   const aiCameraId = (incident?.details as any)?.ai_camera_id ?? "";
   const snapshotUrl = incident?.media_key
-    || (aiCameraId ? `/api/ai/frame/${aiCameraId}/` : "");
+    || (aiCameraId ? `/ai/frame/${aiCameraId}/` : "");
 
   // Auto-refresh live frame every 3s when falling back to AI feed
   useEffect(() => {

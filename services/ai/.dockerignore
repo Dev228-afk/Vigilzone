@@ -1,0 +1,19 @@
+# Version control
+.git
+.gitignore
+
+# Documentation
+README.md
+instructions.md
+
+# Local data (runtime-created, not needed in image)
+evidence/
+uploads/
+alerts/
+data/
+logs/
+__pycache__/
+*.pyc
+
+# Validation script (dev-only)
+validate.py

@@ -1,0 +1,46 @@
+# ── Python ─────────────────────────────────────────────────────
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# ── Node ──────────────────────────────────────────────────────
+node_modules/
+web/ui/dist/
+
+# ── IDE / OS ──────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ── Git ───────────────────────────────────────────────────────
+.git/
+.gitignore
+
+# ── Logs & runtime ────────────────────────────────────────────
+*.log
+logs/
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+
+# ── Model weights (large) ────────────────────────────────────
+*.pt
+*.onnx
+*.pth
+*.bin
+*.mat
+*.ckpt
+
+# ── Archives / misc ──────────────────────────────────────────
+*.zip
+*.tar
+*.tgz
+*.gz
+repomix-output.xml
+create-context-zip.ps1
+scripts/list-zip.ps1

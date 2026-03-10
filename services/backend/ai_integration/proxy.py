@@ -12,7 +12,7 @@ from django.http import StreamingHttpResponse, JsonResponse, HttpResponse
 
 logger = logging.getLogger(__name__)
 
-AI_BASE = os.getenv("AI_BASE_INTERNAL", "http://ai:8080")
+AI_BASE = os.getenv("AI_BASE_INTERNAL", "http://127.0.0.1:8080")
 _CONNECT_TIMEOUT = 5   # fast-fail if AI service is unreachable
 _READ_TIMEOUT = 30     # seconds for non-streaming reads
 _STREAM_TIMEOUT = 120
