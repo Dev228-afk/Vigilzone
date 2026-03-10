@@ -147,8 +147,18 @@ class CameraViewSet(TenantScopedViewSet):
                 ai_data = resp.json()
                 camera.ai_camera_id = ai_data.get("camera_id", payload["camera_id"])
                 camera.status = Camera.Status.ACTIVE
-                camera.save(update_fields=["ai_camera_id", "status", "updated_at"])
-                return Response({"status": "synced", "ai_camera_id": camera.ai_camera_id})
+                # Ensure stream_path is populated (auto-derive triggers on save)
+                update_fields = ["ai_camera_id", "status", "updated_at"]
+                if not camera.stream_path:
+                    camera.stream_path = camera.ai_camera_id
+                    update_fields.append("stream_path")
+                camera.save(update_fields=update_fields)
+                return Response({
+                    "status": "synced",
+                    "ai_camera_id": camera.ai_camera_id,
+                    "stream_path": camera.stream_path,
+                    "hot_loaded": ai_data.get("hot_loaded", False),
+                })
             else:
                 camera.status = Camera.Status.INACTIVE
                 camera.save(update_fields=["status", "updated_at"])

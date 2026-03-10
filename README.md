@@ -127,22 +127,80 @@ Open **http://localhost:5173** — login with your user credentials.
 
 The `webcam_publisher` service captures the host webcam and publishes it to MediaMTX via RTSP. The AI module then reads the RTSP stream.
 
+### Streaming Architecture
+
+```
+Camera/Webcam ──RTSP──▶ MediaMTX :8554
+                           │
+                           ├── AI Module reads  rtsp://mediamtx:8554/<stream_path>
+                           ├── WebRTC viewer    /webrtc/<stream_path>  (port 8889, proxied via Nginx)
+                           └── HLS viewer       /hls/<stream_path>    (port 8888, proxied via Nginx)
+
+Nginx :8085
+   ├─ /webrtc/*  →  mediamtx:8889   (WebRTC signalling + media)
+   └─ /hls/*     →  mediamtx:8888   (HLS segments)
+
+React UI loads:
+   <iframe src="/webrtc/<stream_path>">   (main live feed via WebRTC)
+   AuthImage src="/api/streams/{id}/snapshot/"  (thumbnails — JWT-authenticated blob fetch)
+```
+
+### Stream Path Mapping
+
+Each camera in Django has a `stream_path` field that maps to a MediaMTX publish path.
+
+| Camera Name | `stream_path` | MediaMTX RTSP URL | WebRTC URL |
+|-------------|---------------|-------------------|------------|
+| Webcam (dev) | `webcam` | `rtsp://mediamtx:8554/webcam` | `/webrtc/webcam` |
+| Front Door | `front-door` | `rtsp://mediamtx:8554/front-door` | `/webrtc/front-door` |
+
+If `stream_path` is left blank when creating a camera, it is auto-derived:
+1. From `ai_camera_id` if set
+2. From `slugify(name)` otherwise (e.g. "Front Door" → "front-door")
+
 ### Docker mode
 - `webcam_publisher` reads `/dev/video0` (Linux) or generates an SMPTE test pattern as fallback
 - Publishes to `rtsp://mediamtx:8554/webcam`
 - AI ingests via `cameras.docker.yaml` (`camera_id: webcam`, `rtsp_url: rtsp://mediamtx:8554/webcam`)
+- WebRTC/HLS proxied through Nginx at `/webrtc/webcam` and `/hls/webcam`
+
+### Local dev (Windows)
+
+#### Without MediaMTX (simplest)
+The AI module uses `cam_live` with `live_camera` backend (OpenCV, index 0) — reads the webcam directly.
+No streaming URLs will work in the UI, but AI detection runs.
+
+#### With MediaMTX (full streaming)
+1. Download [MediaMTX](https://github.com/bluenviron/mediamtx/releases) for Windows
+2. Run `mediamtx.exe` (listens on :8554 RTSP, :8889 WebRTC, :8888 HLS)
+3. Publish your webcam:
+   ```powershell
+   ffmpeg -f dshow -i video="<webcam name>" -c:v libx264 -preset ultrafast -tune zerolatency -f rtsp rtsp://localhost:8554/webcam
+   ```
+4. In `cameras.yaml`, use the `cam1` entry with `rtsp_url: rtsp://localhost:8554/webcam`
+5. In Django, create a camera with `stream_path = webcam`
+6. Vite proxies `/webrtc` → `localhost:8889` and `/hls` → `localhost:8888` automatically
+
+### Adding a real RTSP camera
+1. Configure the camera to publish RTSP (e.g. `rtsp://192.168.1.100:554/stream1`)
+2. **(Option A) Direct** — Set `rtsp_url` on the Django camera and `stream_path` to match a MediaMTX path. Relay via MediaMTX: add a `paths:` entry in `mediamtx.yml` pointing the source to the camera's RTSP URL.
+3. **(Option B) AI-only** — Set `rtsp_url` on the Django camera and sync to AI. AI reads directly; no WebRTC in the UI.
+
+### Vite Dev Proxy
+
+The Vite dev server proxies `/api`, `/webrtc`, and `/hls` so the React app can reach all services.
+Defaults work for local dev; override with env vars when targets differ:
+
+```bash
+VITE_PROXY_TARGET=http://192.168.1.50:8000       # Django backend
+VITE_MEDIAMTX_TARGET=http://192.168.1.50:8889    # MediaMTX WebRTC
+VITE_MEDIAMTX_HLS_TARGET=http://192.168.1.50:8888 # MediaMTX HLS
+```
 
 ### Fallback modes
 Set `WEBCAM_FALLBACK` env var:
 - `testsrc` (default) — SMPTE colour bars with timestamp overlay
 - `mp4` — Loop a test video file (set `FALLBACK_MP4` path)
-
-### Local dev (Windows)
-The AI module uses `cam_live` with `live_camera` backend (OpenCV, index 0) — no MediaMTX needed. To use RTSP locally:
-1. Download [MediaMTX](https://github.com/bluenviron/mediamtx/releases) for Windows
-2. Run `mediamtx.exe`
-3. Publish: `ffmpeg -f dshow -i video="<webcam name>" -c:v libx264 -preset ultrafast -f rtsp rtsp://localhost:8554/webcam`
-4. Uncomment the `webcam` camera entry in `cameras.yaml`
 
 ## Environment Variables
 
@@ -164,6 +222,9 @@ The AI module uses `cam_live` with `live_camera` backend (OpenCV, index 0) — n
 | `EMAIL_USE_TLS` | `True` | Use TLS for SMTP |
 | `EMAIL_HOST_USER` | *(empty)* | SMTP username |
 | `EMAIL_HOST_PASSWORD` | *(empty)* | SMTP password / app-specific password |
+| `VITE_PROXY_TARGET` | `http://127.0.0.1:8000` | Vite dev proxy → Django backend |
+| `VITE_MEDIAMTX_TARGET` | `http://127.0.0.1:8889` | Vite dev proxy → MediaMTX WebRTC |
+| `VITE_MEDIAMTX_HLS_TARGET` | `http://127.0.0.1:8888` | Vite dev proxy → MediaMTX HLS |
 
 ## Project Structure
 
@@ -251,5 +312,91 @@ python manage.py register_ai_webhook
 # Close stale incidents (no updates for 5 minutes)
 python manage.py close_stale_incidents --minutes 5
 ```
+
+## What Changed (Integration v5 — Streaming Bug-Fixes)
+
+### A) Fix Snapshot 401
+- **AuthImage component** — Reusable `<AuthImage>` fetches images through the authenticated axios instance (blob), auto-refreshes on interval
+- **LiveAI.tsx** — Sidebar thumbnails and evidence images now use `AuthImage` instead of raw `<img>`, eliminating 401 errors
+
+### B) Fix "No stream URL mapped"
+- **Auto-derive `stream_path`** — `CameraWriteSerializer.validate()` and `Camera.save()` auto-set `stream_path` from `ai_camera_id` or `slugify(name)` when empty
+- **Cameras.tsx** — Added `stream_path` field to the Add Camera form and table view
+
+### C) Fix Vite Proxy ECONNREFUSED
+- **vite.config.ts** — Proxy targets now use `VITE_PROXY_TARGET`, `VITE_MEDIAMTX_TARGET`, `VITE_MEDIAMTX_HLS_TARGET` env vars with sensible defaults
+- **Added `/webrtc` and `/hls` proxy rules** for local dev without Nginx
+
+### D) AI Camera Hot-Load
+- **AlertServer.set_app_context()** — Receives shared evidence exporter, model config, etc. from CCTVAIModule
+- **Register endpoint** — `POST /api/v1/cameras/register` now immediately creates and starts a `CameraProcessor` (hot-load), no restart required
+- **sync_to_ai** — Django view now also back-fills `stream_path` and returns `hot_loaded` status
+
+### E) MediaMTX Mapping Strategy
+- **README** — Comprehensive streaming architecture docs: stream path mapping, dev/docker/real-camera workflows, Vite proxy configuration
+
+---
+
+## What Changed (Integration v4)
+
+### RTSP Snapshot Fix (§1)
+- **FFmpegReader** — Fully rewritten subprocess-based reader with configurable `rtsp_transport`, reconnect logic, and `get_diagnostics()` method
+- **AI proxy** — Added `Cache-Control: no-store` header on streaming snapshot responses
+
+### Intrusion Zones & Camera Types (§2)
+- **Camera model** — Added `camera_type` (BACKYARD, FRONT_DOOR, BEDROOM, GARAGE, LIVING_ROOM, OTHER)
+- **CameraZone model** — Per-camera polygon zones (RESTRICTED / MONITOR), full CRUD via REST
+- **AI endpoints** — `PUT /cameras/{id}/zones` and `PUT /cameras/{id}/settings` to push zone/threshold config live
+- **CameraProcessor.update_zones()** — Propagates zone polygons to zone-aware lanes at runtime
+
+### False-Positive Reduction (§3)
+- **Per-camera AI settings** — `min_confidence`, `min_bbox_area`, `k_of_n_k`, `k_of_n_n`, `cooldown_s` on Camera model
+- **sync_ai_settings** view — Pushes thresholds from Django to AI module
+
+### Notification API (§4)
+- **NotificationChannel model** — OneToOne per Tenant: email/push toggles, email recipients, FCM tokens, severity threshold
+- **Settings/Test/Register views** — GET/PUT settings, POST test email, POST register FCM device
+- **dispatch_notifications()** — Auto-sends email on incident create/escalate (wired into webhook receiver)
+- **Email config** — Console backend (dev), SMTP env vars for production
+
+### YOLO12 Critical Lane (§5)
+- **yolo12_critical.py** — New detection lane: fire, smoke, knife, gun, bear, dog, wolf, deer
+- **Persistence tracking** — K-of-N confirmation (default 3-of-6) before alerting
+- **Registered** in `LANE_REGISTRY`, `_LANE_HZ_CATEGORY`, models.yaml, cameras.yaml
+
+### Debug Tab (§7)
+- **debug_system** API — Aggregates Django uptime, DB status, AI status + camera health
+- **Debug.tsx** — New UI page with system stats, camera health table, raw diagnostics
+- **Dashboard.tsx** — Removed system health section (moved to Debug)
+- **NavBar** — Added Debug nav item
+
+### Housekeeping
+- **Removed Watchlist** (§8) — Removed from KnownEntity model, serializers, views, UI
+- **MediaMTX** (§9) — Already complete in docker-compose
+- **Migration 0008** applied — All new models and fields
+
+---
+
+## What Changed (Integration v3)
+
+### Phase 1 & 2 — UI + Backend wiring
+- **All 8+ UI pages** rewritten: Dashboard, Cameras, Incidents, IncidentDetails, Reports, Settings, Community, Entities — wired to real Django/AI APIs via `useQuery`/`useMutation`
+- **LiveAI.tsx** — Fixed `device` object rendering error; properly handles nested `SystemStatus.device`
+- **New Django endpoints**: `dashboard_summary`, `incidents/stats`, `incidents/{id}/acknowledge`, `incidents/{id}/resolve`, `profile/me` (GET/PATCH)
+- **Extended models**: Profile with notification/privacy/system settings (8 new fields)
+- **IncidentSerializer** — Added `camera_name` field
+
+### Phase 3 — MediaMTX + RTSP live camera
+- **docker-compose.yml** — Added `mediamtx` (RTSP server) and `webcam_publisher` (FFmpeg) services
+- **webcam_publisher/** — Dockerfile + `entrypoint.sh` (tries v4l2 webcam, falls back to SMPTE test pattern)
+- **cameras.docker.yaml** — Docker-specific AI camera config reading from `rtsp://mediamtx:8554/webcam`
+- **cameras.yaml** — Added commented RTSP camera entry for reference
+
+### Phase 4 — Webhook persistence
+- **Webhook auth aligned** — Django receiver now accepts both `X-AI-WEBHOOK-TOKEN` (flat) and `X-Vigilzone-Signature` (HMAC-SHA256)
+- **Auto-registration** — `AiIntegrationConfig.ready()` spawns background thread to register webhook with AI on startup
+- **register_ai_webhook** command — Now passes `AI_WEBHOOK_SECRET` as HMAC secret when registering
+
+### Phase 5 — Deliverables
 - **Acceptance tests** — `tests/acceptance.sh` (bash) + `tests/acceptance.ps1` (PowerShell)
 - **README** — Comprehensive docs with architecture, local dev, Docker, testing

@@ -38,7 +38,16 @@ export default defineConfig({
     },
     proxy: {
       "/api": {
-        target: "http://127.0.0.1:8000",
+        target: process.env.VITE_PROXY_TARGET || "http://127.0.0.1:8000",
+        changeOrigin: true,
+      },
+      "/webrtc": {
+        target: process.env.VITE_MEDIAMTX_TARGET || "http://127.0.0.1:8889",
+        changeOrigin: true,
+        ws: true,
+      },
+      "/hls": {
+        target: process.env.VITE_MEDIAMTX_HLS_TARGET || "http://127.0.0.1:8888",
         changeOrigin: true,
       },
     },

@@ -94,6 +94,9 @@ class AlertServer:
         # Doctor report (set externally)
         self._doctor_report = None
 
+        # App context for hot-loading cameras (set externally)
+        self._app_context: Dict[str, Any] = {}
+
         # §2.2 — shared frame store for camera capture enrollment
         self._frame_store = None
 
@@ -132,6 +135,15 @@ class AlertServer:
     def set_camera_processors(self, processors):
         """Accept list of CameraProcessor for live frame endpoint."""
         self._camera_processors = processors
+
+    def set_app_context(self, ctx: dict):
+        """
+        Store shared application objects needed to hot-create new
+        CameraProcessor instances at runtime (register endpoint).
+        Expected keys: evidence_exporter, models_cfg, zones_cfg,
+                       anyanomaly_client.
+        """
+        self._app_context = ctx
 
     # ------------------------------------------------------------------
     def _setup_routes(self):
@@ -1188,13 +1200,58 @@ class AlertServer:
                 f"lanes={enabled_lanes} hz={sample_hz}"
             )
 
+            # ── Hot-load: create CameraProcessor and start it immediately ──
+            hot_loaded = False
+            ctx = getattr(self, "_app_context", {})
+            evidence_exp = ctx.get("evidence_exporter")
+            models_cfg = ctx.get("models_cfg")
+            zones_cfg = ctx.get("zones_cfg", {})
+            anyanomaly = ctx.get("anyanomaly_client")
+
+            if evidence_exp and models_cfg and self._aggregator:
+                try:
+                    from ..app import CameraProcessor
+
+                    cam_cfg = {
+                        "camera_id": camera_id,
+                        "rtsp_url": rtsp_url,
+                        "ingest_backend": ingest_backend,
+                        "enabled_lanes": enabled_lanes,
+                        "sample_hz": sample_hz,
+                        "source_type": "rtsp" if rtsp_url else "live_camera",
+                    }
+                    zones = zones_cfg.get(camera_id, [])
+                    proc = CameraProcessor(
+                        cam_cfg, models_cfg, zones,
+                        self._aggregator, evidence_exp,
+                        gpu_scheduler=self._gpu_scheduler,
+                        auto_throttle=self._auto_throttle,
+                        anyanomaly_client=anyanomaly,
+                        face_embedder=self._face_embedder,
+                        pet_embedder=self._pet_embedder,
+                        identity_matcher=self._identity_matcher,
+                        identity_stabilizer=self._identity_stabilizer,
+                        frame_store=self._frame_store,
+                    )
+                    proc.start()
+                    self._camera_processors.append(proc)
+                    hot_loaded = True
+                    self.logger.info(f"Hot-loaded camera processor for {camera_id}")
+                except Exception as e:
+                    self.logger.error(f"Hot-load failed for {camera_id}: {e}")
+
             return {
                 "status": "registered",
                 "camera_id": camera_id,
                 "rtsp_url": rtsp_url,
                 "enabled_lanes": enabled_lanes,
                 "sample_hz": sample_hz,
-                "message": f"Camera {camera_id} registered. It will start processing on next restart or can be hot-loaded.",
+                "hot_loaded": hot_loaded,
+                "message": (
+                    f"Camera {camera_id} registered and started."
+                    if hot_loaded
+                    else f"Camera {camera_id} registered. Will start on next restart."
+                ),
             }
 
         @self.app.get("/api/v1/cameras/{camera_id}/snapshot")
