@@ -3,8 +3,7 @@ FastAPI server for alerts, evidence, live frame feed,
 upload mode (offline video processing), and /metrics.
 """
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Query, Body
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -26,11 +25,10 @@ class AlertServer:
     """
 
     def __init__(self, host: str = "0.0.0.0", port: int = 8080,
-                 evidence_dir: str = "evidence", static_dir: str = None):
+                 evidence_dir: str = "evidence"):
         self.host = host
         self.port = port
         self.evidence_dir = Path(evidence_dir)
-        self.static_dir = Path(static_dir) if static_dir else Path(__file__).parent / "static"
 
         self.app = FastAPI(
             title="VigilZone AI Module",
@@ -148,19 +146,15 @@ class AlertServer:
     # ------------------------------------------------------------------
     def _setup_routes(self):
 
-        @self.app.get("/", response_class=HTMLResponse)
-        async def index():
-            index_file = self.static_dir / "index.html"
-            if index_file.exists():
-                return FileResponse(index_file)
-            return HTMLResponse(content="<h1>CCTV AI Module v2</h1><p>UI not found</p>")
-
-        @self.app.get("/app.js")
-        async def get_app_js():
-            js_file = self.static_dir / "app.js"
-            if js_file.exists():
-                return FileResponse(js_file)
-            return HTMLResponse(content="// Not found", media_type="application/javascript")
+        @self.app.get("/")
+        async def root():
+            """Service root – returns basic health/identity info."""
+            return {
+                "service": "vigilzone-ai",
+                "version": "2.0.0",
+                "status": "running",
+                "uptime_s": round(time.time() - self._start_time, 1),
+            }
 
         @self.app.get("/alerts")
         async def get_alerts(limit: int = 200):
