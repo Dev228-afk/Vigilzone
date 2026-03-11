@@ -9,12 +9,19 @@ declare module 'http' {
     rawBody: unknown
   }
 }
-app.use(express.json({
-  verify: (req, _res, buf) => {
-    req.rawBody = buf;
-  }
-}));
-app.use(express.urlencoded({ extended: false }));
+
+// Skip body parsing for proxied routes so Vite http-proxy can forward raw body
+const PROXY_PREFIXES = ["/api", "/webrtc", "/hls"];
+const isProxied = (p: string) => PROXY_PREFIXES.some((px) => p.startsWith(px));
+
+app.use((req, res, next) => {
+  if (isProxied(req.path)) return next();
+  express.json({ verify: (r, _res, buf) => { (r as any).rawBody = buf; } })(req, res, next);
+});
+app.use((req, res, next) => {
+  if (isProxied(req.path)) return next();
+  express.urlencoded({ extended: false })(req, res, next);
+});
 
 app.use((req, res, next) => {
   const start = Date.now();

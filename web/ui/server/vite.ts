@@ -21,6 +21,7 @@ export function log(message: string, source = "express") {
 
 export async function setupVite(app: Express, server: Server) {
   const serverOptions = {
+    ...(typeof viteConfig.server === "object" ? viteConfig.server : {}),
     middlewareMode: true,
     hmr: { server },
     allowedHosts: true as const,
@@ -43,6 +44,11 @@ export async function setupVite(app: Express, server: Server) {
   app.use(vite.middlewares);
   app.use("*", async (req, res, next) => {
     const url = req.originalUrl;
+
+    // Never serve SPA HTML for proxied paths — let them 404 normally
+    if (url.startsWith("/api") || url.startsWith("/webrtc") || url.startsWith("/hls")) {
+      return next();
+    }
 
     try {
       const clientTemplate = path.resolve(
