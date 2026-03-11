@@ -738,20 +738,33 @@ def streams_snapshot(request, camera_id):
     # ── Identifiers ──────────────────────────────────────────
     ai_cam_id = camera.ai_camera_id or f"cam_{camera.pk}"
     stream_path = camera.stream_path or ai_cam_id
-    rtsp_url = camera.rtsp_url or f"rtsp://mediamtx:8554/{stream_path}"
+    # Build RTSP URL — works for both Docker (mediamtx) and local dev (127.0.0.1)
+    mediamtx_rtsp_base = os.getenv("MEDIAMTX_RTSP_BASE", "rtsp://127.0.0.1:8554")
+    rtsp_url = camera.rtsp_url or f"{mediamtx_rtsp_base}/{stream_path}"
     ai_base = os.getenv("AI_BASE_INTERNAL", "http://127.0.0.1:8080")
 
-    # ── In-memory cache (3 s TTL) ────────────────────────────
+    # ── Check background snapshot cache first ────────────────
+    from api.snapshot_cache import get_cached_snapshot
+    cached = get_cached_snapshot(camera.pk)
+    if cached:
+        from django.http import HttpResponse
+        data, source, age = cached
+        resp = HttpResponse(data, content_type="image/jpeg")
+        resp["Cache-Control"] = "no-store"
+        resp["X-Snapshot-Source"] = f"{source} (cached {age:.1f}s)"
+        return resp
+
+    # ── Per-request in-memory fallback cache (5 s TTL) ───────
     cache_key = f"_snapshot_{camera.pk}"
     if not hasattr(streams_snapshot, "_cache"):
         streams_snapshot._cache = {}
-    cached = streams_snapshot._cache.get(cache_key)
+    inline_cached = streams_snapshot._cache.get(cache_key)
     now = _time.time()
-    if cached and (now - cached["ts"]) < 3.0:
+    if inline_cached and (now - inline_cached["ts"]) < 5.0:
         from django.http import HttpResponse
-        resp = HttpResponse(cached["data"], content_type="image/jpeg")
+        resp = HttpResponse(inline_cached["data"], content_type="image/jpeg")
         resp["Cache-Control"] = "no-store"
-        resp["X-Snapshot-Source"] = cached.get("source", "cache")
+        resp["X-Snapshot-Source"] = inline_cached.get("source", "cache")
         return resp
 
     def _make_jpeg_response(data: bytes, source: str):
@@ -762,11 +775,16 @@ def streams_snapshot(request, camera_id):
         resp["X-Snapshot-Source"] = source
         return resp
 
+    ffmpeg_err = ""
+    ai_errors = []
+
     # ── Step 1: ffmpeg from RTSP ─────────────────────────────
     try:
         result = subprocess.run(
             [
-                "ffmpeg", "-rtsp_transport", "tcp",
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-rtsp_transport", "tcp",
+                "-rw_timeout", "3000000",
                 "-i", rtsp_url,
                 "-frames:v", "1",
                 "-q:v", "5",
@@ -778,12 +796,13 @@ def streams_snapshot(request, camera_id):
         )
         if result.returncode == 0 and result.stdout:
             return _make_jpeg_response(result.stdout, "ffmpeg")
+        ffmpeg_err = (result.stderr or b"").decode(errors="replace").strip()[:300]
     except FileNotFoundError:
-        pass   # ffmpeg not installed — fall through to AI
+        ffmpeg_err = "ffmpeg not installed"
     except subprocess.TimeoutExpired:
-        pass   # RTSP timed out — fall through to AI
-    except Exception:
-        pass
+        ffmpeg_err = "ffmpeg timed out (8s)"
+    except Exception as exc:
+        ffmpeg_err = str(exc)[:200]
 
     # ── Step 2: AI module fallback (auto-detect endpoint) ────
     ai_endpoints = [
@@ -797,9 +816,16 @@ def streams_snapshot(request, camera_id):
             ct = ai_resp.headers.get("Content-Type", "")
             if ai_resp.status_code == 200 and "image" in ct and ai_resp.content:
                 return _make_jpeg_response(ai_resp.content, f"ai_fallback:{endpoint}")
-        except Exception:
-            continue
+            ai_errors.append(f"{endpoint} -> {ai_resp.status_code}")
+        except Exception as exc:
+            ai_errors.append(f"{endpoint} -> {exc}")
 
+    # ── Both failed — log one diagnosable line ───────────────
+    _log = logging.getLogger("vigilzone.snapshot")
+    _log.error(
+        "Snapshot failed camera=%s rtsp=%s | ffmpeg: %s | AI: %s",
+        camera_id, rtsp_url, ffmpeg_err, "; ".join(ai_errors),
+    )
     return Response(
         {"error": "Snapshot unavailable — ffmpeg and AI fallback both failed"},
         status=status.HTTP_502_BAD_GATEWAY,

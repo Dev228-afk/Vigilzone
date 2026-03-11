@@ -189,13 +189,54 @@ No streaming URLs will work in the UI, but AI detection runs.
 ### Vite Dev Proxy
 
 The Vite dev server proxies `/api`, `/webrtc`, and `/hls` so the React app can reach all services.
+The `/webrtc` and `/hls` prefixes are **stripped** before forwarding (MediaMTX expects paths without the prefix).
 Defaults work for local dev; override with env vars when targets differ:
 
 ```bash
-VITE_PROXY_TARGET=http://192.168.1.50:8000       # Django backend
-VITE_MEDIAMTX_TARGET=http://192.168.1.50:8889    # MediaMTX WebRTC
-VITE_MEDIAMTX_HLS_TARGET=http://192.168.1.50:8888 # MediaMTX HLS
+VITE_PROXY_TARGET=http://192.168.1.50:8000              # Django backend
+VITE_MEDIAMTX_WEBRTC_TARGET=http://192.168.1.50:8889    # MediaMTX WebRTC
+VITE_MEDIAMTX_HLS_TARGET=http://192.168.1.50:8888       # MediaMTX HLS
 ```
+
+### How to Publish a Dev Stream
+
+MediaMTX accepts streams published via RTSP. You can loop a local video file to simulate a camera:
+
+```bash
+# Loop an MP4 file as an RTSP stream (works on any OS with FFmpeg)
+ffmpeg -re -stream_loop -1 -i file.mp4 -c copy -f rtsp rtsp://127.0.0.1:8554/<stream_path>
+```
+
+For a live webcam (Windows):
+```powershell
+ffmpeg -f dshow -i video="<webcam name>" -c:v libx264 -preset ultrafast -tune zerolatency -f rtsp rtsp://127.0.0.1:8554/webcam
+```
+
+Once published, verify:
+- **WebRTC** (via Vite proxy): open `http://localhost:5000/webrtc/<stream_path>` in a browser
+- **Snapshot** (Django API):
+  ```bash
+  curl -H "Authorization: Bearer <TOKEN>" -H "X-Tenant-ID: <ID>" \
+       http://127.0.0.1:8000/api/streams/<camera_id>/snapshot/ --output out.jpg
+  ```
+  Check the `X-Snapshot-Source` response header — it should say `ffmpeg` or `ai_fallback:<url>`.
+
+### Snapshot Endpoint Details
+
+`GET /api/streams/<id>/snapshot/` is JWT-protected and returns `image/jpeg`.
+
+Pipeline:
+1. **ffmpeg** grabs one frame from RTSP (`-rtsp_transport tcp`, 3 s timeout)
+2. **AI fallback** — auto-tries `/frame/<cam>`, `/api/v1/cameras/<cam>/snapshot`, `/api/v1/cameras/<cam>/frame`
+3. **Background cache** — a daemon thread refreshes snapshots every 2 s so responses are instant
+
+Environment variables:
+| Variable | Default (local) | Default (Docker) | Purpose |
+|----------|----------------|------------------|---------|
+| `MEDIAMTX_RTSP_BASE` | `rtsp://127.0.0.1:8554` | `rtsp://mediamtx:8554` | RTSP base for stream URLs |
+| `AI_BASE_INTERNAL` | `http://127.0.0.1:8080` | `http://ai:8080` | AI module base URL |
+| `SNAPSHOT_CACHE_INTERVAL` | `2` | `2` | Background cache refresh interval (seconds) |
+| `SNAPSHOT_CACHE_MAX_AGE` | `5` | `5` | Max cached image age (seconds) |
 
 ### Fallback modes
 Set `WEBCAM_FALLBACK` env var:

@@ -42,13 +42,15 @@ export default defineConfig({
         changeOrigin: true,
       },
       "/webrtc": {
-        target: process.env.VITE_MEDIAMTX_TARGET || "http://127.0.0.1:8889",
+        target: process.env.VITE_MEDIAMTX_WEBRTC_TARGET || "http://127.0.0.1:8889",
         changeOrigin: true,
         ws: true,
+        rewrite: (p: string) => p.replace(/^\/webrtc/, ""),
       },
       "/hls": {
         target: process.env.VITE_MEDIAMTX_HLS_TARGET || "http://127.0.0.1:8888",
         changeOrigin: true,
+        rewrite: (p: string) => p.replace(/^\/hls/, ""),
       },
     },
   },
