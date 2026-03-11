@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { useToast } from "@/hooks/use-toast";
 import { queryClient } from "@/lib/queryClient";
-import { setSelectedTenantId } from "@/lib/tenant";
+import { getSelectedTenantId, setSelectedTenantId } from "@/lib/tenant";
 import { getMyTenants, createTenant } from "@/lib/tenant";
 import { getPendingInvites, acceptInvite } from "@/lib/invitations";
 
@@ -15,7 +15,14 @@ export default function SelectCommunity() {
   const [, setLocation] = useLocation();
   const [newName, setNewName] = useState("");
 
-  const tenantsQ = useQuery({ queryKey: ["tenants", "mine"], queryFn: getMyTenants, retry: false });
+  // If tenant is already selected (e.g. from login), skip straight to dashboard
+  useEffect(() => {
+    if (getSelectedTenantId()) {
+      setLocation("/dashboard");
+    }
+  }, [setLocation]);
+
+  const tenantsQ = useQuery({ queryKey: ["tenants", "mine"], queryFn: getMyTenants, retry: 1 });
   const invitesQ = useQuery({
     queryKey: ["invites", "pending"],
     queryFn: getPendingInvites,
@@ -63,7 +70,18 @@ export default function SelectCommunity() {
   }
 
   if (tenantsQ.isError) {
-    return <div className="min-h-screen flex items-center justify-center">Failed to load communities.</div>;
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <Card className="w-full max-w-md p-6 space-y-4 text-center">
+          <h1 className="text-xl font-semibold">Something went wrong</h1>
+          <p className="text-sm text-muted-foreground">Failed to load communities.</p>
+          <div className="flex gap-2 justify-center">
+            <Button variant="outline" onClick={() => tenantsQ.refetch()}>Retry</Button>
+            <Button variant="outline" onClick={() => setLocation("/login")}>Back to Login</Button>
+          </div>
+        </Card>
+      </div>
+    );
   }
 
   const tenants = tenantsQ.data ?? [];

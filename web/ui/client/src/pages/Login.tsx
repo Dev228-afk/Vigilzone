@@ -45,14 +45,14 @@ export default function Login() {
           title: "Welcome back!",
           description: "Redirecting to your dashboard…",
         });
-        setTimeout(() => setLocation("/dashboard"), 400);
+        setLocation("/dashboard");
       } else {
         // No tenant resolved — send to community selection
         toast({
           title: "One more step",
           description: "Please select your community.",
         });
-        setTimeout(() => setLocation("/select-community"), 400);
+        setLocation("/select-community");
       }
     } catch (err) {
       console.error(err);
