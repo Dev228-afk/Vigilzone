@@ -25,6 +25,7 @@ import {
 import { api } from "@/lib/api";
 import AuthImage from "@/components/AuthImage";
 import AuthedMjpeg from "@/components/AuthedMjpeg";
+import { useMediamtxHealth } from "@/hooks/use-mediamtx-health";
 
 /* ── Types ──────────────────────────────────────────────────── */
 interface AiCamera {
@@ -151,6 +152,7 @@ export default function LiveAI() {
   const [loading, setLoading] = useState(true);
   const [isLive, setIsLive] = useState(false); // true = connected to real AI
   const [webrtcFailed, setWebrtcFailed] = useState(false); // fallback to MJPEG
+  const { reachable: mtxReachable, checked: mtxChecked } = useMediamtxHealth();
 
   /* ── Fetch data — real AI first, fallback to demo ──────────── */
   const fetchData = useCallback(async () => {
@@ -425,7 +427,7 @@ export default function LiveAI() {
           </CardHeader>
           <CardContent>
             {selectedCamera ? (
-              selectedStreamUrl && !webrtcFailed ? (
+              selectedStreamUrl && !webrtcFailed && mtxChecked && mtxReachable ? (
                 <div className="relative">
                   <iframe
                     key={selectedCamera}

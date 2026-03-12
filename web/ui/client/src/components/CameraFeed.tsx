@@ -4,6 +4,7 @@ import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { api } from "@/lib/api";
 import AuthedMjpeg from "@/components/AuthedMjpeg";
+import { useMediamtxHealth } from "@/hooks/use-mediamtx-health";
 
 interface CameraFeedProps {
   name: string;
@@ -40,6 +41,7 @@ export default function CameraFeed({ name, location, status, cameraId, imageUrl,
   const [error, setError] = useState(false);
   const [iframeError, setIframeError] = useState(false);
   const prevBlobRef = useRef<string | null>(null);
+  const { reachable: mtxReachable, checked: mtxChecked } = useMediamtxHealth();
 
   const needsAuth = imageUrl ? isApiUrl(imageUrl) : false;
 
@@ -82,8 +84,8 @@ export default function CameraFeed({ name, location, status, cameraId, imageUrl,
 
   /* ── Render priority: streamUrl (WebRTC iframe) > MJPEG > imageUrl > placeholder ── */
   const renderMedia = () => {
-    // WebRTC iframe — primary path
-    if (streamUrl && !iframeError) {
+    // WebRTC iframe — only attempt when MediaMTX is confirmed reachable
+    if (streamUrl && !iframeError && mtxChecked && mtxReachable) {
       return (
         <iframe
           src={streamUrl}
@@ -95,8 +97,8 @@ export default function CameraFeed({ name, location, status, cameraId, imageUrl,
         />
       );
     }
-    // MJPEG fallback — when WebRTC fails but we have a camera ID
-    if (iframeError && cameraId) {
+    // MJPEG fallback — when WebRTC fails or MediaMTX unreachable, but we have a camera ID
+    if ((iframeError || (mtxChecked && !mtxReachable)) && cameraId) {
       return (
         <AuthedMjpeg
           cameraId={cameraId}

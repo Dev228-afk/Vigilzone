@@ -30,6 +30,10 @@ export default function Cameras() {
   const [isDialogOpen, setIsDialogOpen] = useState(false);
   const [newCamera, setNewCamera] = useState({ name: "", site: "", rtsp_url: "", ai_camera_id: "", stream_path: "" });
 
+  // Edit state
+  const [editCamera, setEditCamera] = useState<Camera | null>(null);
+  const [editForm, setEditForm] = useState({ name: "", site: "", rtsp_url: "", ai_camera_id: "", stream_path: "", status: "active" });
+
   /* ── Fetch cameras ─────────────────────────────────────────── */
   const camerasQ = useQuery({
     queryKey: ["cameras"],
@@ -92,8 +96,58 @@ export default function Cameras() {
     addMut.mutate(newCamera);
   };
 
-  const handleTestConnection = () => {
-    toast({ title: "Test", description: `Checking ${newCamera.rtsp_url}…` });
+  const handleTestConnection = async () => {
+    const url = newCamera.rtsp_url.trim();
+    if (!url) {
+      toast({ title: "No URL", description: "Enter an RTSP URL first.", variant: "destructive" });
+      return;
+    }
+    toast({ title: "Testing…", description: `Checking ${url}` });
+    try {
+      const { data } = await api.post("/cameras/test_connection/", { rtsp_url: url, timeout_s: 3 });
+      if (data.ok) {
+        const d = data.details;
+        const info = d ? `${d.codec ?? ""} ${d.width ?? ""}x${d.height ?? ""} ${d.fps ?? ""}`.trim() : "";
+        toast({ title: "Connection OK", description: `${data.method} — ${data.latency_ms} ms${info ? ` (${info})` : ""}` });
+      } else {
+        toast({ title: "Connection failed", description: data.error ?? "Unknown error", variant: "destructive" });
+      }
+    } catch {
+      toast({ title: "Test failed", description: "Could not reach backend", variant: "destructive" });
+    }
+  };
+
+  /* ── Edit camera ───────────────────────────────────────────── */
+  const editMut = useMutation({
+    mutationFn: async ({ id, ...fields }: { id: number | string; [k: string]: unknown }) => {
+      const { data } = await api.patch(`/cameras/${id}/`, fields);
+      return data;
+    },
+    onSuccess: () => {
+      toast({ title: "Camera updated" });
+      queryClient.invalidateQueries({ queryKey: ["cameras"] });
+      setEditCamera(null);
+    },
+    onError: () => {
+      toast({ title: "Failed to update camera", variant: "destructive" });
+    },
+  });
+
+  const openEditModal = (cam: Camera) => {
+    setEditCamera(cam);
+    setEditForm({
+      name: cam.name,
+      site: cam.site ?? "",
+      rtsp_url: cam.rtsp_url ?? "",
+      ai_camera_id: cam.ai_camera_id ?? "",
+      stream_path: cam.stream_path ?? "",
+      status: cam.status ?? "active",
+    });
+  };
+
+  const handleSaveEdit = () => {
+    if (!editCamera) return;
+    editMut.mutate({ id: editCamera.id, ...editForm });
   };
 
   /* ── Sync camera to AI ─────────────────────────────────────── */
@@ -265,7 +319,7 @@ export default function Cameras() {
                       <Share2 className="w-3 h-3 mr-1" />
                       Share
                     </Button>
-                    <Button size="icon" variant="ghost" data-testid={`button-edit-${camera.id}`}>
+                    <Button size="icon" variant="ghost" onClick={() => openEditModal(camera)} data-testid={`button-edit-${camera.id}`}>
                       <Edit className="w-4 h-4" />
                     </Button>
                     <Button
@@ -283,6 +337,60 @@ export default function Cameras() {
           </TableBody>
         </Table>
       </Card>
+
+      {/* ── Edit Camera Dialog ─────────────────────────────────── */}
+      <Dialog open={!!editCamera} onOpenChange={(open) => { if (!open) setEditCamera(null); }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Edit Camera</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4 py-4">
+            <div className="space-y-2">
+              <Label htmlFor="edit-name">Camera Name</Label>
+              <Input id="edit-name" value={editForm.name} onChange={(e) => setEditForm({ ...editForm, name: e.target.value })} />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="edit-rtsp">Stream URL</Label>
+              <Input id="edit-rtsp" placeholder="rtsp://..." value={editForm.rtsp_url} onChange={(e) => setEditForm({ ...editForm, rtsp_url: e.target.value })} />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="edit-site">Location / Site</Label>
+              <Input id="edit-site" value={editForm.site} onChange={(e) => setEditForm({ ...editForm, site: e.target.value })} />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="edit-ai-id">AI Camera ID</Label>
+              <Input id="edit-ai-id" value={editForm.ai_camera_id} onChange={(e) => setEditForm({ ...editForm, ai_camera_id: e.target.value })} />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="edit-stream-path">Stream Path</Label>
+              <Input id="edit-stream-path" value={editForm.stream_path} onChange={(e) => setEditForm({ ...editForm, stream_path: e.target.value })} />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="edit-status">Status</Label>
+              <Select value={editForm.status} onValueChange={(v) => setEditForm({ ...editForm, status: v })}>
+                <SelectTrigger id="edit-status">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="active">Active</SelectItem>
+                  <SelectItem value="inactive">Inactive</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+          <DialogFooter>
+            {editCamera && (
+              <Button variant="outline" onClick={() => syncMut.mutate(editCamera.id)} disabled={syncMut.isPending}>
+                <RefreshCw className="w-3 h-3 mr-1" />
+                Sync to AI
+              </Button>
+            )}
+            <Button onClick={handleSaveEdit} disabled={editMut.isPending}>
+              {editMut.isPending ? "Saving…" : "Save Changes"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

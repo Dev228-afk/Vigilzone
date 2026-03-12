@@ -106,6 +106,92 @@ class MembershipViewSet(TenantScopedViewSet):
     serializer_class = MembershipSerializer
     permission_classes = [permissions.IsAuthenticated]
 
+
+# ── RTSP probe helper (used by test_connection endpoints) ────
+def _probe_rtsp(rtsp_url: str, timeout_s: int = 3) -> dict:
+    """
+    Probe an RTSP URL with ffprobe (fast), falling back to ffmpeg single-frame grab.
+    Returns { ok, method, latency_ms, details?, error? }.
+    """
+    import subprocess
+    import time as _time
+    import json as _json
+    import shutil
+
+    result: dict = {"ok": False, "method": "none", "latency_ms": 0}
+
+    # ── Try ffprobe first ─────────────────────────────────────
+    if shutil.which("ffprobe"):
+        t0 = _time.monotonic()
+        try:
+            proc = subprocess.run(
+                [
+                    "ffprobe", "-v", "error",
+                    "-rtsp_transport", "tcp",
+                    "-rw_timeout", str(timeout_s * 1_000_000),
+                    "-show_streams", "-select_streams", "v:0",
+                    "-print_format", "json",
+                    rtsp_url,
+                ],
+                capture_output=True, timeout=timeout_s + 2,
+            )
+            latency = int((_time.monotonic() - t0) * 1000)
+            if proc.returncode == 0 and proc.stdout:
+                try:
+                    info = _json.loads(proc.stdout)
+                    streams = info.get("streams", [])
+                    if streams:
+                        s = streams[0]
+                        return {
+                            "ok": True,
+                            "method": "ffprobe",
+                            "latency_ms": latency,
+                            "details": {
+                                "codec": s.get("codec_name"),
+                                "width": s.get("width"),
+                                "height": s.get("height"),
+                                "fps": s.get("r_frame_rate"),
+                            },
+                        }
+                except _json.JSONDecodeError:
+                    pass
+            result["error"] = (proc.stderr or b"").decode(errors="replace").strip()[:300]
+        except subprocess.TimeoutExpired:
+            result["error"] = f"ffprobe timed out ({timeout_s}s)"
+            result["latency_ms"] = timeout_s * 1000
+            return result
+        except FileNotFoundError:
+            pass  # fall through to ffmpeg
+
+    # ── Fallback: ffmpeg single-frame grab ────────────────────
+    t0 = _time.monotonic()
+    try:
+        proc = subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-rtsp_transport", "tcp",
+                "-rw_timeout", str(timeout_s * 1_000_000),
+                "-i", rtsp_url,
+                "-frames:v", "1",
+                "-f", "null", "-",
+            ],
+            capture_output=True, timeout=timeout_s + 2,
+        )
+        latency = int((_time.monotonic() - t0) * 1000)
+        if proc.returncode == 0:
+            return {"ok": True, "method": "ffmpeg", "latency_ms": latency}
+        result["method"] = "ffmpeg"
+        result["latency_ms"] = latency
+        result["error"] = (proc.stderr or b"").decode(errors="replace").strip()[:300]
+    except FileNotFoundError:
+        result["error"] = "Neither ffprobe nor ffmpeg found on PATH"
+    except subprocess.TimeoutExpired:
+        result["error"] = f"ffmpeg timed out ({timeout_s}s)"
+        result["latency_ms"] = timeout_s * 1000
+
+    return result
+
+
 class CameraViewSet(TenantScopedViewSet):
     queryset = Camera.objects.all()
     permission_classes = [permissions.IsAuthenticated]
@@ -244,6 +330,27 @@ class CameraViewSet(TenantScopedViewSet):
             return Response({"status": "synced", "ai_status": resp.status_code})
         except Exception as exc:
             return Response({"error": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+
+    # ── Test connection (existing camera) ───────────────────
+    @action(detail=True, methods=["post"], url_path="test_connection")
+    def test_connection_detail(self, request, pk=None):
+        """POST /api/cameras/{id}/test_connection/ — test stored RTSP URL."""
+        camera = self.get_object()
+        rtsp_url = camera.rtsp_url
+        if not rtsp_url:
+            return Response({"ok": False, "error": "No RTSP URL stored for this camera"}, status=status.HTTP_400_BAD_REQUEST)
+        timeout_s = min(int(request.data.get("timeout_s", 3)), 10)
+        return Response(_probe_rtsp(rtsp_url, timeout_s))
+
+    # ── Test connection (unsaved URL) ───────────────────────
+    @action(detail=False, methods=["post"], url_path="test_connection")
+    def test_connection_list(self, request):
+        """POST /api/cameras/test_connection/ — test an arbitrary RTSP URL."""
+        rtsp_url = request.data.get("rtsp_url", "").strip()
+        if not rtsp_url:
+            return Response({"ok": False, "error": "rtsp_url is required"}, status=status.HTTP_400_BAD_REQUEST)
+        timeout_s = min(int(request.data.get("timeout_s", 3)), 10)
+        return Response(_probe_rtsp(rtsp_url, timeout_s))
 
 class IncidentViewSet(TenantScopedViewSet):
     queryset = Incident.objects.select_related("camera").all()
@@ -766,16 +873,20 @@ def streams_snapshot(request, camera_id):
     ai_errors = []
     ffmpeg_err = ""
 
-    # ── Step 1: AI module (primary) ──────────────────────────
-    ai_endpoint = f"{ai_base}/frame/{ai_id}?maxw=1280&quality=70"
-    try:
-        ai_resp = http_client.get(ai_endpoint, timeout=2)
-        ct = ai_resp.headers.get("Content-Type", "")
-        if ai_resp.status_code == 200 and "image" in ct and ai_resp.content:
-            return _make_jpeg_response(ai_resp.content, "ai")
-        ai_errors.append(f"{ai_endpoint} -> {ai_resp.status_code}")
-    except Exception as exc:
-        ai_errors.append(f"{ai_endpoint} -> {exc}")
+    # ── Step 1: AI module (primary — try both endpoints) ─────
+    ai_endpoints = [
+        f"{ai_base}/frame/{ai_id}?maxw=1280&quality=70",
+        f"{ai_base}/api/v1/cameras/{ai_id}/snapshot?maxw=1280&quality=70",
+    ]
+    for ai_endpoint in ai_endpoints:
+        try:
+            ai_resp = http_client.get(ai_endpoint, timeout=2)
+            ct = ai_resp.headers.get("Content-Type", "")
+            if ai_resp.status_code == 200 and "image" in ct and ai_resp.content:
+                return _make_jpeg_response(ai_resp.content, f"ai:{ai_endpoint.split(ai_base)[1].split('?')[0]}")
+            ai_errors.append(f"{ai_endpoint} -> {ai_resp.status_code}")
+        except Exception as exc:
+            ai_errors.append(f"{ai_endpoint} -> {exc}")
 
     # ── Step 2: ffmpeg from RTSP (fallback) ──────────────────
     try:
