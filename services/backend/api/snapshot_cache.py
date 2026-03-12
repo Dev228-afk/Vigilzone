@@ -26,6 +26,33 @@ INTERVAL = float(os.getenv("SNAPSHOT_CACHE_INTERVAL", "2"))
 MAX_AGE = float(os.getenv("SNAPSHOT_CACHE_MAX_AGE", "5"))
 
 
+def _get_ai_active_camera_ids(ai_base: str, ttl_s: float = 3.0):
+    """Best-effort cached fetch of active AI camera IDs from /cameras."""
+    import requests as http_client
+
+    now = time.time()
+    cache = getattr(_get_ai_active_camera_ids, "_cache", None)
+    if cache and cache.get("base") == ai_base and (now - cache.get("ts", 0.0)) < ttl_s:
+        return cache.get("ids")
+
+    try:
+        r = http_client.get(f"{ai_base}/cameras", timeout=1.0)
+        ids = set()
+        if r.status_code == 200 and r.content:
+            payload = r.json()
+            if isinstance(payload, list):
+                for item in payload:
+                    if isinstance(item, dict):
+                        cam_id = item.get("camera_id")
+                        if cam_id:
+                            ids.add(str(cam_id))
+        _get_ai_active_camera_ids._cache = {"base": ai_base, "ts": now, "ids": ids}
+        return ids
+    except Exception:
+        # Unknown active set -> caller may try all candidates.
+        return None
+
+
 def get_cached_snapshot(camera_pk: int):
     """Return (jpeg_bytes, source_str, age_seconds) or None."""
     with _lock:
@@ -38,22 +65,23 @@ def get_cached_snapshot(camera_pk: int):
     return entry["data"], entry["source"], age
 
 
-def _grab_frame(rtsp_url: str, ai_base: str, ai_cam_id: str):
+def _grab_frame(rtsp_url: str, ai_base: str, ai_cam_ids):
     """Try AI first, then ffmpeg fallback.  Returns (jpeg_bytes, source) or (None, None)."""
     import requests as http_client
 
-    # AI primary — single endpoint with quality params
-    try:
-        r = http_client.get(
+    # AI primary — try candidate IDs/endpoints in order
+    for ai_cam_id in ai_cam_ids:
+        for url in (
             f"{ai_base}/frame/{ai_cam_id}",
-            params={"maxw": 1280, "quality": 70},
-            timeout=2,
-        )
-        ct = r.headers.get("Content-Type", "")
-        if r.status_code == 200 and "image" in ct and r.content:
-            return r.content, "ai"
-    except Exception:
-        pass
+            f"{ai_base}/api/v1/cameras/{ai_cam_id}/snapshot",
+        ):
+            try:
+                r = http_client.get(url, params={"maxw": 1280, "quality": 70}, timeout=2)
+                ct = r.headers.get("Content-Type", "")
+                if r.status_code == 200 and "image" in ct and r.content:
+                    return r.content, f"ai:{ai_cam_id}"
+            except Exception:
+                continue
 
     # ffmpeg fallback
     try:
@@ -97,13 +125,24 @@ def _worker():
 
         mediamtx_rtsp_base = os.getenv("MEDIAMTX_RTSP_BASE", "rtsp://127.0.0.1:8554")
         ai_base = os.getenv("AI_BASE_INTERNAL", "http://127.0.0.1:8080")
+        active_ids = _get_ai_active_camera_ids(ai_base)
 
         for pk, rtsp_url, stream_path, ai_camera_id in cameras:
             if not _running:
                 break
-            ai_cam_id = ai_camera_id or f"cam_{pk}"
+            ai_candidates = []
+            for cand in (ai_camera_id, stream_path, f"cam_{pk}"):
+                if cand and cand not in ai_candidates:
+                    ai_candidates.append(cand)
+            if active_ids is not None:
+                ai_candidates = [c for c in ai_candidates if c in active_ids]
+            if not ai_candidates:
+                # Avoid hammering known-invalid IDs when AI active set is known.
+                if active_ids is not None:
+                    continue
+                ai_candidates = [ai_camera_id or stream_path or f"cam_{pk}"]
             url = rtsp_url or f"{mediamtx_rtsp_base}/{stream_path}"
-            data, source = _grab_frame(url, ai_base, ai_cam_id)
+            data, source = _grab_frame(url, ai_base, ai_candidates)
             if data:
                 with _lock:
                     _store[pk] = {"data": data, "source": source, "ts": time.time()}
