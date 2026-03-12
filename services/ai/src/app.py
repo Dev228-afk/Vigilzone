@@ -11,7 +11,7 @@ import argparse
 import time
 import threading
 import asyncio
-from concurrent.futures import ThreadPoolExecutor, Future, as_completed
+from concurrent.futures import ThreadPoolExecutor, Future, wait
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 import sys
@@ -445,8 +445,22 @@ class CameraProcessor:
                         futures[lane_name] = fut
                         future_to_lane[fut] = lane_name
 
-                # ── Collect results incrementally via as_completed ─────
-                for fut in as_completed(future_to_lane, timeout=5.0):
+                # ── Collect completed lane results with bounded wait ─────
+                done, not_done = wait(list(future_to_lane.keys()), timeout=5.0)
+
+                if not_done:
+                    self.logger.warning(
+                        "Lane timeout on camera=%s: %d (of %d) futures unfinished",
+                        self.camera_id,
+                        len(not_done),
+                        len(future_to_lane),
+                    )
+                    # Best effort cancellation for queued tasks; running tasks will
+                    # finish in the background and be dropped for this frame.
+                    for fut in not_done:
+                        fut.cancel()
+
+                for fut in done:
                     lane_name = future_to_lane[fut]
                     try:
                         obs = fut.result()

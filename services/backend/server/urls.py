@@ -48,6 +48,7 @@ urlpatterns += [
 # Debug (§7)
 urlpatterns += [
     path("api/debug/system/", debug_system, name="debug-system"),
+    path("api/debug/mediamtx/health/", debug_mediamtx_health, name="debug-mediamtx-health-slash"),
     path("api/debug/mediamtx/health", debug_mediamtx_health, name="debug-mediamtx-health"),
 ]
 # Streams (§B — WebRTC/HLS URL endpoints)

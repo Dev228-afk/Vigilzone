@@ -845,7 +845,11 @@ def streams_snapshot(request, camera_id):
         return Response({"error": "Camera not found"}, status=status.HTTP_404_NOT_FOUND)
 
     # ── Identifiers ──────────────────────────────────────────
-    ai_id = camera.ai_camera_id or camera.stream_path or f"cam_{camera.pk}"
+    ai_candidates = []
+    for cand in (camera.ai_camera_id, camera.stream_path, f"cam_{camera.pk}"):
+        if cand and cand not in ai_candidates:
+            ai_candidates.append(cand)
+    ai_id = ai_candidates[0]
     stream_path = camera.stream_path or ai_id
     mediamtx_rtsp_base = os.getenv("MEDIAMTX_RTSP_BASE", "rtsp://127.0.0.1:8554")
     rtsp_url = camera.rtsp_url or f"{mediamtx_rtsp_base}/{stream_path}"
@@ -874,10 +878,12 @@ def streams_snapshot(request, camera_id):
     ffmpeg_err = ""
 
     # ── Step 1: AI module (primary — try both endpoints) ─────
-    ai_endpoints = [
-        f"{ai_base}/frame/{ai_id}?maxw=1280&quality=70",
-        f"{ai_base}/api/v1/cameras/{ai_id}/snapshot?maxw=1280&quality=70",
-    ]
+    ai_endpoints = []
+    for cand in ai_candidates:
+        ai_endpoints.extend([
+            f"{ai_base}/frame/{cand}?maxw=1280&quality=70",
+            f"{ai_base}/api/v1/cameras/{cand}/snapshot?maxw=1280&quality=70",
+        ])
     for ai_endpoint in ai_endpoints:
         try:
             ai_resp = http_client.get(ai_endpoint, timeout=2)
@@ -917,11 +923,11 @@ def streams_snapshot(request, camera_id):
     # ── Both failed ──────────────────────────────────────────
     _log = logging.getLogger("vigilzone.snapshot")
     _log.error(
-        "Snapshot failed camera=%s rtsp=%s | AI: %s | ffmpeg: %s",
-        camera_id, rtsp_url, "; ".join(ai_errors), ffmpeg_err,
+        "Snapshot failed camera=%s ai_candidates=%s rtsp=%s | AI: %s | ffmpeg: %s",
+        camera_id, ai_candidates, rtsp_url, "; ".join(ai_errors), ffmpeg_err,
     )
     return Response(
-        {"error": "Snapshot unavailable — AI and ffmpeg both failed"},
+        {"error": "Snapshot unavailable — AI and ffmpeg both failed", "code": "SNAPSHOT_UPSTREAM_UNAVAILABLE"},
         status=status.HTTP_502_BAD_GATEWAY,
     )
 
@@ -1074,28 +1080,30 @@ def streams_mjpeg(request, camera_id):
 @permission_classes([IsAuthenticated])
 def debug_mediamtx_health(request):
     """
-    GET /api/debug/mediamtx/health
+    GET /api/debug/mediamtx/health/
     Quick TCP-connect probe to MediaMTX WebRTC port.
     """
     import socket
+    from datetime import datetime, timezone as dt_timezone
 
-    host = os.getenv("MEDIAMTX_HOST", "127.0.0.1")
+    host = os.getenv("MEDIAMTX_WEBRTC_HOST", os.getenv("MEDIAMTX_HOST", "127.0.0.1"))
     port = int(os.getenv("MEDIAMTX_WEBRTC_PORT", "8889"))
+    timeout_s = 0.3
 
     reachable = False
     error = None
     try:
-        sock = socket.create_connection((host, port), timeout=2)
+        sock = socket.create_connection((host, port), timeout=timeout_s)
         sock.close()
         reachable = True
     except Exception as exc:
         error = str(exc)
 
     return Response({
-        "mediamtx_host": host,
-        "mediamtx_webrtc_port": port,
+        "target": f"{host}:{port}",
         "reachable": reachable,
         "error": error,
+        "checked_at": datetime.now(dt_timezone.utc).isoformat(),
     })
 
 
