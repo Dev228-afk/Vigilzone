@@ -3,11 +3,14 @@ import { Video, Wifi, WifiOff } from "lucide-react";
 import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { api } from "@/lib/api";
+import AuthedMjpeg from "@/components/AuthedMjpeg";
 
 interface CameraFeedProps {
   name: string;
   location: string;
   status: "active" | "offline";
+  /** Camera DB id — needed for MJPEG fallback */
+  cameraId?: number;
   /** Static image or API snapshot URL (legacy fallback) */
   imageUrl?: string;
   /** WebRTC iframe URL — takes priority over imageUrl when provided */
@@ -32,7 +35,7 @@ function normalizeForAxios(url: string): string {
   return url;
 }
 
-export default function CameraFeed({ name, location, status, imageUrl, streamUrl, timestamp }: CameraFeedProps) {
+export default function CameraFeed({ name, location, status, cameraId, imageUrl, streamUrl, timestamp }: CameraFeedProps) {
   const [blobSrc, setBlobSrc] = useState<string | null>(null);
   const [error, setError] = useState(false);
   const [iframeError, setIframeError] = useState(false);
@@ -77,7 +80,7 @@ export default function CameraFeed({ name, location, status, imageUrl, streamUrl
 
   const displaySrc = needsAuth ? blobSrc : imageUrl;
 
-  /* ── Render priority: streamUrl (WebRTC iframe) > imageUrl > placeholder ── */
+  /* ── Render priority: streamUrl (WebRTC iframe) > MJPEG > imageUrl > placeholder ── */
   const renderMedia = () => {
     // WebRTC iframe — primary path
     if (streamUrl && !iframeError) {
@@ -89,6 +92,31 @@ export default function CameraFeed({ name, location, status, imageUrl, streamUrl
           allow="autoplay; encrypted-media"
           sandbox="allow-scripts allow-same-origin"
           onError={() => setIframeError(true)}
+        />
+      );
+    }
+    // MJPEG fallback — when WebRTC fails but we have a camera ID
+    if (iframeError && cameraId) {
+      return (
+        <AuthedMjpeg
+          cameraId={cameraId}
+          alt={name}
+          className="w-full h-full object-cover"
+          fallback={
+            displaySrc && !error ? (
+              <img
+                src={displaySrc}
+                alt={name}
+                className="w-full h-full object-cover"
+                onError={() => setError(true)}
+              />
+            ) : (
+              <div className="w-full h-full flex items-center justify-center">
+                <Video className="w-12 h-12 text-muted-foreground" />
+                <span className="absolute bottom-2 left-2 text-xs text-destructive">Feed unavailable</span>
+              </div>
+            )
+          }
         />
       );
     }

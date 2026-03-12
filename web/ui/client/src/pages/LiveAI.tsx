@@ -24,6 +24,7 @@ import {
 } from "lucide-react";
 import { api } from "@/lib/api";
 import AuthImage from "@/components/AuthImage";
+import AuthedMjpeg from "@/components/AuthedMjpeg";
 
 /* ── Types ──────────────────────────────────────────────────── */
 interface AiCamera {
@@ -149,6 +150,7 @@ export default function LiveAI() {
   const [selectedCamera, setSelectedCamera] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [isLive, setIsLive] = useState(false); // true = connected to real AI
+  const [webrtcFailed, setWebrtcFailed] = useState(false); // fallback to MJPEG
 
   /* ── Fetch data — real AI first, fallback to demo ──────────── */
   const fetchData = useCallback(async () => {
@@ -237,6 +239,9 @@ export default function LiveAI() {
 
   const selectedCam = cameras.find((c) => c.camera_id === selectedCamera);
   const selectedStreamUrl = selectedCamera ? getStreamUrl(selectedCamera) : null;
+  const selectedStreamInfo = selectedCamera
+    ? streams.find((s) => s.ai_camera_id === selectedCamera || s.stream_path === selectedCamera)
+    : null;
 
   /* ── Render ─────────────────────────────────────────────────── */
   return (
@@ -338,7 +343,7 @@ export default function LiveAI() {
                         className={`w-full text-left px-3 py-3 hover:bg-accent transition-colors ${
                           isSelected ? "bg-accent ring-2 ring-primary/30" : ""
                         }`}
-                        onClick={() => setSelectedCamera(cam.camera_id)}
+                        onClick={() => { setSelectedCamera(cam.camera_id); setWebrtcFailed(false); }}
                       >
                         <div className="flex gap-3">
                           {/* Thumbnail */}
@@ -420,7 +425,7 @@ export default function LiveAI() {
           </CardHeader>
           <CardContent>
             {selectedCamera ? (
-              selectedStreamUrl ? (
+              selectedStreamUrl && !webrtcFailed ? (
                 <div className="relative">
                   <iframe
                     key={selectedCamera}
@@ -429,6 +434,7 @@ export default function LiveAI() {
                     className="w-full rounded-lg border bg-muted aspect-video"
                     allow="autoplay; encrypted-media"
                     sandbox="allow-scripts allow-same-origin"
+                    onError={() => setWebrtcFailed(true)}
                   />
                   {/* Overlay info */}
                   <div className="absolute bottom-3 left-3 flex gap-2">
@@ -447,6 +453,28 @@ export default function LiveAI() {
                   <div className="absolute top-3 right-3">
                     <span className="text-[11px] bg-black/60 text-white px-2 py-0.5 rounded">
                       WebRTC
+                    </span>
+                  </div>
+                </div>
+              ) : selectedStreamInfo ? (
+                <div className="relative">
+                  <AuthedMjpeg
+                    cameraId={selectedStreamInfo.id}
+                    alt={`Live feed — ${selectedCamera}`}
+                    className="w-full rounded-lg border bg-muted aspect-video object-cover"
+                    fallback={
+                      <div className="aspect-video flex items-center justify-center bg-muted rounded-lg text-muted-foreground">
+                        <div className="text-center">
+                          <Camera className="w-12 h-12 mx-auto mb-2 opacity-40" />
+                          <p className="text-sm font-medium">Feed unavailable</p>
+                          <p className="text-xs mt-1">WebRTC and MJPEG fallback both failed.</p>
+                        </div>
+                      </div>
+                    }
+                  />
+                  <div className="absolute top-3 right-3">
+                    <span className="text-[11px] bg-yellow-600/80 text-white px-2 py-0.5 rounded">
+                      MJPEG fallback
                     </span>
                   </div>
                 </div>

@@ -39,10 +39,23 @@ def get_cached_snapshot(camera_pk: int):
 
 
 def _grab_frame(rtsp_url: str, ai_base: str, ai_cam_id: str):
-    """Try ffmpeg then AI fallback.  Returns (jpeg_bytes, source) or (None, None)."""
+    """Try AI first, then ffmpeg fallback.  Returns (jpeg_bytes, source) or (None, None)."""
     import requests as http_client
 
-    # ffmpeg
+    # AI primary — single endpoint with quality params
+    try:
+        r = http_client.get(
+            f"{ai_base}/frame/{ai_cam_id}",
+            params={"maxw": 1280, "quality": 70},
+            timeout=2,
+        )
+        ct = r.headers.get("Content-Type", "")
+        if r.status_code == 200 and "image" in ct and r.content:
+            return r.content, "ai"
+    except Exception:
+        pass
+
+    # ffmpeg fallback
     try:
         result = subprocess.run(
             [
@@ -61,20 +74,6 @@ def _grab_frame(rtsp_url: str, ai_base: str, ai_cam_id: str):
             return result.stdout, "ffmpeg"
     except Exception:
         pass
-
-    # AI fallback
-    for endpoint in [
-        f"{ai_base}/frame/{ai_cam_id}",
-        f"{ai_base}/api/v1/cameras/{ai_cam_id}/snapshot",
-        f"{ai_base}/api/v1/cameras/{ai_cam_id}/frame",
-    ]:
-        try:
-            r = http_client.get(endpoint, timeout=2)
-            ct = r.headers.get("Content-Type", "")
-            if r.status_code == 200 and "image" in ct and r.content:
-                return r.content, f"ai_fallback:{endpoint}"
-        except Exception:
-            continue
 
     return None, None
 

@@ -176,12 +176,13 @@ export default function Dashboard() {
           <div>
             <h2 className="text-lg font-semibold mb-4">Live Feeds</h2>
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-1 gap-3">
-              {(cameras.length > 0 ? cameras : [{ name: "No cameras", location: "-", status: "offline" as const, streamUrl: undefined, imageUrl: frontDoorImg }]).map((camera, idx) => (
+              {(cameras.length > 0 ? cameras : [{ id: 0, name: "No cameras", location: "-", status: "offline" as const, streamUrl: undefined, imageUrl: frontDoorImg }]).map((camera, idx) => (
                 <CameraFeed
                   key={idx}
                   name={camera.name}
                   location={camera.location}
                   status={camera.status}
+                  cameraId={camera.id || undefined}
                   streamUrl={camera.streamUrl}
                   imageUrl={camera.imageUrl}
                   timestamp={new Date().toLocaleTimeString()}

@@ -6,8 +6,8 @@ from api.views import (
     DetectionViewSet, AlertViewSet, AuditLogViewSet, ProfileViewSet, auth_context, InvitationViewSet,
     dashboard_summary, KnownEntityViewSet,
     notification_settings, notification_test, notification_register_device,
-    debug_system,
-    streams_list, streams_detail, streams_snapshot,
+    debug_system, debug_mediamtx_health,
+    streams_list, streams_detail, streams_snapshot, streams_mjpeg, streams_signed_token,
 )
 
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
@@ -48,12 +48,15 @@ urlpatterns += [
 # Debug (§7)
 urlpatterns += [
     path("api/debug/system/", debug_system, name="debug-system"),
+    path("api/debug/mediamtx/health", debug_mediamtx_health, name="debug-mediamtx-health"),
 ]
 # Streams (§B — WebRTC/HLS URL endpoints)
 urlpatterns += [
     path("api/streams/", streams_list, name="streams-list"),
     path("api/streams/<int:camera_id>/", streams_detail, name="streams-detail"),
     path("api/streams/<int:camera_id>/snapshot/", streams_snapshot, name="streams-snapshot"),
+    path("api/streams/<int:camera_id>/mjpeg/", streams_mjpeg, name="streams-mjpeg"),
+    path("api/streams/<int:camera_id>/signed_stream_token/", streams_signed_token, name="streams-signed-token"),
 ]
 # AI Integration (proxy + webhook)
 urlpatterns += [

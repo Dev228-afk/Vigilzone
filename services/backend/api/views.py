@@ -718,14 +718,16 @@ def streams_detail(request, camera_id):
 def streams_snapshot(request, camera_id):
     """
     GET /api/streams/<camera_id>/snapshot/
-    Grab a still frame.  Pipeline:
-      1. ffmpeg from RTSP (fast, no AI dependency)
-      2. AI module fallback — auto-detect which endpoint exists
+    AI-first snapshot pipeline:
+      1. Background cache (instant)
+      2. AI module /frame/<ai_id>  (2 s timeout)
+      3. ffmpeg from RTSP           (8 s timeout)
     Returns image/jpeg with X-Snapshot-Source header.
     """
     import subprocess
     import time as _time
     import requests as http_client
+    from django.http import HttpResponse
 
     tenant = get_active_tenant(request)
     if not assert_member(request, tenant):
@@ -736,49 +738,46 @@ def streams_snapshot(request, camera_id):
         return Response({"error": "Camera not found"}, status=status.HTTP_404_NOT_FOUND)
 
     # ── Identifiers ──────────────────────────────────────────
-    ai_cam_id = camera.ai_camera_id or f"cam_{camera.pk}"
-    stream_path = camera.stream_path or ai_cam_id
-    # Build RTSP URL — works for both Docker (mediamtx) and local dev (127.0.0.1)
+    ai_id = camera.ai_camera_id or camera.stream_path or f"cam_{camera.pk}"
+    stream_path = camera.stream_path or ai_id
     mediamtx_rtsp_base = os.getenv("MEDIAMTX_RTSP_BASE", "rtsp://127.0.0.1:8554")
     rtsp_url = camera.rtsp_url or f"{mediamtx_rtsp_base}/{stream_path}"
     ai_base = os.getenv("AI_BASE_INTERNAL", "http://127.0.0.1:8080")
 
-    # ── Check background snapshot cache first ────────────────
-    from api.snapshot_cache import get_cached_snapshot
-    cached = get_cached_snapshot(camera.pk)
-    if cached:
-        from django.http import HttpResponse
-        data, source, age = cached
-        resp = HttpResponse(data, content_type="image/jpeg")
-        resp["Cache-Control"] = "no-store"
-        resp["X-Snapshot-Source"] = f"{source} (cached {age:.1f}s)"
-        return resp
-
-    # ── Per-request in-memory fallback cache (5 s TTL) ───────
+    # ── Per-request in-memory cache (3 s TTL) ────────────────
     cache_key = f"_snapshot_{camera.pk}"
     if not hasattr(streams_snapshot, "_cache"):
         streams_snapshot._cache = {}
     inline_cached = streams_snapshot._cache.get(cache_key)
     now = _time.time()
-    if inline_cached and (now - inline_cached["ts"]) < 5.0:
-        from django.http import HttpResponse
+    if inline_cached and (now - inline_cached["ts"]) < 3.0:
         resp = HttpResponse(inline_cached["data"], content_type="image/jpeg")
         resp["Cache-Control"] = "no-store"
         resp["X-Snapshot-Source"] = inline_cached.get("source", "cache")
         return resp
 
     def _make_jpeg_response(data: bytes, source: str):
-        from django.http import HttpResponse
         streams_snapshot._cache[cache_key] = {"ts": _time.time(), "data": data, "source": source}
         resp = HttpResponse(data, content_type="image/jpeg")
         resp["Cache-Control"] = "no-store"
         resp["X-Snapshot-Source"] = source
         return resp
 
-    ffmpeg_err = ""
     ai_errors = []
+    ffmpeg_err = ""
 
-    # ── Step 1: ffmpeg from RTSP ─────────────────────────────
+    # ── Step 1: AI module (primary) ──────────────────────────
+    ai_endpoint = f"{ai_base}/frame/{ai_id}?maxw=1280&quality=70"
+    try:
+        ai_resp = http_client.get(ai_endpoint, timeout=2)
+        ct = ai_resp.headers.get("Content-Type", "")
+        if ai_resp.status_code == 200 and "image" in ct and ai_resp.content:
+            return _make_jpeg_response(ai_resp.content, "ai")
+        ai_errors.append(f"{ai_endpoint} -> {ai_resp.status_code}")
+    except Exception as exc:
+        ai_errors.append(f"{ai_endpoint} -> {exc}")
+
+    # ── Step 2: ffmpeg from RTSP (fallback) ──────────────────
     try:
         result = subprocess.run(
             [
@@ -804,32 +803,189 @@ def streams_snapshot(request, camera_id):
     except Exception as exc:
         ffmpeg_err = str(exc)[:200]
 
-    # ── Step 2: AI module fallback (auto-detect endpoint) ────
-    ai_endpoints = [
-        f"{ai_base}/frame/{ai_cam_id}",
-        f"{ai_base}/api/v1/cameras/{ai_cam_id}/snapshot",
-        f"{ai_base}/api/v1/cameras/{ai_cam_id}/frame",
-    ]
-    for endpoint in ai_endpoints:
-        try:
-            ai_resp = http_client.get(endpoint, timeout=2)
-            ct = ai_resp.headers.get("Content-Type", "")
-            if ai_resp.status_code == 200 and "image" in ct and ai_resp.content:
-                return _make_jpeg_response(ai_resp.content, f"ai_fallback:{endpoint}")
-            ai_errors.append(f"{endpoint} -> {ai_resp.status_code}")
-        except Exception as exc:
-            ai_errors.append(f"{endpoint} -> {exc}")
-
-    # ── Both failed — log one diagnosable line ───────────────
+    # ── Both failed ──────────────────────────────────────────
     _log = logging.getLogger("vigilzone.snapshot")
     _log.error(
-        "Snapshot failed camera=%s rtsp=%s | ffmpeg: %s | AI: %s",
-        camera_id, rtsp_url, ffmpeg_err, "; ".join(ai_errors),
+        "Snapshot failed camera=%s rtsp=%s | AI: %s | ffmpeg: %s",
+        camera_id, rtsp_url, "; ".join(ai_errors), ffmpeg_err,
     )
     return Response(
-        {"error": "Snapshot unavailable — ffmpeg and AI fallback both failed"},
+        {"error": "Snapshot unavailable — AI and ffmpeg both failed"},
         status=status.HTTP_502_BAD_GATEWAY,
     )
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# §3b  MJPEG STREAM  (robust live-video fallback)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _verify_stream_token(token: str, camera_id: int) -> bool:
+    """Verify an HMAC-signed short-lived stream token."""
+    import hashlib
+    import hmac
+    import time as _time
+    from django.conf import settings
+
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return False
+        tok_cam, tok_exp, tok_sig = parts
+        if int(tok_cam) != camera_id:
+            return False
+        if _time.time() > float(tok_exp):
+            return False
+        payload = f"{tok_cam}.{tok_exp}".encode()
+        expected = hmac.new(
+            settings.SECRET_KEY.encode(), payload, hashlib.sha256
+        ).hexdigest()[:32]
+        return hmac.compare_digest(expected, tok_sig)
+    except Exception:
+        return False
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def streams_signed_token(request, camera_id):
+    """
+    GET /api/streams/<camera_id>/signed_stream_token/
+    Returns a 60-second HMAC token so <img src="...?token=..."> works for MJPEG.
+    """
+    import hashlib
+    import hmac
+    import time as _time
+    from django.conf import settings
+
+    tenant = get_active_tenant(request)
+    if not assert_member(request, tenant):
+        raise PermissionDenied()
+    try:
+        Camera.objects.get(pk=camera_id, tenant=tenant)
+    except Camera.DoesNotExist:
+        return Response({"error": "Camera not found"}, status=status.HTTP_404_NOT_FOUND)
+
+    ttl = 60
+    exp = str(int(_time.time()) + ttl)
+    payload = f"{camera_id}.{exp}".encode()
+    sig = hmac.new(
+        settings.SECRET_KEY.encode(), payload, hashlib.sha256
+    ).hexdigest()[:32]
+    token = f"{camera_id}.{exp}.{sig}"
+
+    return Response({"token": token, "ttl": ttl})
+
+
+def _mjpeg_generator(camera_id: int, ai_base: str, ai_id: str, fps: int = 3):
+    """Yield multipart MJPEG frames at ~fps rate by pulling from AI module."""
+    import time as _time
+    import requests as http_client
+
+    interval = 1.0 / fps
+    boundary = b"--frame\r\n"
+
+    while True:
+        frame = None
+        try:
+            r = http_client.get(
+                f"{ai_base}/frame/{ai_id}",
+                params={"maxw": 1280, "quality": 60},
+                timeout=2,
+            )
+            ct = r.headers.get("Content-Type", "")
+            if r.status_code == 200 and "image" in ct and r.content:
+                frame = r.content
+        except Exception:
+            pass
+
+        if frame:
+            yield (
+                boundary
+                + b"Content-Type: image/jpeg\r\nContent-Length: "
+                + str(len(frame)).encode()
+                + b"\r\n\r\n"
+                + frame
+                + b"\r\n"
+            )
+        else:
+            _time.sleep(0.5)
+            continue
+
+        _time.sleep(interval)
+
+
+@api_view(["GET"])
+@permission_classes([])  # auth handled manually (JWT or signed token)
+def streams_mjpeg(request, camera_id):
+    """
+    GET /api/streams/<camera_id>/mjpeg/?token=<signed_token>
+    MJPEG multipart stream — works in <img> tags (no JS/WebSocket needed).
+    Auth: either JWT Bearer header OR ?token= query param (from signed_stream_token).
+    """
+    from django.http import StreamingHttpResponse
+
+    # ── Auth: try JWT first, then signed token ───────────────
+    user = request.user
+    token_param = request.GET.get("token", "")
+
+    if user and user.is_authenticated:
+        tenant = get_active_tenant(request)
+        if not assert_member(request, tenant):
+            raise PermissionDenied()
+        try:
+            camera = Camera.objects.get(pk=camera_id, tenant=tenant)
+        except Camera.DoesNotExist:
+            return Response({"error": "Camera not found"}, status=status.HTTP_404_NOT_FOUND)
+    elif token_param and _verify_stream_token(token_param, camera_id):
+        try:
+            camera = Camera.objects.get(pk=camera_id)
+        except Camera.DoesNotExist:
+            return Response({"error": "Camera not found"}, status=status.HTTP_404_NOT_FOUND)
+    else:
+        raise NotAuthenticated("Provide Authorization header or ?token= parameter")
+
+    ai_id = camera.ai_camera_id or camera.stream_path or f"cam_{camera.pk}"
+    ai_base = os.getenv("AI_BASE_INTERNAL", "http://127.0.0.1:8080")
+
+    resp = StreamingHttpResponse(
+        _mjpeg_generator(camera_id, ai_base, ai_id, fps=3),
+        content_type="multipart/x-mixed-replace; boundary=frame",
+    )
+    resp["Cache-Control"] = "no-store"
+    resp["X-Accel-Buffering"] = "no"
+    return resp
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# §3c  MEDIAMTX HEALTH CHECK
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def debug_mediamtx_health(request):
+    """
+    GET /api/debug/mediamtx/health
+    Quick TCP-connect probe to MediaMTX WebRTC port.
+    """
+    import socket
+
+    host = os.getenv("MEDIAMTX_HOST", "127.0.0.1")
+    port = int(os.getenv("MEDIAMTX_WEBRTC_PORT", "8889"))
+
+    reachable = False
+    error = None
+    try:
+        sock = socket.create_connection((host, port), timeout=2)
+        sock.close()
+        reachable = True
+    except Exception as exc:
+        error = str(exc)
+
+    return Response({
+        "mediamtx_host": host,
+        "mediamtx_webrtc_port": port,
+        "reachable": reachable,
+        "error": error,
+    })
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
