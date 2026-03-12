@@ -855,6 +855,10 @@ def streams_snapshot(request, camera_id):
     rtsp_url = camera.rtsp_url or f"{mediamtx_rtsp_base}/{stream_path}"
     ai_base = os.getenv("AI_BASE_INTERNAL", "http://127.0.0.1:8080")
 
+    active_ids = _get_ai_active_camera_ids(ai_base)
+    if active_ids is not None:
+        ai_candidates = [c for c in ai_candidates if c in active_ids]
+
     # ── Per-request in-memory cache (3 s TTL) ────────────────
     cache_key = f"_snapshot_{camera.pk}"
     if not hasattr(streams_snapshot, "_cache"):
@@ -884,6 +888,8 @@ def streams_snapshot(request, camera_id):
             f"{ai_base}/frame/{cand}?maxw=1280&quality=70",
             f"{ai_base}/api/v1/cameras/{cand}/snapshot?maxw=1280&quality=70",
         ])
+    if not ai_endpoints and active_ids is not None:
+        ai_errors.append("No matching active camera_id in AI /cameras")
     for ai_endpoint in ai_endpoints:
         try:
             ai_resp = http_client.get(ai_endpoint, timeout=2)
@@ -992,7 +998,35 @@ def streams_signed_token(request, camera_id):
     return Response({"token": token, "ttl": ttl})
 
 
-def _mjpeg_generator(camera_id: int, ai_base: str, ai_id: str, fps: int = 3):
+def _get_ai_active_camera_ids(ai_base: str, ttl_s: float = 3.0):
+    """Best-effort cached fetch of active AI camera IDs from /cameras."""
+    import time as _time
+    import requests as http_client
+
+    now = _time.time()
+    cache = getattr(_get_ai_active_camera_ids, "_cache", None)
+    if cache and cache.get("base") == ai_base and (now - cache.get("ts", 0.0)) < ttl_s:
+        return cache.get("ids")
+
+    try:
+        r = http_client.get(f"{ai_base}/cameras", timeout=1.0)
+        ids = set()
+        if r.status_code == 200:
+            payload = r.json() if r.content else []
+            if isinstance(payload, list):
+                for item in payload:
+                    if isinstance(item, dict):
+                        cam_id = item.get("camera_id")
+                        if cam_id:
+                            ids.add(str(cam_id))
+        _get_ai_active_camera_ids._cache = {"base": ai_base, "ts": now, "ids": ids}
+        return ids
+    except Exception:
+        # None means "unknown" (do not filter candidates).
+        return None
+
+
+def _mjpeg_generator(camera_id: int, ai_base: str, ai_ids, fps: int = 3):
     """Yield multipart MJPEG frames at ~fps rate by pulling from AI module."""
     import time as _time
     import requests as http_client
@@ -1002,17 +1036,19 @@ def _mjpeg_generator(camera_id: int, ai_base: str, ai_id: str, fps: int = 3):
 
     while True:
         frame = None
-        try:
-            r = http_client.get(
-                f"{ai_base}/frame/{ai_id}",
-                params={"maxw": 1280, "quality": 60},
-                timeout=2,
-            )
-            ct = r.headers.get("Content-Type", "")
-            if r.status_code == 200 and "image" in ct and r.content:
-                frame = r.content
-        except Exception:
-            pass
+        for ai_id in ai_ids:
+            try:
+                r = http_client.get(
+                    f"{ai_base}/frame/{ai_id}",
+                    params={"maxw": 1280, "quality": 60},
+                    timeout=2,
+                )
+                ct = r.headers.get("Content-Type", "")
+                if r.status_code == 200 and "image" in ct and r.content:
+                    frame = r.content
+                    break
+            except Exception:
+                continue
 
         if frame:
             yield (
@@ -1060,11 +1096,20 @@ def streams_mjpeg(request, camera_id):
     else:
         raise NotAuthenticated("Provide Authorization header or ?token= parameter")
 
-    ai_id = camera.ai_camera_id or camera.stream_path or f"cam_{camera.pk}"
+    ai_candidates = []
+    for cand in (camera.ai_camera_id, camera.stream_path, f"cam_{camera.pk}"):
+        if cand and cand not in ai_candidates:
+            ai_candidates.append(cand)
     ai_base = os.getenv("AI_BASE_INTERNAL", "http://127.0.0.1:8080")
 
+    active_ids = _get_ai_active_camera_ids(ai_base)
+    if active_ids is not None:
+        ai_candidates = [c for c in ai_candidates if c in active_ids]
+    if not ai_candidates:
+        ai_candidates = [camera.stream_path or camera.ai_camera_id or f"cam_{camera.pk}"]
+
     resp = StreamingHttpResponse(
-        _mjpeg_generator(camera_id, ai_base, ai_id, fps=3),
+        _mjpeg_generator(camera_id, ai_base, ai_candidates, fps=3),
         content_type="multipart/x-mixed-replace; boundary=frame",
     )
     resp["Cache-Control"] = "no-store"
