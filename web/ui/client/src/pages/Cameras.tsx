@@ -28,13 +28,24 @@ interface Camera {
 export default function Cameras() {
   const { toast } = useToast();
   const [isDialogOpen, setIsDialogOpen] = useState(false);
-  const [newCamera, setNewCamera] = useState({ name: "", site: "", rtsp_url: "", ai_camera_id: "", stream_path: "" });
+  const [newCamera, setNewCamera] = useState({
+    name: "",
+    site: "",
+    rtsp_url: "",
+    ai_camera_id: "",
+    stream_path: "",
+  });
 
-  // Edit state
   const [editCamera, setEditCamera] = useState<Camera | null>(null);
-  const [editForm, setEditForm] = useState({ name: "", site: "", rtsp_url: "", ai_camera_id: "", stream_path: "", status: "active" });
+  const [editForm, setEditForm] = useState({
+    name: "",
+    site: "",
+    rtsp_url: "",
+    ai_camera_id: "",
+    stream_path: "",
+    status: "active",
+  });
 
-  /* ── Fetch cameras ─────────────────────────────────────────── */
   const camerasQ = useQuery({
     queryKey: ["cameras"],
     queryFn: async () => {
@@ -44,7 +55,6 @@ export default function Cameras() {
     retry: false,
   });
 
-  /* ── Add camera ────────────────────────────────────────────── */
   const addMut = useMutation({
     mutationFn: async (cam: typeof newCamera) => {
       const { data } = await api.post("/cameras/", {
@@ -55,14 +65,11 @@ export default function Cameras() {
         stream_path: cam.stream_path,
         status: "active",
       });
-      // Auto-sync to AI module if we have an RTSP URL
       if (cam.rtsp_url && data?.id) {
         try {
-          await api.post(`/cameras/${data.id}/sync_to_ai/`, {
-            rtsp_url: cam.rtsp_url,
-          });
+          await api.post(`/cameras/${data.id}/sync_to_ai/`, { rtsp_url: cam.rtsp_url });
         } catch {
-          // Camera created but AI sync failed — user can retry via UI
+          // Camera created but AI sync failed; user can retry manually.
         }
       }
       return data;
@@ -78,7 +85,6 @@ export default function Cameras() {
     },
   });
 
-  /* ── Delete camera ─────────────────────────────────────────── */
   const deleteMut = useMutation({
     mutationFn: async (id: number | string) => {
       await api.delete(`/cameras/${id}/`);
@@ -92,8 +98,51 @@ export default function Cameras() {
     },
   });
 
-  const handleAddCamera = () => {
-    addMut.mutate(newCamera);
+  const editMut = useMutation({
+    mutationFn: async ({ id, ...fields }: { id: number | string; [k: string]: unknown }) => {
+      const { data } = await api.patch(`/cameras/${id}/`, fields);
+      return data;
+    },
+    onSuccess: () => {
+      toast({ title: "Camera updated" });
+      queryClient.invalidateQueries({ queryKey: ["cameras"] });
+      setEditCamera(null);
+    },
+    onError: () => {
+      toast({ title: "Failed to update camera", variant: "destructive" });
+    },
+  });
+
+  const syncMut = useMutation({
+    mutationFn: async (id: number | string) => {
+      const { data } = await api.post(`/cameras/${id}/sync_to_ai/`);
+      return data;
+    },
+    onSuccess: (data) => {
+      toast({ title: "Camera synced to AI", description: `AI ID: ${data.ai_camera_id}` });
+      queryClient.invalidateQueries({ queryKey: ["cameras"] });
+    },
+    onError: () => {
+      toast({ title: "AI sync failed", variant: "destructive" });
+    },
+  });
+
+  const openEditModal = (cam: Camera) => {
+    setEditCamera(cam);
+    setEditForm({
+      name: cam.name,
+      site: cam.site ?? "",
+      rtsp_url: cam.rtsp_url ?? "",
+      ai_camera_id: cam.ai_camera_id ?? "",
+      stream_path: cam.stream_path ?? "",
+      status: cam.status ?? "active",
+    });
+  };
+
+  const handleAddCamera = () => addMut.mutate(newCamera);
+  const handleSaveEdit = () => {
+    if (!editCamera) return;
+    editMut.mutate({ id: editCamera.id, ...editForm });
   };
 
   const handleTestConnection = async () => {
@@ -116,54 +165,6 @@ export default function Cameras() {
       toast({ title: "Test failed", description: "Could not reach backend", variant: "destructive" });
     }
   };
-
-  /* ── Edit camera ───────────────────────────────────────────── */
-  const editMut = useMutation({
-    mutationFn: async ({ id, ...fields }: { id: number | string; [k: string]: unknown }) => {
-      const { data } = await api.patch(`/cameras/${id}/`, fields);
-      return data;
-    },
-    onSuccess: () => {
-      toast({ title: "Camera updated" });
-      queryClient.invalidateQueries({ queryKey: ["cameras"] });
-      setEditCamera(null);
-    },
-    onError: () => {
-      toast({ title: "Failed to update camera", variant: "destructive" });
-    },
-  });
-
-  const openEditModal = (cam: Camera) => {
-    setEditCamera(cam);
-    setEditForm({
-      name: cam.name,
-      site: cam.site ?? "",
-      rtsp_url: cam.rtsp_url ?? "",
-      ai_camera_id: cam.ai_camera_id ?? "",
-      stream_path: cam.stream_path ?? "",
-      status: cam.status ?? "active",
-    });
-  };
-
-  const handleSaveEdit = () => {
-    if (!editCamera) return;
-    editMut.mutate({ id: editCamera.id, ...editForm });
-  };
-
-  /* ── Sync camera to AI ─────────────────────────────────────── */
-  const syncMut = useMutation({
-    mutationFn: async (id: number | string) => {
-      const { data } = await api.post(`/cameras/${id}/sync_to_ai/`);
-      return data;
-    },
-    onSuccess: (data) => {
-      toast({ title: "Camera synced to AI", description: `AI ID: ${data.ai_camera_id}` });
-      queryClient.invalidateQueries({ queryKey: ["cameras"] });
-    },
-    onError: () => {
-      toast({ title: "AI sync failed", variant: "destructive" });
-    },
-  });
 
   const cameras: Camera[] = camerasQ.data ?? [];
 
@@ -188,62 +189,27 @@ export default function Cameras() {
             <div className="space-y-4 py-4">
               <div className="space-y-2">
                 <Label htmlFor="camera-name">Camera Name</Label>
-                <Input
-                  id="camera-name"
-                  placeholder="e.g., FrontDoorCam"
-                  value={newCamera.name}
-                  onChange={(e) => setNewCamera({ ...newCamera, name: e.target.value })}
-                  data-testid="input-camera-name"
-                />
+                <Input id="camera-name" value={newCamera.name} onChange={(e) => setNewCamera({ ...newCamera, name: e.target.value })} />
               </div>
               <div className="space-y-2">
                 <Label htmlFor="stream-url">Stream URL</Label>
-                <Input
-                  id="stream-url"
-                  placeholder="rtsp://camera.local/stream"
-                  value={newCamera.rtsp_url}
-                  onChange={(e) => setNewCamera({ ...newCamera, rtsp_url: e.target.value })}
-                  data-testid="input-stream-url"
-                />
+                <Input id="stream-url" placeholder="rtsp://camera.local/stream" value={newCamera.rtsp_url} onChange={(e) => setNewCamera({ ...newCamera, rtsp_url: e.target.value })} />
               </div>
               <div className="space-y-2">
                 <Label htmlFor="location">Location / Site</Label>
-                <Input
-                  id="location"
-                  placeholder="e.g., Entrance, Backyard"
-                  value={newCamera.site}
-                  onChange={(e) => setNewCamera({ ...newCamera, site: e.target.value })}
-                  data-testid="input-location"
-                />
+                <Input id="location" value={newCamera.site} onChange={(e) => setNewCamera({ ...newCamera, site: e.target.value })} />
               </div>
               <div className="space-y-2">
                 <Label htmlFor="ai-cam-id">AI Camera ID (optional)</Label>
-                <Input
-                  id="ai-cam-id"
-                  placeholder="e.g., cam_live"
-                  value={newCamera.ai_camera_id}
-                  onChange={(e) => setNewCamera({ ...newCamera, ai_camera_id: e.target.value })}
-                  data-testid="input-ai-camera-id"
-                />
+                <Input id="ai-cam-id" value={newCamera.ai_camera_id} onChange={(e) => setNewCamera({ ...newCamera, ai_camera_id: e.target.value })} />
               </div>
               <div className="space-y-2">
                 <Label htmlFor="stream-path">Stream Path (optional)</Label>
-                <Input
-                  id="stream-path"
-                  placeholder="e.g., webcam — auto-derived from name if empty"
-                  value={newCamera.stream_path}
-                  onChange={(e) => setNewCamera({ ...newCamera, stream_path: e.target.value })}
-                  data-testid="input-stream-path"
-                />
-                <p className="text-xs text-muted-foreground">
-                  MediaMTX path used for WebRTC/HLS. Leave blank to auto-derive from the camera name.
-                </p>
+                <Input id="stream-path" value={newCamera.stream_path} onChange={(e) => setNewCamera({ ...newCamera, stream_path: e.target.value })} />
               </div>
             </div>
             <DialogFooter>
-              <Button variant="outline" onClick={handleTestConnection} data-testid="button-test-connection">
-                Test Connection
-              </Button>
+              <Button variant="outline" onClick={handleTestConnection} data-testid="button-test-connection">Test Connection</Button>
               <Button onClick={handleAddCamera} disabled={addMut.isPending} data-testid="button-save-camera">
                 {addMut.isPending ? "Saving…" : "Save"}
               </Button>
@@ -275,18 +241,10 @@ export default function Cameras() {
             )}
             {cameras.map((camera) => (
               <TableRow key={camera.id}>
-                <TableCell className="font-medium" data-testid={`text-camera-${camera.id}`}>{camera.name}</TableCell>
+                <TableCell className="font-medium">{camera.name}</TableCell>
                 <TableCell>{camera.site || "—"}</TableCell>
-                <TableCell>
-                  {camera.ai_camera_id ? (
-                    <Badge variant="outline">{camera.ai_camera_id}</Badge>
-                  ) : "—"}
-                </TableCell>
-                <TableCell>
-                  {camera.stream_path ? (
-                    <Badge variant="outline">{camera.stream_path}</Badge>
-                  ) : "—"}
-                </TableCell>
+                <TableCell>{camera.ai_camera_id ? <Badge variant="outline">{camera.ai_camera_id}</Badge> : "—"}</TableCell>
+                <TableCell>{camera.stream_path ? <Badge variant="outline">{camera.stream_path}</Badge> : "—"}</TableCell>
                 <TableCell>
                   <div className="flex items-center gap-2">
                     {camera.status === "active" ? (
@@ -305,29 +263,18 @@ export default function Cameras() {
                 <TableCell>{new Date(camera.created_at).toLocaleDateString()}</TableCell>
                 <TableCell className="text-right">
                   <div className="flex justify-end gap-2">
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      onClick={() => syncMut.mutate(camera.id)}
-                      disabled={syncMut.isPending}
-                      data-testid={`button-sync-${camera.id}`}
-                    >
+                    <Button size="sm" variant="outline" onClick={() => syncMut.mutate(camera.id)} disabled={syncMut.isPending}>
                       <RefreshCw className="w-3 h-3 mr-1" />
                       Sync AI
                     </Button>
-                    <Button size="sm" variant="outline" data-testid={`button-share-${camera.id}`}>
+                    <Button size="sm" variant="outline">
                       <Share2 className="w-3 h-3 mr-1" />
                       Share
                     </Button>
-                    <Button size="icon" variant="ghost" onClick={() => openEditModal(camera)} data-testid={`button-edit-${camera.id}`}>
+                    <Button size="icon" variant="ghost" onClick={() => openEditModal(camera)}>
                       <Edit className="w-4 h-4" />
                     </Button>
-                    <Button
-                      size="icon"
-                      variant="ghost"
-                      onClick={() => deleteMut.mutate(camera.id)}
-                      data-testid={`button-delete-${camera.id}`}
-                    >
+                    <Button size="icon" variant="ghost" onClick={() => deleteMut.mutate(camera.id)}>
                       <Trash2 className="w-4 h-4" />
                     </Button>
                   </div>
@@ -338,7 +285,6 @@ export default function Cameras() {
         </Table>
       </Card>
 
-      {/* ── Edit Camera Dialog ─────────────────────────────────── */}
       <Dialog open={!!editCamera} onOpenChange={(open) => { if (!open) setEditCamera(null); }}>
         <DialogContent>
           <DialogHeader>

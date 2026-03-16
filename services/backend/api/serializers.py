@@ -52,34 +52,24 @@ class MembershipSerializer(serializers.ModelSerializer):
 class CameraSafeSerializer(serializers.ModelSerializer):
     class Meta:
         model = Camera
-        exclude = ("rtsp_url",)  # don't leak RTSP in public responses
+        fields = [
+            "id", "name", "site", "status", "camera_type",
+            "ai_camera_id", "stream_path",
+            "min_confidence", "min_bbox_area", "k_of_n_k", "k_of_n_n", "cooldown_s",
+            "created_at", "updated_at", "tenant",
+        ]
+        read_only_fields = ["created_at", "updated_at", "tenant"]
 
 
 class CameraStreamSerializer(serializers.ModelSerializer):
-    """Read-only serializer that exposes stream URLs derived from stream_path."""
-    webrtc_url = serializers.SerializerMethodField()
-    whep_url = serializers.SerializerMethodField()
-    hls_url = serializers.SerializerMethodField()
+    """Read-only serializer used by UI stream mapping."""
 
     class Meta:
         model = Camera
-        fields = ["id", "name", "site", "status", "ai_camera_id", "stream_path",
-                  "camera_type", "webrtc_url", "whep_url", "hls_url"]
-
-    def _stream_path(self, obj):
-        return obj.stream_path or obj.ai_camera_id or f"cam_{obj.pk}"
-
-    def get_webrtc_url(self, obj):
-        p = self._stream_path(obj)
-        return f"/webrtc/{p}" if p else None
-
-    def get_whep_url(self, obj):
-        p = self._stream_path(obj)
-        return f"/webrtc/{p}/whep" if p else None
-
-    def get_hls_url(self, obj):
-        p = self._stream_path(obj)
-        return f"/hls/{p}" if p else None
+        fields = [
+            "id", "name", "site", "status", "ai_camera_id", "stream_path",
+            "camera_type",
+        ]
 
 class CameraAdminSerializer(serializers.ModelSerializer):
     class Meta:
@@ -139,6 +129,10 @@ class CameraWriteSerializer(serializers.ModelSerializer):
                 attrs["stream_path"] = attrs["ai_camera_id"]
             elif attrs.get("name"):
                 attrs["stream_path"] = slugify(attrs["name"])
+
+        # Keep ai_camera_id aligned with stream_path unless user explicitly set it.
+        if not attrs.get("ai_camera_id") and attrs.get("stream_path"):
+            attrs["ai_camera_id"] = attrs["stream_path"]
 
         return attrs
 

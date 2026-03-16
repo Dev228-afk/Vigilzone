@@ -4,7 +4,14 @@ import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { api } from "@/lib/api";
 import AuthedMjpeg from "@/components/AuthedMjpeg";
-import { useMediamtxHealth } from "@/hooks/use-mediamtx-health";
+
+interface StreamHealth {
+  connected: boolean;
+  last_frame_ts: number | null;
+  last_error: string;
+  fps_config: number;
+  viewers: number;
+}
 
 interface CameraFeedProps {
   name: string;
@@ -14,8 +21,7 @@ interface CameraFeedProps {
   cameraId?: number;
   /** Static image or API snapshot URL (legacy fallback) */
   imageUrl?: string;
-  /** WebRTC iframe URL — takes priority over imageUrl when provided */
-  streamUrl?: string;
+  health?: StreamHealth;
   timestamp?: string;
 }
 
@@ -36,18 +42,16 @@ function normalizeForAxios(url: string): string {
   return url;
 }
 
-export default function CameraFeed({ name, location, status, cameraId, imageUrl, streamUrl, timestamp }: CameraFeedProps) {
+export default function CameraFeed({ name, location, status, cameraId, imageUrl, health, timestamp }: CameraFeedProps) {
   const [blobSrc, setBlobSrc] = useState<string | null>(null);
   const [error, setError] = useState(false);
-  const [iframeError, setIframeError] = useState(false);
   const prevBlobRef = useRef<string | null>(null);
-  const { reachable: mtxReachable, checked: mtxChecked } = useMediamtxHealth();
 
   const needsAuth = imageUrl ? isApiUrl(imageUrl) : false;
 
-  // Legacy blob-fetch path (only used when streamUrl is absent)
+  // Legacy blob-fetch path used for fallback snapshots/images.
   useEffect(() => {
-    if (streamUrl || !imageUrl || !needsAuth) {
+    if (!imageUrl || !needsAuth) {
       setBlobSrc(null);
       setError(false);
       return;
@@ -72,7 +76,7 @@ export default function CameraFeed({ name, location, status, cameraId, imageUrl,
     return () => {
       cancelled = true;
     };
-  }, [imageUrl, needsAuth, streamUrl]);
+  }, [imageUrl, needsAuth]);
 
   useEffect(() => {
     return () => {
@@ -82,23 +86,9 @@ export default function CameraFeed({ name, location, status, cameraId, imageUrl,
 
   const displaySrc = needsAuth ? blobSrc : imageUrl;
 
-  /* ── Render priority: streamUrl (WebRTC iframe) > MJPEG > imageUrl > placeholder ── */
+  /* ── Render priority: MJPEG > imageUrl > placeholder ── */
   const renderMedia = () => {
-    // WebRTC iframe — only attempt when MediaMTX is confirmed reachable
-    if (streamUrl && !iframeError && mtxChecked && mtxReachable) {
-      return (
-        <iframe
-          src={streamUrl}
-          title={`Live feed — ${name}`}
-          className="w-full h-full border-0"
-          allow="autoplay; encrypted-media"
-          sandbox="allow-scripts allow-same-origin"
-          onError={() => setIframeError(true)}
-        />
-      );
-    }
-    // MJPEG fallback — when WebRTC fails or MediaMTX unreachable, but we have a camera ID
-    if ((iframeError || (mtxChecked && !mtxReachable)) && cameraId) {
+    if (cameraId && status === "active") {
       return (
         <AuthedMjpeg
           cameraId={cameraId}
@@ -122,6 +112,7 @@ export default function CameraFeed({ name, location, status, cameraId, imageUrl,
         />
       );
     }
+
     // Image fallback
     if (displaySrc && !error) {
       return (
@@ -137,7 +128,7 @@ export default function CameraFeed({ name, location, status, cameraId, imageUrl,
     return (
       <div className="w-full h-full flex items-center justify-center">
         <Video className="w-12 h-12 text-muted-foreground" />
-        {(error || iframeError) && (
+        {error && (
           <span className="absolute bottom-2 left-2 text-xs text-destructive">Feed unavailable</span>
         )}
       </div>
@@ -157,6 +148,11 @@ export default function CameraFeed({ name, location, status, cameraId, imageUrl,
         {timestamp && (
           <div className="absolute bottom-2 right-2 bg-black/70 text-white text-xs px-2 py-1 rounded">
             {timestamp}
+          </div>
+        )}
+        {health && (
+          <div className="absolute bottom-2 left-2 bg-black/70 text-white text-[10px] px-2 py-1 rounded">
+            {health.connected ? "Connected" : "Warming"}
           </div>
         )}
       </div>

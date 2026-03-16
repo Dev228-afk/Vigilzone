@@ -24,7 +24,21 @@ export default function AuthedMjpeg({
 }: AuthedMjpegProps) {
   const [src, setSrc] = useState<string | null>(null);
   const [error, setError] = useState(false);
+  const [retryTick, setRetryTick] = useState(0);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const refreshRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const versionRef = useRef(0);
+
+  const clearTimers = () => {
+    if (timerRef.current) {
+      clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+    if (refreshRef.current) {
+      clearInterval(refreshRef.current);
+      refreshRef.current = null;
+    }
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -34,23 +48,34 @@ export default function AuthedMjpeg({
         const { data } = await api.get(`/streams/${cameraId}/signed_stream_token/`);
         if (cancelled) return;
         const token: string = data.token;
-        const ttl: number = data.ttl ?? 60;
-        setSrc(`/api/streams/${cameraId}/mjpeg/?token=${encodeURIComponent(token)}`);
+        versionRef.current += 1;
+        setSrc(`/api/streams/${cameraId}/mjpeg/?token=${encodeURIComponent(token)}&v=${versionRef.current}`);
         setError(false);
-        // Refresh token at 80% of TTL
-        timerRef.current = setTimeout(fetchToken, ttl * 800);
       } catch {
         if (!cancelled) setError(true);
       }
     }
 
+    clearTimers();
     fetchToken();
+
+    // Refresh token every 50 seconds to stay under the 60-second token TTL.
+    refreshRef.current = setInterval(fetchToken, 50_000);
 
     return () => {
       cancelled = true;
-      if (timerRef.current) clearTimeout(timerRef.current);
+      clearTimers();
     };
-  }, [cameraId]);
+  }, [cameraId, retryTick]);
+
+  const handleImgError = () => {
+    setError(true);
+    // Back off briefly for warm-up scenarios, then request a new token.
+    clearTimers();
+    timerRef.current = setTimeout(() => {
+      setRetryTick((v) => v + 1);
+    }, 1500);
+  };
 
   if (error || !src) {
     return <>{fallback ?? null}</>;
@@ -60,7 +85,7 @@ export default function AuthedMjpeg({
     <img
       src={src}
       alt={alt ?? "MJPEG stream"}
-      onError={() => setError(true)}
+      onError={handleImgError}
       {...imgProps}
     />
   );

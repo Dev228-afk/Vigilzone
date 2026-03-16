@@ -66,21 +66,6 @@ export default function Dashboard() {
     retry: false,
   });
 
-  /** Streams endpoint — returns WebRTC / HLS URLs per camera (no AI dependency) */
-  const streamsQ = useQuery({
-    queryKey: ["streams"],
-    queryFn: async () => {
-      const { data } = await api.get("/streams/");
-      return data as Array<{
-        id: number; name: string; site: string; status: string;
-        ai_camera_id: string; stream_path: string; camera_type: string;
-        webrtc_url: string; whep_url: string; hls_url: string;
-      }>;
-    },
-    refetchInterval: 30_000,
-    retry: false,
-  });
-
   const entitiesQ = useQuery({
     queryKey: ["ai-entities-dash"],
     queryFn: async () => {
@@ -92,25 +77,35 @@ export default function Dashboard() {
     retry: false,
   });
 
+  const healthQ = useQuery({
+    queryKey: ["streams-health"],
+    queryFn: async () => {
+      const { data } = await api.get("/streams/health/");
+      return (data ?? {}) as Record<string, {
+        connected: boolean;
+        last_frame_ts: number | null;
+        last_error: string;
+        fps_config: number;
+        viewers: number;
+      }>;
+    },
+    refetchInterval: 10_000,
+    retry: false,
+  });
+
   /* ── Derived data ────────────────────────────────────────── */
   const d = dashboardQ.data;
-  const streams = streamsQ.data ?? [];
-
-  // Build a lookup: camera id → stream info
-  const streamMap = new Map(streams.map((s) => [s.id, s]));
-
   const cameras = (d?.cameras ?? []).map((c) => {
-    const stream = streamMap.get(c.id);
     return {
       id: c.id,
       name: c.name,
       location: c.site || "Unknown",
       status: (c.status === "active" ? "active" : "offline") as "active" | "offline",
       ai_camera_id: c.ai_camera_id,
-      // WebRTC iframe URL — primary live feed (no AI dependency)
-      streamUrl: stream?.webrtc_url ?? undefined,
-      // Static fallback image if no stream available
-      imageUrl: frontDoorImg,
+      // Snapshot fallback (auth-protected) — fetched via CameraFeed blob fetch.
+      // NOTE: this is relative to axios baseURL ("/api"), so do NOT prefix with /api.
+      imageUrl: c.id ? `/streams/${c.id}/snapshot/` : frontDoorImg,
+      health: healthQ.data?.[String(c.id)],
     };
   });
 
@@ -176,15 +171,15 @@ export default function Dashboard() {
           <div>
             <h2 className="text-lg font-semibold mb-4">Live Feeds</h2>
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-1 gap-3">
-              {(cameras.length > 0 ? cameras : [{ id: 0, name: "No cameras", location: "-", status: "offline" as const, streamUrl: undefined, imageUrl: frontDoorImg }]).map((camera, idx) => (
+              {(cameras.length > 0 ? cameras : [{ id: 0, name: "No cameras", location: "-", status: "offline" as const, imageUrl: frontDoorImg, health: undefined }]).map((camera, idx) => (
                 <CameraFeed
                   key={idx}
                   name={camera.name}
                   location={camera.location}
                   status={camera.status}
                   cameraId={camera.id || undefined}
-                  streamUrl={camera.streamUrl}
                   imageUrl={camera.imageUrl}
+                  health={camera.health}
                   timestamp={new Date().toLocaleTimeString()}
                 />
               ))}

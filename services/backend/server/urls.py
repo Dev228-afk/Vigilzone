@@ -6,8 +6,8 @@ from api.views import (
     DetectionViewSet, AlertViewSet, AuditLogViewSet, ProfileViewSet, auth_context, InvitationViewSet,
     dashboard_summary, KnownEntityViewSet,
     notification_settings, notification_test, notification_register_device,
-    debug_system, debug_mediamtx_health,
-    streams_list, streams_detail, streams_snapshot, streams_mjpeg, streams_signed_token,
+    debug_system,
+    streams_list, streams_detail, streams_snapshot, streams_mjpeg, streams_signed_token, streams_health,
 )
 
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
@@ -39,6 +39,7 @@ urlpatterns += [
     path("api/auth/context/", auth_context),
     path("api/dashboard/summary/", dashboard_summary, name="dashboard-summary"),
 ]
+
 # Notifications (§4)
 urlpatterns += [
     path("api/notifications/settings/", notification_settings, name="notification-settings"),
@@ -48,8 +49,6 @@ urlpatterns += [
 # Debug (§7)
 urlpatterns += [
     path("api/debug/system/", debug_system, name="debug-system"),
-    path("api/debug/mediamtx/health/", debug_mediamtx_health, name="debug-mediamtx-health-slash"),
-    path("api/debug/mediamtx/health", debug_mediamtx_health, name="debug-mediamtx-health"),
 ]
 # Streams (§B — WebRTC/HLS URL endpoints)
 urlpatterns += [
@@ -58,6 +57,7 @@ urlpatterns += [
     path("api/streams/<int:camera_id>/snapshot/", streams_snapshot, name="streams-snapshot"),
     path("api/streams/<int:camera_id>/mjpeg/", streams_mjpeg, name="streams-mjpeg"),
     path("api/streams/<int:camera_id>/signed_stream_token/", streams_signed_token, name="streams-signed-token"),
+    path("api/streams/health/", streams_health, name="streams-health"),
 ]
 # AI Integration (proxy + webhook)
 urlpatterns += [

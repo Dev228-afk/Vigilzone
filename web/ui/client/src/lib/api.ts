@@ -8,12 +8,20 @@ export const api = axios.create({
   baseURL: API_BASE,
 });
 
-let accessToken: string | null = localStorage.getItem("accessToken");
+// Keep client + route guards consistent: accept token from either localStorage
+// or sessionStorage. Some flows may store tokens in one or the other.
+let accessToken =
+  localStorage.getItem("accessToken") ?? sessionStorage.getItem("accessToken");
 
 export function setAccessToken(t: string | null) {
   accessToken = t;
-  if (t) localStorage.setItem("accessToken", t);
-  else localStorage.removeItem("accessToken");
+  if (t) {
+    localStorage.setItem("accessToken", t);
+    sessionStorage.setItem("accessToken", t);
+  } else {
+    localStorage.removeItem("accessToken");
+    sessionStorage.removeItem("accessToken");
+  }
 }
 
 

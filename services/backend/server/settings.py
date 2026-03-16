@@ -172,6 +172,12 @@ AUTO_CREATE_TENANT_ON_REGISTER = bool(
     int(os.getenv("AUTO_CREATE_TENANT_ON_REGISTER", "1"))
 )
 
+# If a user logs in with zero tenant memberships (e.g., created via admin/import),
+# create a personal community on first login to avoid a demo-killing dead-end.
+AUTO_CREATE_TENANT_ON_FIRST_LOGIN = bool(
+    int(os.getenv("AUTO_CREATE_TENANT_ON_FIRST_LOGIN", "1"))
+)
+
 # ── Email (§4 Notifications) ──────────────────────────────────
 # Dev: console backend (prints emails to stdout).
 # Production: set SENDGRID_API_KEY or SMTP env vars.
@@ -182,3 +188,13 @@ EMAIL_PORT = int(os.getenv("EMAIL_PORT", "587"))
 EMAIL_USE_TLS = os.getenv("EMAIL_USE_TLS", "True").lower() in ("1", "true", "yes")
 EMAIL_HOST_USER = os.getenv("EMAIL_HOST_USER", "")
 EMAIL_HOST_PASSWORD = os.getenv("EMAIL_HOST_PASSWORD", "")
+
+# ── OpenCV preview streaming (snapshot + MJPEG) ─────────────
+STREAM_PREVIEW_FPS = int(os.getenv("STREAM_PREVIEW_FPS", "3"))
+STREAM_PREVIEW_MAX_WIDTH = int(os.getenv("STREAM_PREVIEW_MAX_WIDTH", "960"))
+STREAM_PREVIEW_JPEG_QUALITY = int(os.getenv("STREAM_PREVIEW_JPEG_QUALITY", "70"))
+STREAM_IDLE_TTL_SECONDS = int(os.getenv("STREAM_IDLE_TTL_SECONDS", "60"))
+OPENCV_FFMPEG_CAPTURE_OPTIONS = os.getenv(
+    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+    "rtsp_transport;tcp|stimeout;3000000",
+)
