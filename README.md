@@ -56,7 +56,7 @@ python manage.py runserver 0.0.0.0:8000
 # 3. Start React UI dev server
 cd web\ui
 npm install
-npx vite                               # runs on :5173, proxies /api → :8000
+npm run dev                            # runs on :5000, serves UI + Vite middleware
 
 # 4. Register webhook (once, while AI + Django are running)
 set AI_BASE_INTERNAL=http://127.0.0.1:8080
@@ -74,7 +74,7 @@ Open **http://localhost:5000** — login with your user credentials.
 | **Django** | 8000 | `/api/*` | REST API, JWT auth, incidents, cameras, AI proxy |
 | **AI** | 8080 | *(internal)* | CCTV AI detection — accessed only via Django proxy |
 | **OpenCV Worker Pool** | in backend | `/api/streams/*` | In-process capture workers for snapshot + MJPEG preview |
-| **Vite** | 5173 | `/` | Dev UI server (local dev only) |
+| **UI Dev Server (Express + Vite middleware)** | 5000 | `/` | Local dev server (`npm run dev`) |
 
 ## Key Endpoints
 
@@ -90,11 +90,13 @@ Open **http://localhost:5000** — login with your user credentials.
 - `DELETE /api/cameras/{id}/zones/{zone_id}/` — Delete zone
 - `POST /api/cameras/{id}/sync_zones_to_ai/` — Push zones to AI
 - `POST /api/cameras/{id}/sync_ai_settings/` — Push per-camera AI thresholds
+- `GET  /api/streams/` — List stream-capable cameras with derived stream URLs
+- `GET  /api/streams/{id}/` — Stream metadata for one camera
 - `GET  /api/streams/{id}/signed_stream_token/` — Issue short-lived token for MJPEG/snapshot image tags
 - `GET  /api/streams/{id}/snapshot/` — Fast latest JPEG snapshot (JWT or token auth)
 - `GET  /api/streams/{id}/mjpeg/` — Multipart MJPEG stream (`?token=...`)
 - `GET  /api/streams/health/` — Per-camera worker health and viewer counts
-- `GET  /api/incidents/` — List incidents (filter: `?type=`, `?status=`)
+- `GET  /api/incidents/` — List incidents (filter: `?type=`, `?status=`, `?search=`)
 - `POST /api/incidents/{id}/acknowledge/` — Acknowledge incident
 - `POST /api/incidents/{id}/resolve/` — Resolve incident
 - `GET  /api/incidents/stats/` — Incident statistics (today/week/month, breakdown)
@@ -115,6 +117,9 @@ Open **http://localhost:5000** — login with your user credentials.
 - `GET  /api/ai/entities/` — List known entities
 - `POST /api/ai/entities/enroll_person/` — Enroll person (multipart)
 - `POST /api/ai/entities/enroll_pet/` — Enroll pet (multipart)
+- `POST /api/ai/entities/enroll_person_from_upload/` — Enroll person from staged upload images
+- `POST /api/ai/entities/enroll_pet_from_upload/` — Enroll pet from staged upload images
+- `POST /api/ai/uploads/enroll_images/` — Stage enrollment images
 - `DELETE /api/ai/entities/<id>/` — Delete entity
 - `POST /api/ai/webhooks/register/` — Register webhook with AI
 - `GET  /api/ai/evidence/<camera_id>/<filename>` — Download evidence
@@ -153,6 +158,12 @@ React UI
 - `GET /api/streams/health/` returns per-camera worker health:
   - `connected`, `last_frame_ts`, `last_error`, `fps_config`, `viewers`.
 
+### Runtime Reliability Notes
+
+- Stream capture reconnect uses exponential backoff (starts near 2s, capped at 60s) and resets on successful frames.
+- Lane scheduling in the AI processor uses per-lane in-flight backpressure to avoid runaway unfinished-future buildup.
+- AnyAnomaly lane performs dependency preflight and gracefully disables itself when required packages are missing.
+
 ### Runbook
 
 1. Configure stream env vars in `.env` (`STREAM_PREVIEW_*`, `OPENCV_FFMPEG_CAPTURE_OPTIONS`).
@@ -168,13 +179,14 @@ React UI
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DJANGO_DEBUG` | `1` | Django debug mode |
+| `UI_PORT` | `5000` | Local UI dev server port |
 | `SECRET_KEY` | insecure default | Django secret key |
 | `ALLOWED_HOSTS` | `localhost,...` | Django allowed hosts |
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:8085,...` | CORS origins |
-| `AI_BASE_INTERNAL` | `http://ai:8080` | AI module URL (backend→AI internal network) |
+| `AI_BASE_INTERNAL` | `http://127.0.0.1:8080` (local) / `http://ai:8080` (docker) | AI module URL (backend→AI internal network) |
 | `AI_WEBHOOK_TOKEN` | *(empty)* | Flat token for `X-AI-WEBHOOK-TOKEN` auth |
 | `AI_WEBHOOK_SECRET` | `vigilzone-webhook-secret` | HMAC secret for `X-Vigilzone-Signature` auth |
-| `PUBLIC_BASE_URL` | `http://backend:8000` | Public URL for webhook callbacks |
+| `PUBLIC_BASE_URL` | `http://127.0.0.1:8000` (local) / `http://localhost:8085` (docker proxy) | Public URL for webhook callbacks |
 | `STREAM_PREVIEW_FPS` | `3` | Capture FPS per camera worker |
 | `STREAM_PREVIEW_MAX_WIDTH` | `960` | Optional max width for preview JPEG resizing |
 | `STREAM_PREVIEW_JPEG_QUALITY` | `70` | JPEG encoding quality for snapshots/MJPEG |
@@ -276,5 +288,3 @@ python manage.py register_ai_webhook
 # Close stale incidents (no updates for 5 minutes)
 python manage.py close_stale_incidents --minutes 5
 ```
- — `tests/acceptance.sh` (bash) + `tests/acceptance.ps1` (PowerShell)
-- **README** — Comprehensive docs with architecture, local dev, Docker, testing
