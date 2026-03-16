@@ -3,5 +3,9 @@ export function hasToken() {
 }
 
 export function getTenantId() {
-  return localStorage.getItem("selectedTenantId");
+  try {
+    return localStorage.getItem("selectedTenantId") || sessionStorage.getItem("selectedTenantId");
+  } catch {
+    return null;
+  }
 }

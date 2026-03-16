@@ -9,12 +9,19 @@ declare module 'http' {
     rawBody: unknown
   }
 }
-app.use(express.json({
-  verify: (req, _res, buf) => {
-    req.rawBody = buf;
-  }
-}));
-app.use(express.urlencoded({ extended: false }));
+
+// Skip body parsing for proxied routes so Vite/Express can forward raw body
+const PROXY_PREFIXES = ["/api"];
+const isProxied = (p: string) => PROXY_PREFIXES.some((px) => p.startsWith(px));
+
+app.use((req, res, next) => {
+  if (isProxied(req.path)) return next();
+  express.json({ verify: (r, _res, buf) => { (r as any).rawBody = buf; } })(req, res, next);
+});
+app.use((req, res, next) => {
+  if (isProxied(req.path)) return next();
+  express.urlencoded({ extended: false })(req, res, next);
+});
 
 app.use((req, res, next) => {
   const start = Date.now();
@@ -30,6 +37,10 @@ app.use((req, res, next) => {
   res.on("finish", () => {
     const duration = Date.now() - start;
     if (path.startsWith("/api")) {
+      // 304 is a normal browser cache revalidation result; skip it to reduce noise.
+      if (res.statusCode === 304) {
+        return;
+      }
       let logLine = `${req.method} ${path} ${res.statusCode} in ${duration}ms`;
       if (capturedJsonResponse) {
         logLine += ` :: ${JSON.stringify(capturedJsonResponse)}`;
@@ -54,7 +65,11 @@ app.use((req, res, next) => {
     const message = err.message || "Internal Server Error";
 
     res.status(status).json({ message });
-    throw err;
+    // IMPORTANT: Do not re-throw after sending a response.
+    // Re-throwing crashes the dev server and looks like an "abrupt shutdown"
+    // during navigation when any error occurs.
+    // Log instead so the server stays alive.
+    console.error("[ui-server]", err);
   });
 
   // importantly only setup vite in development and after

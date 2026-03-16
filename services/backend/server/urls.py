@@ -7,7 +7,7 @@ from api.views import (
     dashboard_summary, KnownEntityViewSet,
     notification_settings, notification_test, notification_register_device,
     debug_system,
-    streams_list, streams_detail, streams_snapshot,
+    streams_list, streams_detail, streams_snapshot, streams_mjpeg, streams_signed_token, streams_health,
 )
 
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
@@ -39,6 +39,7 @@ urlpatterns += [
     path("api/auth/context/", auth_context),
     path("api/dashboard/summary/", dashboard_summary, name="dashboard-summary"),
 ]
+
 # Notifications (§4)
 urlpatterns += [
     path("api/notifications/settings/", notification_settings, name="notification-settings"),
@@ -54,6 +55,9 @@ urlpatterns += [
     path("api/streams/", streams_list, name="streams-list"),
     path("api/streams/<int:camera_id>/", streams_detail, name="streams-detail"),
     path("api/streams/<int:camera_id>/snapshot/", streams_snapshot, name="streams-snapshot"),
+    path("api/streams/<int:camera_id>/mjpeg/", streams_mjpeg, name="streams-mjpeg"),
+    path("api/streams/<int:camera_id>/signed_stream_token/", streams_signed_token, name="streams-signed-token"),
+    path("api/streams/health/", streams_health, name="streams-health"),
 ]
 # AI Integration (proxy + webhook)
 urlpatterns += [

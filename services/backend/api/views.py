@@ -1,16 +1,21 @@
 import os
 import logging
+import hashlib
+import hmac
+import time
 from rest_framework import viewsets, permissions, status
 from rest_framework.exceptions import PermissionDenied, NotAuthenticated
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from django.db import transaction
+from django.conf import settings
 from django.utils import timezone
 from .models import (
     Tenant, Membership, Camera, CameraZone, Incident, Detection,
     Alert, AuditLog, Profile, Invitation, KnownEntity, NotificationChannel,
 )
+from .stream_workers import STREAM_WORKERS
 from .serializers import (
     TenantSerializer, MyTenantSerializer, MembershipSerializer,
     CameraSafeSerializer, CameraAdminSerializer, CameraWriteSerializer,
@@ -106,6 +111,92 @@ class MembershipViewSet(TenantScopedViewSet):
     serializer_class = MembershipSerializer
     permission_classes = [permissions.IsAuthenticated]
 
+
+# ── RTSP probe helper (used by test_connection endpoints) ────
+def _probe_rtsp(rtsp_url: str, timeout_s: int = 3) -> dict:
+    """
+    Probe an RTSP URL with ffprobe (fast), falling back to ffmpeg single-frame grab.
+    Returns { ok, method, latency_ms, details?, error? }.
+    """
+    import subprocess
+    import time as _time
+    import json as _json
+    import shutil
+
+    result: dict = {"ok": False, "method": "none", "latency_ms": 0}
+
+    # ── Try ffprobe first ─────────────────────────────────────
+    if shutil.which("ffprobe"):
+        t0 = _time.monotonic()
+        try:
+            proc = subprocess.run(
+                [
+                    "ffprobe", "-v", "error",
+                    "-rtsp_transport", "tcp",
+                    "-rw_timeout", str(timeout_s * 1_000_000),
+                    "-show_streams", "-select_streams", "v:0",
+                    "-print_format", "json",
+                    rtsp_url,
+                ],
+                capture_output=True, timeout=timeout_s + 2,
+            )
+            latency = int((_time.monotonic() - t0) * 1000)
+            if proc.returncode == 0 and proc.stdout:
+                try:
+                    info = _json.loads(proc.stdout)
+                    streams = info.get("streams", [])
+                    if streams:
+                        s = streams[0]
+                        return {
+                            "ok": True,
+                            "method": "ffprobe",
+                            "latency_ms": latency,
+                            "details": {
+                                "codec": s.get("codec_name"),
+                                "width": s.get("width"),
+                                "height": s.get("height"),
+                                "fps": s.get("r_frame_rate"),
+                            },
+                        }
+                except _json.JSONDecodeError:
+                    pass
+            result["error"] = (proc.stderr or b"").decode(errors="replace").strip()[:300]
+        except subprocess.TimeoutExpired:
+            result["error"] = f"ffprobe timed out ({timeout_s}s)"
+            result["latency_ms"] = timeout_s * 1000
+            return result
+        except FileNotFoundError:
+            pass  # fall through to ffmpeg
+
+    # ── Fallback: ffmpeg single-frame grab ────────────────────
+    t0 = _time.monotonic()
+    try:
+        proc = subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-rtsp_transport", "tcp",
+                "-rw_timeout", str(timeout_s * 1_000_000),
+                "-i", rtsp_url,
+                "-frames:v", "1",
+                "-f", "null", "-",
+            ],
+            capture_output=True, timeout=timeout_s + 2,
+        )
+        latency = int((_time.monotonic() - t0) * 1000)
+        if proc.returncode == 0:
+            return {"ok": True, "method": "ffmpeg", "latency_ms": latency}
+        result["method"] = "ffmpeg"
+        result["latency_ms"] = latency
+        result["error"] = (proc.stderr or b"").decode(errors="replace").strip()[:300]
+    except FileNotFoundError:
+        result["error"] = "Neither ffprobe nor ffmpeg found on PATH"
+    except subprocess.TimeoutExpired:
+        result["error"] = f"ffmpeg timed out ({timeout_s}s)"
+        result["latency_ms"] = timeout_s * 1000
+
+    return result
+
+
 class CameraViewSet(TenantScopedViewSet):
     queryset = Camera.objects.all()
     permission_classes = [permissions.IsAuthenticated]
@@ -123,11 +214,24 @@ class CameraViewSet(TenantScopedViewSet):
     def sync_to_ai(self, request, pk=None):
         """POST /api/cameras/{id}/sync_to_ai/ — register camera with AI module."""
         import requests as http_client
+        import re
+        from django.utils.text import slugify
         camera = self.get_object()
         ai_base = os.getenv("AI_BASE_INTERNAL", "http://127.0.0.1:8080")
 
+        # Prefer stable IDs that match what the UI/streams use.
+        # Avoid the old fallback cam_<pk> unless absolutely necessary.
+        def _default_camera_id() -> str:
+            if camera.ai_camera_id and not re.match(r"^cam_\d+$", camera.ai_camera_id):
+                return camera.ai_camera_id
+            if camera.stream_path:
+                return camera.stream_path
+            if camera.name:
+                return slugify(camera.name)
+            return f"cam_{camera.pk}"
+
         payload = {
-            "camera_id": camera.ai_camera_id or f"cam_{camera.pk}",
+            "camera_id": _default_camera_id(),
             "rtsp_url": camera.rtsp_url or "",
             "ingest_backend": "opencv",
             "enabled_lanes": ["rt_detr", "yolov8_fallback", "fire_smoke_yolo", "person_zone"],
@@ -244,6 +348,27 @@ class CameraViewSet(TenantScopedViewSet):
             return Response({"status": "synced", "ai_status": resp.status_code})
         except Exception as exc:
             return Response({"error": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+
+    # ── Test connection (existing camera) ───────────────────
+    @action(detail=True, methods=["post"], url_path="test_connection")
+    def test_connection_detail(self, request, pk=None):
+        """POST /api/cameras/{id}/test_connection/ — test stored RTSP URL."""
+        camera = self.get_object()
+        rtsp_url = camera.rtsp_url
+        if not rtsp_url:
+            return Response({"ok": False, "error": "No RTSP URL stored for this camera"}, status=status.HTTP_400_BAD_REQUEST)
+        timeout_s = min(int(request.data.get("timeout_s", 3)), 10)
+        return Response(_probe_rtsp(rtsp_url, timeout_s))
+
+    # ── Test connection (unsaved URL) ───────────────────────
+    @action(detail=False, methods=["post"], url_path="test_connection")
+    def test_connection_list(self, request):
+        """POST /api/cameras/test_connection/ — test an arbitrary RTSP URL."""
+        rtsp_url = request.data.get("rtsp_url", "").strip()
+        if not rtsp_url:
+            return Response({"ok": False, "error": "rtsp_url is required"}, status=status.HTTP_400_BAD_REQUEST)
+        timeout_s = min(int(request.data.get("timeout_s", 3)), 10)
+        return Response(_probe_rtsp(rtsp_url, timeout_s))
 
 class IncidentViewSet(TenantScopedViewSet):
     queryset = Incident.objects.select_related("camera").all()
@@ -449,6 +574,19 @@ def dashboard_summary(request):
 def auth_context(request):
     tenant = get_active_tenant(request, required=False)
 
+    # Demo-safety net: if a user has no tenant memberships (e.g., created via admin/import),
+    # create a personal community on first login so they never hit a dead-end.
+    auto_create_first_login = getattr(
+        settings, "AUTO_CREATE_TENANT_ON_FIRST_LOGIN", True
+    )
+    if tenant is None and auto_create_first_login:
+        memberships_qs = Membership.objects.select_related("tenant").filter(user=request.user)
+        if memberships_qs.count() == 0:
+            with transaction.atomic():
+                t = Tenant.objects.create(name=f"{request.user.username}'s Community")
+                Membership.objects.create(user=request.user, tenant=t, role=Membership.Role.OWNER)
+            tenant = t
+
     # If no tenant header, and user has exactly one membership, auto-select it
     if tenant is None:
         memberships = Membership.objects.select_related("tenant").filter(user=request.user)
@@ -570,9 +708,24 @@ class KnownEntityViewSet(TenantScopedViewSet):
                 # Build thumbnail URL from first saved image
                 saved_urls = ai_data.get("saved_image_urls", [])
                 if saved_urls:
-                    entity.thumbnail_url = f"/api/ai{saved_urls[0]}"
+                    # IMPORTANT: store a URL that the frontend can fetch through
+                    # the Django API base (/api) without double-prefixing.
+                    # Frontend axios baseURL is "/api", so we store paths like "/ai/...".
+                    # AI returns paths like "/enroll_images/<id>/<file>", which are served
+                    # through Django at "/api/ai/enroll_images/...".
+                    p = str(saved_urls[0])
+                    if p.startswith("/api/"):
+                        p = p[4:]  # "/api/ai/..." -> "/ai/..."
+                    if p.startswith("/enroll_images/"):
+                        p = f"/ai{p}"  # -> "/ai/enroll_images/..."
+                    entity.thumbnail_url = p
                 elif ai_data.get("thumbnail"):
-                    entity.thumbnail_url = ai_data["thumbnail"]
+                    p = str(ai_data["thumbnail"])
+                    if p.startswith("/api/"):
+                        p = p[4:]
+                    if p.startswith("/enroll_images/"):
+                        p = f"/ai{p}"
+                    entity.thumbnail_url = p
                 entity.save(update_fields=["ai_entity_id", "thumbnail_url", "updated_at"])
         except Exception as exc:
             import logging
@@ -684,14 +837,58 @@ class InvitationViewSet(viewsets.ModelViewSet):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# §B  STREAM ENDPOINTS (WebRTC/HLS URLs)
+# §B  STREAM ENDPOINTS (OpenCV preview + MJPEG)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+def _stream_preview_config() -> dict:
+    return {
+        "fps": int(getattr(settings, "STREAM_PREVIEW_FPS", 3)),
+        "max_width": int(getattr(settings, "STREAM_PREVIEW_MAX_WIDTH", 960)),
+        "jpeg_quality": int(getattr(settings, "STREAM_PREVIEW_JPEG_QUALITY", 70)),
+        "idle_ttl_s": int(getattr(settings, "STREAM_IDLE_TTL_SECONDS", 60)),
+        "ffmpeg_capture_options": str(
+            getattr(settings, "OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp|stimeout;3000000")
+        ),
+    }
+
+
+def _build_stream_token(camera_id: int, ttl_s: int = 60) -> tuple[str, int]:
+    exp = int(time.time()) + ttl_s
+    payload = f"{camera_id}.{exp}".encode()
+    sig = hmac.new(settings.SECRET_KEY.encode(), payload, hashlib.sha256).hexdigest()[:32]
+    return f"{camera_id}.{exp}.{sig}", ttl_s
+
+
+def _verify_stream_token(token: str, camera_id: int) -> tuple[bool, dict]:
+    try:
+        tok_cam, tok_exp, tok_sig = token.split(".")
+        if int(tok_cam) != int(camera_id):
+            return False, {"error": "camera_mismatch"}
+        if time.time() > float(tok_exp):
+            return False, {"error": "expired"}
+        payload = f"{tok_cam}.{tok_exp}".encode()
+        expected = hmac.new(settings.SECRET_KEY.encode(), payload, hashlib.sha256).hexdigest()[:32]
+        if not hmac.compare_digest(expected, tok_sig):
+            return False, {"error": "signature_mismatch"}
+        return True, {"camera_id": int(tok_cam), "exp": int(tok_exp)}
+    except Exception:
+        return False, {"error": "malformed"}
+
+
+def _camera_from_jwt_scope(request, camera_id: int) -> Camera:
+    tenant = get_active_tenant(request)
+    if not assert_member(request, tenant):
+        raise PermissionDenied()
+    try:
+        return Camera.objects.get(pk=camera_id, tenant=tenant)
+    except Camera.DoesNotExist:
+        raise PermissionDenied("Camera not found for tenant")
 
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def streams_list(request):
-    """GET /api/streams/ — list cameras with derived WebRTC/HLS URLs."""
     tenant = get_active_tenant(request)
     if not assert_member(request, tenant):
         raise PermissionDenied()
@@ -702,7 +899,6 @@ def streams_list(request):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def streams_detail(request, camera_id):
-    """GET /api/streams/<camera_id>/ — single camera stream URLs."""
     tenant = get_active_tenant(request)
     if not assert_member(request, tenant):
         raise PermissionDenied()
@@ -715,95 +911,125 @@ def streams_detail(request, camera_id):
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
-def streams_snapshot(request, camera_id):
-    """
-    GET /api/streams/<camera_id>/snapshot/
-    Grab a still frame.  Pipeline:
-      1. ffmpeg from RTSP (fast, no AI dependency)
-      2. AI module fallback — auto-detect which endpoint exists
-    Returns image/jpeg with X-Snapshot-Source header.
-    """
-    import subprocess
-    import time as _time
-    import requests as http_client
-
+def streams_signed_token(request, camera_id):
     tenant = get_active_tenant(request)
     if not assert_member(request, tenant):
         raise PermissionDenied()
     try:
-        camera = Camera.objects.get(pk=camera_id, tenant=tenant)
+        Camera.objects.get(pk=camera_id, tenant=tenant)
     except Camera.DoesNotExist:
         return Response({"error": "Camera not found"}, status=status.HTTP_404_NOT_FOUND)
 
-    # ── Identifiers ──────────────────────────────────────────
-    ai_cam_id = camera.ai_camera_id or f"cam_{camera.pk}"
-    stream_path = camera.stream_path or ai_cam_id
-    rtsp_url = camera.rtsp_url or f"rtsp://mediamtx:8554/{stream_path}"
-    ai_base = os.getenv("AI_BASE_INTERNAL", "http://127.0.0.1:8080")
+    token, ttl = _build_stream_token(camera_id, ttl_s=60)
+    return Response({"token": token, "ttl": ttl})
 
-    # ── In-memory cache (3 s TTL) ────────────────────────────
-    cache_key = f"_snapshot_{camera.pk}"
-    if not hasattr(streams_snapshot, "_cache"):
-        streams_snapshot._cache = {}
-    cached = streams_snapshot._cache.get(cache_key)
-    now = _time.time()
-    if cached and (now - cached["ts"]) < 3.0:
-        from django.http import HttpResponse
-        resp = HttpResponse(cached["data"], content_type="image/jpeg")
-        resp["Cache-Control"] = "no-store"
-        resp["X-Snapshot-Source"] = cached.get("source", "cache")
-        return resp
 
-    def _make_jpeg_response(data: bytes, source: str):
-        from django.http import HttpResponse
-        streams_snapshot._cache[cache_key] = {"ts": _time.time(), "data": data, "source": source}
-        resp = HttpResponse(data, content_type="image/jpeg")
-        resp["Cache-Control"] = "no-store"
-        resp["X-Snapshot-Source"] = source
-        return resp
+@api_view(["GET"])
+@permission_classes([])
+def streams_snapshot(request, camera_id):
+    """JWT member auth OR signed query token auth."""
+    from django.http import HttpResponse
 
-    # ── Step 1: ffmpeg from RTSP ─────────────────────────────
-    try:
-        result = subprocess.run(
-            [
-                "ffmpeg", "-rtsp_transport", "tcp",
-                "-i", rtsp_url,
-                "-frames:v", "1",
-                "-q:v", "5",
-                "-f", "image2", "-vcodec", "mjpeg",
-                "pipe:1",
-            ],
-            capture_output=True,
-            timeout=8,
-        )
-        if result.returncode == 0 and result.stdout:
-            return _make_jpeg_response(result.stdout, "ffmpeg")
-    except FileNotFoundError:
-        pass   # ffmpeg not installed — fall through to AI
-    except subprocess.TimeoutExpired:
-        pass   # RTSP timed out — fall through to AI
-    except Exception:
-        pass
+    token_param = request.GET.get("token", "")
+    camera = None
 
-    # ── Step 2: AI module fallback (auto-detect endpoint) ────
-    ai_endpoints = [
-        f"{ai_base}/frame/{ai_cam_id}",
-        f"{ai_base}/api/v1/cameras/{ai_cam_id}/snapshot",
-        f"{ai_base}/api/v1/cameras/{ai_cam_id}/frame",
-    ]
-    for endpoint in ai_endpoints:
+    if token_param:
+        ok, _payload = _verify_stream_token(token_param, camera_id)
+        if not ok:
+            return Response({"error": "Invalid stream token"}, status=status.HTTP_401_UNAUTHORIZED)
         try:
-            ai_resp = http_client.get(endpoint, timeout=2)
-            ct = ai_resp.headers.get("Content-Type", "")
-            if ai_resp.status_code == 200 and "image" in ct and ai_resp.content:
-                return _make_jpeg_response(ai_resp.content, f"ai_fallback:{endpoint}")
-        except Exception:
-            continue
+            camera = Camera.objects.get(pk=camera_id)
+        except Camera.DoesNotExist:
+            return Response({"error": "Camera not found"}, status=status.HTTP_404_NOT_FOUND)
+    elif request.user and request.user.is_authenticated:
+        try:
+            camera = _camera_from_jwt_scope(request, camera_id)
+        except PermissionDenied as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_403_FORBIDDEN)
+    else:
+        raise NotAuthenticated("Provide Authorization header or ?token= parameter")
+
+    cfg = _stream_preview_config()
+    worker = STREAM_WORKERS.ensure_running(camera, **cfg)
+    worker.touch()
+    jpeg, frame_ts, last_error = STREAM_WORKERS.get_latest_jpeg(int(camera.pk))
+
+    if jpeg:
+        resp = HttpResponse(jpeg, content_type="image/jpeg")
+        resp["Cache-Control"] = "no-store"
+        resp["X-Frame-Timestamp"] = str(frame_ts or "")
+        resp["X-Stream-Status"] = "connected"
+        return resp
 
     return Response(
-        {"error": "Snapshot unavailable — ffmpeg and AI fallback both failed"},
-        status=status.HTTP_502_BAD_GATEWAY,
+        {
+            "status": "warming_up",
+            "last_error": last_error,
+        },
+        status=status.HTTP_503_SERVICE_UNAVAILABLE,
     )
+
+
+def _mjpeg_generator(camera_id: int, fps: int):
+    interval = 1.0 / max(1, fps)
+    boundary = b"--frame\r\n"
+    try:
+        while True:
+            STREAM_WORKERS.touch(camera_id)
+            jpeg, _frame_ts, _err = STREAM_WORKERS.get_latest_jpeg(camera_id)
+            if jpeg:
+                yield (
+                    boundary
+                    + b"Content-Type: image/jpeg\r\nContent-Length: "
+                    + str(len(jpeg)).encode()
+                    + b"\r\n\r\n"
+                    + jpeg
+                    + b"\r\n"
+                )
+            time.sleep(interval)
+    finally:
+        STREAM_WORKERS.remove_viewer(camera_id)
+
+
+@api_view(["GET"])
+@permission_classes([])
+def streams_mjpeg(request, camera_id):
+    """Signed query token auth for browser <img> compatibility."""
+    from django.http import StreamingHttpResponse
+
+    token_param = request.GET.get("token", "")
+    ok, _payload = _verify_stream_token(token_param, camera_id) if token_param else (False, {})
+    if not ok:
+        return Response({"error": "Invalid stream token"}, status=status.HTTP_401_UNAUTHORIZED)
+
+    try:
+        camera = Camera.objects.get(pk=camera_id)
+    except Camera.DoesNotExist:
+        return Response({"error": "Camera not found"}, status=status.HTTP_404_NOT_FOUND)
+
+    cfg = _stream_preview_config()
+    STREAM_WORKERS.ensure_running(camera, **cfg)
+    STREAM_WORKERS.add_viewer(int(camera.pk))
+
+    resp = StreamingHttpResponse(
+        _mjpeg_generator(int(camera.pk), cfg["fps"]),
+        content_type="multipart/x-mixed-replace; boundary=frame",
+    )
+    resp["Cache-Control"] = "no-store"
+    resp["X-Accel-Buffering"] = "no"
+    return resp
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def streams_health(request):
+    tenant = get_active_tenant(request)
+    if not assert_member(request, tenant):
+        raise PermissionDenied()
+
+    camera_ids = list(Camera.objects.filter(tenant=tenant).values_list("id", flat=True))
+    cfg = _stream_preview_config()
+    return Response(STREAM_WORKERS.health_for_cameras(camera_ids, default_fps=cfg["fps"]))
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

@@ -6,7 +6,10 @@ import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Shield } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
-import { api } from "@/lib/api"; // use your axios client
+import { api } from "@/lib/api";
+import { login } from "@/lib/auth";
+import { setSelectedTenantId } from "@/lib/tenant";
+import { queryClient } from "@/lib/queryClient";
 
 export default function Register() {
   const { toast } = useToast();
@@ -32,16 +35,32 @@ export default function Register() {
     try {
       setLoading(true);
 
-      // Adjust endpoint + payload to your Django registration API
-      // Example: POST /api/auth/register/
+      // Register the user (backend auto-creates tenant + membership)
       await api.post("/auth/register/", { email, username, password });
 
-      toast({
-        title: "Account created",
-        description: "You can log in now.",
-      });
+      // Auto-login immediately so the user never has to re-enter credentials
+      await login(username, password);
 
-      setTimeout(() => setLocation("/login"), 800);
+      // Fetch auth context to pick up the auto-created tenant
+      const { data: ctx } = await api.get("/auth/context/");
+
+      if (ctx.tenant) {
+        setSelectedTenantId(String(ctx.tenant.id));
+        queryClient.invalidateQueries();
+        toast({
+          title: "Welcome to VigilZone!",
+          description: "Your community is ready.",
+        });
+        setLocation("/dashboard");
+      } else {
+        // Edge case: tenant wasn't auto-created (flag disabled)
+        toast({
+          title: "Account created",
+          description: "Please select or create a community.",
+        });
+        setLocation("/select-community");
+      }
+      return; // exit early — navigation already happened
     } catch (err: any) {
       console.error(err);
       toast({

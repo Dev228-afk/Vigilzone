@@ -74,7 +74,7 @@ class Camera(TimeStamped):
     )
     stream_path = models.CharField(
         max_length=200, blank=True, default="",
-        help_text="MediaMTX stream path for WebRTC/HLS (e.g. 'webcam')",
+        help_text="Stable camera stream identifier used for UI/AI mapping",
     )
     # Per-camera AI settings (§3 false-positive reduction)
     min_confidence = models.FloatField(default=0.35, help_text="Detection confidence threshold 0-1")
@@ -84,13 +84,17 @@ class Camera(TimeStamped):
     cooldown_s = models.IntegerField(default=45, help_text="Alert cooldown seconds")
 
     def save(self, *args, **kwargs):
-        """Auto-derive stream_path if empty (ensures MediaMTX URLs always resolve)."""
+        """Auto-derive stream_path if empty for consistent camera mapping."""
         if not self.stream_path:
             from django.utils.text import slugify
             if self.ai_camera_id:
                 self.stream_path = self.ai_camera_id
             elif self.name:
                 self.stream_path = slugify(self.name)
+        # Keep AI camera id aligned with stream_path when unset.
+        # This avoids legacy cam_<pk> IDs and reduces snapshot/preview mismatches.
+        if not self.ai_camera_id and self.stream_path:
+            self.ai_camera_id = self.stream_path
         super().save(*args, **kwargs)
 
 

@@ -12,7 +12,14 @@ export function useAuthImage(url: string | undefined | null): string | null {
   const [blobUrl, setBlobUrl] = useState<string | null>(null);
   const prevRef = useRef<string | null>(null);
 
-  const isApi = url ? url.startsWith("/api/") : false;
+  // Treat both "raw" backend paths and paths behind the Django API base as protected.
+  // - "/streams/..." and "/ai/..." are fetched via axios baseURL ("/api").
+  // - "/api/..." may appear in older stored URLs; strip the extra prefix.
+  const isApi = url
+    ? (url.startsWith("/api/") || url.startsWith("/streams/") || url.startsWith("/ai/"))
+    : false;
+
+  const normalizeForAxios = (u: string) => (u.startsWith("/api/") ? u.slice(4) : u);
 
   useEffect(() => {
     // Non-API URLs — use directly
@@ -29,7 +36,7 @@ export function useAuthImage(url: string | undefined | null): string | null {
     let cancelled = false;
     (async () => {
       try {
-        const resp = await api.get(url, { responseType: "blob" });
+        const resp = await api.get(normalizeForAxios(url), { responseType: "blob" });
         if (cancelled) return;
         const objectUrl = URL.createObjectURL(resp.data);
         if (prevRef.current) URL.revokeObjectURL(prevRef.current);

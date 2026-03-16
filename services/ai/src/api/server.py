@@ -199,31 +199,45 @@ class AlertServer:
             The AI inference pipeline always processes the full-resolution
             frame — this only affects the served JPEG.
             """
-            for proc in self._camera_processors:
-                if proc.camera_id == camera_id:
-                    frame, ts = proc.reader.get_latest()
-                    if frame is not None:
-                        out = frame
-                        h, w = out.shape[:2]
-                        # Downscale for preview if requested
-                        if maxw and w > maxw:
-                            scale = maxw / w
-                            out = cv2.resize(
-                                out,
-                                (maxw, int(h * scale)),
-                                interpolation=cv2.INTER_AREA,
-                            )
-                        _, buf = cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, quality])
-                        return StreamingResponse(
-                            iter([buf.tobytes()]),
-                            media_type="image/jpeg",
-                            headers={
-                                "X-Timestamp": ts or "",
-                                "Cache-Control": "no-store",
-                                "X-Original-Size": f"{w}x{h}",
-                            },
-                        )
-            return {"error": "Camera not found or no frame available"}
+            # Verify camera exists
+            proc_found = any(p.camera_id == camera_id for p in self._camera_processors)
+            if not proc_found:
+                return JSONResponse(status_code=404, content={"error": f"Camera '{camera_id}' not found"})
+
+            # Primary: non-consumptive LatestFrameStore (written by processing loop)
+            frame, ts = None, None
+            source = "frame_store"
+            if self._frame_store is not None:
+                frame, ts = self._frame_store.get(camera_id)
+
+            # Fallback: consumptive reader (only useful before first process-loop iteration)
+            if frame is None:
+                source = "reader_fallback"
+                for proc in self._camera_processors:
+                    if proc.camera_id == camera_id:
+                        frame, ts = proc.reader.get_latest()
+                        break
+
+            if frame is None:
+                return JSONResponse(status_code=404, content={"error": "No frame available yet"})
+
+            out = frame
+            h, w = out.shape[:2]
+            if maxw and w > maxw:
+                scale = maxw / w
+                out = cv2.resize(out, (maxw, int(h * scale)), interpolation=cv2.INTER_AREA)
+            _, buf = cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, quality])
+            return StreamingResponse(
+                iter([buf.tobytes()]),
+                media_type="image/jpeg",
+                headers={
+                    "Content-Type": "image/jpeg",
+                    "X-Frame-Timestamp": ts or "",
+                    "X-Frame-Source": source,
+                    "Cache-Control": "no-store",
+                    "X-Original-Size": f"{w}x{h}",
+                },
+            )
 
         # ==============================================================
         # UPLOAD MODE (Offline Video Processing) — spec §8
@@ -1249,19 +1263,47 @@ class AlertServer:
             }
 
         @self.app.get("/api/v1/cameras/{camera_id}/snapshot")
-        async def api_camera_snapshot(camera_id: str):
+        async def api_camera_snapshot(
+            camera_id: str,
+            quality: int = Query(80, ge=10, le=100),
+            maxw: Optional[int] = Query(None, ge=160, le=3840),
+        ):
             """Get latest JPEG snapshot from a camera (for embedding in main-drive UI)."""
-            for proc in self._camera_processors:
-                if proc.camera_id == camera_id:
-                    frame, ts = proc.reader.get_latest()
-                    if frame is not None:
-                        _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                        return StreamingResponse(
-                            iter([buf.tobytes()]),
-                            media_type="image/jpeg",
-                            headers={"X-Timestamp": ts or "", "Cache-Control": "no-cache"},
-                        )
-            return JSONResponse(status_code=404, content={"error": "Camera not found or no frame"})
+            proc_found = any(p.camera_id == camera_id for p in self._camera_processors)
+            if not proc_found:
+                return JSONResponse(status_code=404, content={"error": f"Camera '{camera_id}' not found"})
+
+            frame, ts = None, None
+            source = "frame_store"
+            if self._frame_store is not None:
+                frame, ts = self._frame_store.get(camera_id)
+
+            if frame is None:
+                source = "reader_fallback"
+                for proc in self._camera_processors:
+                    if proc.camera_id == camera_id:
+                        frame, ts = proc.reader.get_latest()
+                        break
+
+            if frame is None:
+                return JSONResponse(status_code=404, content={"error": "No frame available yet"})
+
+            out = frame
+            h, w = out.shape[:2]
+            if maxw and w > maxw:
+                scale = maxw / w
+                out = cv2.resize(out, (maxw, int(h * scale)), interpolation=cv2.INTER_AREA)
+            _, buf = cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, quality])
+            return StreamingResponse(
+                iter([buf.tobytes()]),
+                media_type="image/jpeg",
+                headers={
+                    "Content-Type": "image/jpeg",
+                    "X-Frame-Timestamp": ts or "",
+                    "X-Frame-Source": source,
+                    "Cache-Control": "no-store",
+                },
+            )
 
         @self.app.get("/api/v1/entities")
         async def api_entities(

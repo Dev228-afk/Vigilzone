@@ -95,6 +95,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
   }, [memberships, tenantId]);
 
+  // If a tenantId is stored but the user is no longer a member, clear it.
+  // This prevents a broken "stuck on select community" loop after membership changes.
+  useEffect(() => {
+    if (!tenantId || !memberships) return;
+    const ok = memberships.some((m) => String(m.id) === String(tenantId));
+    if (!ok) {
+      setSelectedTenantId(null);
+    }
+  }, [tenantId, memberships]);
+
   // Get user from auth context
   const user = useMemo(() => {
     return authContext?.user ?? null;

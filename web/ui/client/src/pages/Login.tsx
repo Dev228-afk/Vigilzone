@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useLocation } from "wouter";
 
 import { Card } from "@/components/ui/card";
@@ -22,10 +22,8 @@ export default function Login() {
   const [rememberMe, setRememberMe] = useState(false);
   const [loading, setLoading] = useState(false);
 
-  useEffect(() => {
-    const token = localStorage.getItem("accessToken");
-    if (token) setLocation("/dashboard");
-  }, [setLocation]);
+  // NOTE: No redirect useEffect here — PublicOnlyRoute already guards this page.
+  // A useEffect that reads localStorage can race with handleLogin's async flow.
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -45,14 +43,14 @@ export default function Login() {
           title: "Welcome back!",
           description: "Redirecting to your dashboard…",
         });
-        setTimeout(() => setLocation("/dashboard"), 400);
+        setLocation("/dashboard");
       } else {
         // No tenant resolved — send to community selection
         toast({
           title: "One more step",
           description: "Please select your community.",
         });
-        setTimeout(() => setLocation("/select-community"), 400);
+        setLocation("/select-community");
       }
     } catch (err) {
       console.error(err);
