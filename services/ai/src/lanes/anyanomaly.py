@@ -39,6 +39,8 @@ class AnyAnomalyLane(BaseLane):
         self.candidate_threshold = cfg.get("candidate_threshold", 0.40)
         self.max_clip_frames = int(cfg.get("max_clip_sec", 4) * cfg.get("clip_fps", 4))
         self.enabled = cfg.get("enabled", True)
+        self._active = self.enabled
+        self._disabled_reason: Optional[str] = None
 
         # Trigger state — set by aggregator / other lanes
         self._armed = False
@@ -61,6 +63,16 @@ class AnyAnomalyLane(BaseLane):
     def init(self):
         if not self.enabled:
             self.logger.info("AnyAnomaly disabled in config")
+            self._active = False
+        elif self._client and not self._client.is_available:
+            self._active = False
+            self.enabled = False
+            self._disabled_reason = "worker_unavailable"
+            self.logger.warning(
+                "AnyAnomaly lane disabled for camera=%s because worker is unavailable. "
+                "Other lanes continue normally.",
+                self.camera_id,
+            )
         self._initialized = True
         self.logger.info(
             f"AnyAnomaly lane ready (enabled={self.enabled}, "
@@ -76,6 +88,21 @@ class AnyAnomalyLane(BaseLane):
         """
         if not self._initialized:
             self.init()
+
+        if not self.enabled:
+            return Observation(
+                ts_utc=ts_utc,
+                camera_id=self.camera_id,
+                lane=self.lane_name,
+                score=0.0,
+                trigger=False,
+                label=None,
+                debug={
+                    "inference_ms": 0.0,
+                    "disabled": True,
+                    "disabled_reason": self._disabled_reason or "config_disabled",
+                },
+            )
 
         t0 = time.perf_counter()
         self._frame_window.append(frame_bgr.copy())

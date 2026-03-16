@@ -11,7 +11,7 @@ import argparse
 import time
 import threading
 import asyncio
-from concurrent.futures import ThreadPoolExecutor, Future, wait
+from concurrent.futures import ThreadPoolExecutor, Future
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 import sys
@@ -355,6 +355,9 @@ class CameraProcessor:
     def _process_loop(self):
         # Per-lane last-run timestamps for independent cadence
         lane_last_run: Dict[str, float] = {}
+        lane_inflight: Dict[str, Future] = {}
+        lane_inflight_started: Dict[str, float] = {}
+        lane_stuck_warned_at: Dict[str, float] = {}
         frame_count = 0
         frame_seq = 0           # monotonic frame id for detection cache
         t_start = time.time()
@@ -369,6 +372,56 @@ class CameraProcessor:
             "fire_smoke", "weapon_yolo", "entity_identity",
             "yolo_pose",
         })
+        _STUCK_WARN_AFTER_S = 5.0
+        _STUCK_WARN_EVERY_S = 10.0
+
+        def _handle_lane_result(lane_name: str, fut: Future):
+            try:
+                obs = fut.result()
+                if obs is None:
+                    return
+
+                if obs.debug is None:
+                    obs.debug = {}
+
+                # Track RT-DETR detection state for conditional fallback
+                if lane_name == "rt_detr":
+                    num_dets = obs.debug.get("num_detections", 0)
+                    self._last_rtdetr_had_dets = num_dets > 0 or obs.trigger
+
+                # Update auto-throttle for detector lanes
+                dt_ms = obs.debug.get("lane_inference_ms") or obs.debug.get("inference_ms", 0)
+                if self.auto_throttle and lane_name in ("rt_detr", "yolov8_fallback"):
+                    max_hz = self._sample_hz_map.get(lane_name, 2.0)
+                    self.auto_throttle.update(self.camera_id, dt_ms, max_hz)
+
+                # AnyAnomaly trigger policy
+                if lane_name == "anomalyclip" and obs.score > 0:
+                    aa_lane = self.lanes.get("anyanomaly")
+                    if aa_lane and hasattr(aa_lane, "arm"):
+                        aa_cfg = self.models_cfg.get("models", {}).get("anyanomaly", {})
+                        candidate_thresh = aa_cfg.get("candidate_threshold", 0.40)
+                        if obs.score >= candidate_thresh:
+                            aa_lane.arm(reason="anomalyclip_candidate")
+
+                if lane_name in ("rt_detr", "yolov8_fallback"):
+                    suspicious = {"weapon", "knife", "gun", "fight", "violence"}
+                    if obs.label and obs.label.lower() in suspicious:
+                        aa_lane = self.lanes.get("anyanomaly")
+                        if aa_lane and hasattr(aa_lane, "arm"):
+                            aa_lane.arm(reason=f"detector_{obs.label}")
+
+                alert = self.aggregator.process_observation(
+                    obs,
+                    evidence_request_callback=self._request_evidence_async,
+                    ringbuffer=self.ringbuffer,
+                )
+                if alert:
+                    self.stats["last_alert_ts"] = alert.ts_utc
+                    self.logger.info(f"ALERT: {alert.type}")
+
+            except Exception as e:
+                self.logger.error(f"Lane {lane_name} error: {e}")
 
         while self._running:
             try:
@@ -383,6 +436,16 @@ class CameraProcessor:
 
                 now = time.time()
                 frame_seq += 1
+
+                # Drain completed inflight lane jobs from prior frames.
+                for lane_name in list(lane_inflight.keys()):
+                    fut = lane_inflight[lane_name]
+                    if not fut.done():
+                        continue
+                    lane_inflight.pop(lane_name, None)
+                    lane_inflight_started.pop(lane_name, None)
+                    lane_stuck_warned_at.pop(lane_name, None)
+                    _handle_lane_result(lane_name, fut)
 
                 # ── Gate ring-buffer inserts to ~10 fps ───────────────
                 if now - last_ring_insert >= ring_target_interval:
@@ -422,9 +485,28 @@ class CameraProcessor:
                     continue
 
                 # ── Dispatch due lanes in PARALLEL via thread pool ────
-                futures: Dict[str, Future] = {}
-                future_to_lane: Dict[Future, str] = {}
                 for lane_name, lane in due_lanes.items():
+                    inflight = lane_inflight.get(lane_name)
+                    if inflight is not None:
+                        if inflight.done():
+                            lane_inflight.pop(lane_name, None)
+                            lane_inflight_started.pop(lane_name, None)
+                            lane_stuck_warned_at.pop(lane_name, None)
+                            _handle_lane_result(lane_name, inflight)
+                        else:
+                            started = lane_inflight_started.get(lane_name, now)
+                            runtime_s = now - started
+                            last_warn = lane_stuck_warned_at.get(lane_name, 0.0)
+                            if runtime_s >= _STUCK_WARN_AFTER_S and (now - last_warn) >= _STUCK_WARN_EVERY_S:
+                                self.logger.warning(
+                                    "Lane still in-flight camera=%s lane=%s runtime=%.1fs; skipping new dispatch",
+                                    self.camera_id,
+                                    lane_name,
+                                    runtime_s,
+                                )
+                                lane_stuck_warned_at[lane_name] = now
+                            continue
+
                     # Build lane-specific kwargs
                     lane_kwargs: Dict[str, Any] = {}
                     if lane_name in ("yolov8_fallback", "fall_candidate"):
@@ -436,78 +518,14 @@ class CameraProcessor:
                             lane.infer, frame, ts, **lane_kwargs,
                         )
                         if fut is not None:
-                            futures[lane_name] = fut
-                            future_to_lane[fut] = lane_name
+                            lane_inflight[lane_name] = fut
+                            lane_inflight_started[lane_name] = now
                     else:
                         fut = self._lane_pool.submit(
                             lane.infer, frame, ts, **lane_kwargs,
                         )
-                        futures[lane_name] = fut
-                        future_to_lane[fut] = lane_name
-
-                # ── Collect completed lane results with bounded wait ─────
-                done, not_done = wait(list(future_to_lane.keys()), timeout=5.0)
-
-                if not_done:
-                    self.logger.warning(
-                        "Lane timeout on camera=%s: %d (of %d) futures unfinished",
-                        self.camera_id,
-                        len(not_done),
-                        len(future_to_lane),
-                    )
-                    # Best effort cancellation for queued tasks; running tasks will
-                    # finish in the background and be dropped for this frame.
-                    for fut in not_done:
-                        fut.cancel()
-
-                for fut in done:
-                    lane_name = future_to_lane[fut]
-                    try:
-                        obs = fut.result()
-                        if obs is None:
-                            continue
-
-                        if obs.debug is None:
-                            obs.debug = {}
-
-                        # Track RT-DETR detection state for conditional fallback
-                        if lane_name == "rt_detr":
-                            num_dets = obs.debug.get("num_detections", 0)
-                            self._last_rtdetr_had_dets = num_dets > 0 or obs.trigger
-
-                        # Update auto-throttle for detector lanes
-                        dt_ms = obs.debug.get("lane_inference_ms") or obs.debug.get("inference_ms", 0)
-                        if self.auto_throttle and lane_name in ("rt_detr", "yolov8_fallback"):
-                            max_hz = self._sample_hz_map.get(lane_name, 2.0)
-                            self.auto_throttle.update(self.camera_id, dt_ms, max_hz)
-
-                        # AnyAnomaly trigger policy
-                        if lane_name == "anomalyclip" and obs.score > 0:
-                            aa_lane = self.lanes.get("anyanomaly")
-                            if aa_lane and hasattr(aa_lane, "arm"):
-                                aa_cfg = self.models_cfg.get("models", {}).get("anyanomaly", {})
-                                candidate_thresh = aa_cfg.get("candidate_threshold", 0.40)
-                                if obs.score >= candidate_thresh:
-                                    aa_lane.arm(reason="anomalyclip_candidate")
-
-                        if lane_name in ("rt_detr", "yolov8_fallback"):
-                            suspicious = {"weapon", "knife", "gun", "fight", "violence"}
-                            if obs.label and obs.label.lower() in suspicious:
-                                aa_lane = self.lanes.get("anyanomaly")
-                                if aa_lane and hasattr(aa_lane, "arm"):
-                                    aa_lane.arm(reason=f"detector_{obs.label}")
-
-                        alert = self.aggregator.process_observation(
-                            obs,
-                            evidence_request_callback=self._request_evidence_async,
-                            ringbuffer=self.ringbuffer,
-                        )
-                        if alert:
-                            self.stats["last_alert_ts"] = alert.ts_utc
-                            self.logger.info(f"ALERT: {alert.type}")
-
-                    except Exception as e:
-                        self.logger.error(f"Lane {lane_name} error: {e}")
+                        lane_inflight[lane_name] = fut
+                        lane_inflight_started[lane_name] = now
 
                 # ── Poll loitering observations from person_zone ──────
                 try:

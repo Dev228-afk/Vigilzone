@@ -62,7 +62,7 @@ export default function Dashboard() {
         recent_audit: Array<{ id: number; action: string; actor: string; created_at: string }>;
       };
     },
-    refetchInterval: 15_000,
+    refetchInterval: 5_000,
     retry: false,
   });
 

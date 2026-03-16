@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useLocation } from "wouter";
 import { useQuery } from "@tanstack/react-query";
 import { Card } from "@/components/ui/card";
@@ -31,29 +31,32 @@ const STATUS_BADGE: Record<string, "default" | "secondary" | "destructive" | "ou
 export default function Incidents() {
   const [, setLocation] = useLocation();
   const [searchQuery, setSearchQuery] = useState("");
+  const [debouncedSearch, setDebouncedSearch] = useState("");
   const [filterType, setFilterType] = useState("all");
   const [filterStatus, setFilterStatus] = useState("all");
 
+  useEffect(() => {
+    const t = setTimeout(() => {
+      setDebouncedSearch(searchQuery.trim());
+    }, 250);
+    return () => clearTimeout(t);
+  }, [searchQuery]);
+
   const incidentsQ = useQuery({
-    queryKey: ["incidents"],
+    queryKey: ["incidents", { search: debouncedSearch, type: filterType, status: filterStatus }],
     queryFn: async () => {
-      const { data } = await api.get("/incidents/");
+      const params: Record<string, string> = {};
+      if (debouncedSearch) params.search = debouncedSearch;
+      if (filterType !== "all") params.type = filterType;
+      if (filterStatus !== "all") params.status = filterStatus;
+      const { data } = await api.get("/incidents/", { params });
       return (Array.isArray(data) ? data : data?.results ?? []) as Incident[];
     },
+    refetchInterval: 10_000,
     retry: false,
   });
 
   const incidents = incidentsQ.data ?? [];
-
-  const filteredIncidents = incidents.filter((inc) => {
-    const matchesSearch =
-      inc.type.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      (inc.camera_name || "").toLowerCase().includes(searchQuery.toLowerCase()) ||
-      String(inc.id).includes(searchQuery);
-    const matchesType = filterType === "all" || inc.type === filterType;
-    const matchesStatus = filterStatus === "all" || inc.status === filterStatus;
-    return matchesSearch && matchesType && matchesStatus;
-  });
 
   const formatTime = (iso: string) => {
     const d = new Date(iso);
@@ -128,14 +131,14 @@ export default function Incidents() {
             </TableRow>
           </TableHeader>
           <TableBody>
-            {filteredIncidents.length === 0 && (
+            {incidents.length === 0 && (
               <TableRow>
                 <TableCell colSpan={7} className="text-center text-muted-foreground py-8">
                   No incidents found.
                 </TableCell>
               </TableRow>
             )}
-            {filteredIncidents.map((incident) => (
+            {incidents.map((incident) => (
               <TableRow key={incident.id} className="cursor-pointer hover-elevate" onClick={() => setLocation(`/incidents/${incident.id}`)}>
                 <TableCell className="font-medium" data-testid={`text-incident-${incident.id}`}>#{incident.id}</TableCell>
                 <TableCell className="capitalize">{incident.type}</TableCell>

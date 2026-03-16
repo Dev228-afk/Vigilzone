@@ -1,0 +1,54 @@
+{
+  "dcsd": {
+    "camera_id": "dcsd",
+    "rtsp_url": "rtsp://administrator:@169.254.57.139/rtsp/defaultPrimary-0?streamType=u",
+    "ingest_backend": "opencv",
+    "enabled_lanes": [
+      "rt_detr",
+      "yolov8_fallback",
+      "fire_smoke_yolo",
+      "person_zone"
+    ],
+    "sample_hz": 2.0,
+    "registered_at": 1773190013.0826316
+  },
+  "home_cam": {
+    "camera_id": "home_cam",
+    "rtsp_url": "rtmp://semerkandglb.mediatriple.net:1935/semerkandliveedge/semerkand2",
+    "ingest_backend": "opencv",
+    "enabled_lanes": [
+      "rt_detr",
+      "yolov8_fallback",
+      "fire_smoke_yolo",
+      "person_zone"
+    ],
+    "sample_hz": 2.0,
+    "registered_at": 1773279193.9624991
+  },
+  "sfsgs": {
+    "camera_id": "sfsgs",
+    "rtsp_url": "rtsp://170.93.143.139/rtplive/470011e600ef003a004ee33696235daa",
+    "ingest_backend": "opencv",
+    "enabled_lanes": [
+      "rt_detr",
+      "yolov8_fallback",
+      "fire_smoke_yolo",
+      "person_zone"
+    ],
+    "sample_hz": 2.0,
+    "registered_at": 1773279316.6805284
+  },
+  "home": {
+    "camera_id": "home",
+    "rtsp_url": "http://158.58.130.148:80/mjpg/video.mjpg",
+    "ingest_backend": "opencv",
+    "enabled_lanes": [
+      "rt_detr",
+      "yolov8_fallback",
+      "fire_smoke_yolo",
+      "person_zone"
+    ],
+    "sample_hz": 2.0,
+    "registered_at": 1773703154.754433
+  }
+}

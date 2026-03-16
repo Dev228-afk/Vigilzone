@@ -54,6 +54,10 @@ def ai_alerts(request):
 @permission_classes([IsAuthenticated])
 def ai_frame(request, camera_id):
     """GET /api/ai/frame/<camera_id>/ → proxy AI snapshot (binary stream)."""
+    camera_id = (camera_id or "").strip()
+    if not camera_id:
+        return Response({"error": "camera_id is required"}, status=status.HTTP_400_BAD_REQUEST)
+
     resp = proxy_request(request, f"/frame/{camera_id}", stream=True)
     if resp.status_code == 404:
         resp = proxy_request(

@@ -146,6 +146,10 @@ function entityIcon(type: string) {
   return <Car className="w-4 h-4" />;
 }
 
+function isValidAiCameraId(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
 function LiveAiEntityRow({ entity, accent }: { entity: AiEntity; accent: "household" | "neighbor" }) {
   const img = useAuthImage(entity.imageUrl);
   const fallbackClass = accent === "household"
@@ -217,7 +221,8 @@ export default function LiveAI() {
         : camRes.data?.cameras ?? [];
       setCameras(camData);
       if (!selectedCamera && camData.length > 0) {
-        setSelectedCamera(camData[0].camera_id);
+        const firstValid = camData.find((c) => isValidAiCameraId(c.camera_id));
+        if (firstValid) setSelectedCamera(firstValid.camera_id);
       }
       const alertData: AiAlert[] = Array.isArray(alertRes.data)
         ? alertRes.data
@@ -259,7 +264,9 @@ export default function LiveAI() {
       setEntities(DEMO_ENTITIES);
       setSystemStatus(DEMO_SYSTEM);
       setIsLive(false);
-      if (!selectedCamera) setSelectedCamera(DEMO_CAMERAS[0].camera_id);
+      if (!selectedCamera && isValidAiCameraId(DEMO_CAMERAS[0].camera_id)) {
+        setSelectedCamera(DEMO_CAMERAS[0].camera_id);
+      }
     } finally {
       setLoading(false);
     }
@@ -373,6 +380,7 @@ export default function LiveAI() {
                   {cameras.map((cam) => {
                     const isSelected = selectedCamera === cam.camera_id;
                     const stream = getMappedStream(cam.camera_id);
+                    const canUseAiFrame = isValidAiCameraId(cam.camera_id);
                     return (
                       <button
                         key={cam.camera_id}
@@ -396,17 +404,23 @@ export default function LiveAI() {
                                 }
                               />
                             ) : (
-                              <AuthImage
-                                src={`/ai/frame/${cam.camera_id}/`}
-                                alt={cam.camera_id}
-                                className="w-full h-full object-cover"
-                                refreshInterval={15_000}
-                                fallback={
-                                  <div className="w-full h-full flex items-center justify-center text-muted-foreground">
-                                    <Camera className="w-5 h-5" />
-                                  </div>
-                                }
-                              />
+                              canUseAiFrame ? (
+                                <AuthImage
+                                  src={`/ai/frame/${encodeURIComponent(cam.camera_id)}/`}
+                                  alt={cam.camera_id}
+                                  className="w-full h-full object-cover"
+                                  refreshInterval={15_000}
+                                  fallback={
+                                    <div className="w-full h-full flex items-center justify-center text-muted-foreground">
+                                      <Camera className="w-5 h-5" />
+                                    </div>
+                                  }
+                                />
+                              ) : (
+                                <div className="w-full h-full flex items-center justify-center text-muted-foreground">
+                                  <Camera className="w-5 h-5" />
+                                </div>
+                              )
                             )}
                           </div>
                           <div className="flex-1 min-w-0">
@@ -467,7 +481,7 @@ export default function LiveAI() {
             </div>
           </CardHeader>
           <CardContent>
-            {selectedCamera ? (
+            {selectedCamera && isValidAiCameraId(selectedCamera) ? (
               selectedStreamInfo ? (
                 <div className="relative">
                   <AuthedMjpeg
@@ -515,7 +529,7 @@ export default function LiveAI() {
                   {/* Always show a preview from AI so the page is usable even without DB mapping. */}
                   <div className="aspect-video rounded-lg border bg-muted overflow-hidden">
                     <AuthImage
-                      src={`/ai/frame/${selectedCamera}/`}
+                      src={`/ai/frame/${encodeURIComponent(selectedCamera)}/`}
                       alt={`Preview — ${selectedCamera}`}
                       className="w-full h-full object-cover"
                       refreshInterval={1_000}

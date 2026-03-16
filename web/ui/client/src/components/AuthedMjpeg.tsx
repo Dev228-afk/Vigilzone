@@ -43,6 +43,28 @@ export default function AuthedMjpeg({
   useEffect(() => {
     let cancelled = false;
 
+    if (!Number.isFinite(cameraId) || cameraId <= 0) {
+      setError(true);
+      setSrc(null);
+      clearTimers();
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    const hasAuth = !!(
+      localStorage.getItem("accessToken") || sessionStorage.getItem("accessToken")
+    );
+    if (!hasAuth) {
+      // Avoid hammering signed token endpoint when user is not authenticated yet.
+      setError(true);
+      setSrc(null);
+      clearTimers();
+      return () => {
+        cancelled = true;
+      };
+    }
+
     async function fetchToken() {
       try {
         const { data } = await api.get(`/streams/${cameraId}/signed_stream_token/`);

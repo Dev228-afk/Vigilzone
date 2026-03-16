@@ -17,6 +17,9 @@ class OpenCVReader(IngestBackend):
     def __init__(self, camera_id: str, source: str, reconnect_delay: float = 5.0):
         super().__init__(camera_id, source)
         self.reconnect_delay = reconnect_delay
+        self._backoff_delay = max(2.0, reconnect_delay)
+        self._backoff_max = 60.0
+        self._backoff_multiplier = 1.5
         self.logger = setup_logger(f"OpenCVReader-{camera_id}")
         
         self._cap = None
@@ -95,6 +98,9 @@ class OpenCVReader(IngestBackend):
                     with self._lock:
                         self._latest_frame = frame
                         self._latest_ts = now_iso_utc()
+
+                    # Reset reconnect backoff after successful reconnect.
+                    self._backoff_delay = max(2.0, self.reconnect_delay)
                     
                     return True
             
@@ -114,8 +120,10 @@ class OpenCVReader(IngestBackend):
                 if self._connect():
                     self.logger.info(f"Successfully connected")
                 else:
-                    self.logger.warning(f"Connection failed, retrying in {self.reconnect_delay}s")
-                    time.sleep(self.reconnect_delay)
+                    wait_s = self._backoff_delay
+                    self.logger.warning(f"Connection failed, retrying in {wait_s:.1f}s")
+                    time.sleep(wait_s)
+                    self._backoff_delay = min(self._backoff_delay * self._backoff_multiplier, self._backoff_max)
                     continue
             
             try:
@@ -124,7 +132,9 @@ class OpenCVReader(IngestBackend):
                 if not ret or frame is None:
                     self.logger.warning(f"Failed to read frame, reconnecting...")
                     self._connected = False
-                    time.sleep(self.reconnect_delay)
+                    wait_s = self._backoff_delay
+                    time.sleep(wait_s)
+                    self._backoff_delay = min(self._backoff_delay * self._backoff_multiplier, self._backoff_max)
                     continue
                 
                 # Update latest frame — store directly (cap.read() already
@@ -134,6 +144,7 @@ class OpenCVReader(IngestBackend):
                     self._latest_ts = now_iso_utc()
                     self._frame_seq += 1
                 self._new_frame.set()  # wake consumers
+                self._backoff_delay = max(2.0, self.reconnect_delay)
                 
                 # Minimal yield — cap.read() itself blocks sufficiently for
                 # RTSP/file sources.  1 ms keeps CPU usage negligible while
@@ -143,4 +154,6 @@ class OpenCVReader(IngestBackend):
             except Exception as e:
                 self.logger.error(f"Read error: {e}")
                 self._connected = False
-                time.sleep(self.reconnect_delay)
+                wait_s = self._backoff_delay
+                time.sleep(wait_s)
+                self._backoff_delay = min(self._backoff_delay * self._backoff_multiplier, self._backoff_max)

@@ -9,6 +9,8 @@ from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from django.db import transaction
+from django.db.models import Q, TextField
+from django.db.models.functions import Cast
 from django.conf import settings
 from django.utils import timezone
 from .models import (
@@ -379,10 +381,20 @@ class IncidentViewSet(TenantScopedViewSet):
         qs = super().get_queryset().order_by("-started_at")
         status_filter = self.request.query_params.get("status")
         type_filter = self.request.query_params.get("type")
+        search = (self.request.query_params.get("search") or "").strip()
         if status_filter:
             qs = qs.filter(status=status_filter)
         if type_filter:
             qs = qs.filter(type=type_filter)
+        if search:
+            query = (
+                Q(type__icontains=search)
+                | Q(camera__name__icontains=search)
+                | Q(details_text__icontains=search)
+            )
+            if search.isdigit():
+                query |= Q(id=int(search))
+            qs = qs.annotate(details_text=Cast("details", output_field=TextField())).filter(query)
         return qs
 
     @action(detail=True, methods=["post"], url_path="acknowledge")
