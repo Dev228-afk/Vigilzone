@@ -64,7 +64,7 @@ set PUBLIC_BASE_URL=http://127.0.0.1:8000
 python manage.py register_ai_webhook
 ```
 
-Open **http://localhost:5173** — login with your user credentials.
+Open **http://localhost:5000** — login with your user credentials.
 
 ## Services
 
