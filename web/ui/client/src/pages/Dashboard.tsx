@@ -4,11 +4,11 @@ import { useQuery } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import CameraFeed from "@/components/CameraFeed";
 import AlertCard from "@/components/AlertCard";
 import StatsCard from "@/components/StatsCard";
-import { Maximize2, Activity, Clock, TrendingUp, User, Dog, Car } from "lucide-react";
+import { Maximize2, Minimize2, Activity, Clock, TrendingUp, User, Dog, Car } from "lucide-react";
 import { PieChart, Pie, Cell, ResponsiveContainer, Legend, Tooltip } from "recharts";
 import { api } from "@/lib/api";
 
@@ -45,6 +45,8 @@ const CustomPieLabel = ({ cx, cy, midAngle, innerRadius, outerRadius, percentage
 export default function Dashboard() {
   const [, setLocation] = useLocation();
   const [zoneFilter, setZoneFilter] = useState("all");
+  const [focusedCameraId, setFocusedCameraId] = useState<number | null>(null);
+  const [isFullscreenOpen, setIsFullscreenOpen] = useState(false);
 
   /* ── Queries ──────────────────────────────────────────────── */
   const dashboardQ = useQuery({
@@ -62,22 +64,7 @@ export default function Dashboard() {
         recent_audit: Array<{ id: number; action: string; actor: string; created_at: string }>;
       };
     },
-    refetchInterval: 15_000,
-    retry: false,
-  });
-
-  /** Streams endpoint — returns WebRTC / HLS URLs per camera (no AI dependency) */
-  const streamsQ = useQuery({
-    queryKey: ["streams"],
-    queryFn: async () => {
-      const { data } = await api.get("/streams/");
-      return data as Array<{
-        id: number; name: string; site: string; status: string;
-        ai_camera_id: string; stream_path: string; camera_type: string;
-        webrtc_url: string; whep_url: string; hls_url: string;
-      }>;
-    },
-    refetchInterval: 30_000,
+    refetchInterval: 5_000,
     retry: false,
   });
 
@@ -92,27 +79,69 @@ export default function Dashboard() {
     retry: false,
   });
 
+  const activityQ = useQuery({
+    queryKey: ["community-activity", { limit: 10 }],
+    queryFn: async () => {
+      const { data } = await api.get("/community/activity/", { params: { limit: 10 } });
+      return Array.isArray(data) ? data : [];
+    },
+    refetchInterval: 10_000,
+    retry: false,
+  });
+
+  const healthQ = useQuery({
+    queryKey: ["streams-health"],
+    queryFn: async () => {
+      const { data } = await api.get("/streams/health/");
+      return (data ?? {}) as Record<string, {
+        connected: boolean;
+        last_frame_ts: number | null;
+        last_error: string;
+        fps_config: number;
+        viewers: number;
+      }>;
+    },
+    refetchInterval: 10_000,
+    retry: false,
+  });
+
   /* ── Derived data ────────────────────────────────────────── */
   const d = dashboardQ.data;
-  const streams = streamsQ.data ?? [];
-
-  // Build a lookup: camera id → stream info
-  const streamMap = new Map(streams.map((s) => [s.id, s]));
-
   const cameras = (d?.cameras ?? []).map((c) => {
-    const stream = streamMap.get(c.id);
     return {
       id: c.id,
       name: c.name,
       location: c.site || "Unknown",
       status: (c.status === "active" ? "active" : "offline") as "active" | "offline",
       ai_camera_id: c.ai_camera_id,
-      // WebRTC iframe URL — primary live feed (no AI dependency)
-      streamUrl: stream?.webrtc_url ?? undefined,
-      // Static fallback image if no stream available
-      imageUrl: frontDoorImg,
+      // Snapshot fallback (auth-protected) — fetched via CameraFeed blob fetch.
+      // NOTE: this is relative to axios baseURL ("/api"), so do NOT prefix with /api.
+      imageUrl: c.id ? `/streams/${c.id}/snapshot/` : frontDoorImg,
+      health: healthQ.data?.[String(c.id)],
     };
   });
+
+  const zoneValues = Array.from(
+    new Set(
+      cameras
+        .map((cam) => cam.location?.trim())
+        .filter((loc): loc is string => Boolean(loc && loc.length > 0))
+    )
+  );
+
+  const filteredCameras = cameras.filter((cam) => {
+    if (zoneFilter === "all") {
+      return true;
+    }
+    return cam.location === zoneFilter;
+  });
+
+  const focusedCamera = focusedCameraId
+    ? filteredCameras.find((cam) => cam.id === focusedCameraId) ?? null
+    : null;
+  const compactCameras = focusedCamera
+    ? filteredCameras.filter((cam) => cam.id !== focusedCamera.id)
+    : filteredCameras;
 
   const alerts = (d?.recent_incidents ?? []).slice(0, 5).map((inc) => ({
     id: inc.id,
@@ -142,9 +171,14 @@ export default function Dashboard() {
   }));
   const knownEntities = allEntities.filter((e) => e.group === "household" || e.group === "neighbor").slice(0, 6);
 
-  const communityActivity = (d?.recent_audit ?? []).slice(0, 5).map((a) => ({
-    time: new Date(a.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-    action: `${a.actor ?? "System"} — ${a.action.replace(/\./g, " ")}`,
+  const communityActivity = (activityQ.data ?? []).slice(0, 8).map((a: any) => ({
+    time: a.timestamp
+      ? new Date(a.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+      : "",
+    title: String(a.title ?? "Activity"),
+    description: String(a.description ?? ""),
+    actor: a.actor ? String(a.actor) : "System",
+    type: String(a.type ?? "activity"),
   }));
 
   const getEntityIcon = (type: string) => {
@@ -155,18 +189,24 @@ export default function Dashboard() {
 
   return (
     <div className="p-6 space-y-6">
-      <div className="flex gap-3 flex-wrap">
-        <Select value={zoneFilter} onValueChange={setZoneFilter}>
-          <SelectTrigger className="w-[180px]" data-testid="select-zone-filter">
-            <SelectValue placeholder="Zone" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="all">All Zones</SelectItem>
-            <SelectItem value="home">Home</SelectItem>
-            <SelectItem value="street">Street</SelectItem>
-            <SelectItem value="shared">Shared</SelectItem>
-          </SelectContent>
-        </Select>
+      <div className="flex gap-2 flex-wrap overflow-x-auto pb-1" data-testid="zone-chip-bar">
+        <Button
+          size="sm"
+          variant={zoneFilter === "all" ? "default" : "outline"}
+          onClick={() => setZoneFilter("all")}
+        >
+          All
+        </Button>
+        {zoneValues.map((zone) => (
+          <Button
+            key={zone}
+            size="sm"
+            variant={zoneFilter === zone ? "default" : "outline"}
+            onClick={() => setZoneFilter(zone)}
+          >
+            {zone}
+          </Button>
+        ))}
         {dashboardQ.isLoading && <span className="text-sm text-muted-foreground self-center">Loading…</span>}
       </div>
 
@@ -175,23 +215,73 @@ export default function Dashboard() {
         <div className="lg:col-span-4 space-y-4">
           <div>
             <h2 className="text-lg font-semibold mb-4">Live Feeds</h2>
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-1 gap-3">
-              {(cameras.length > 0 ? cameras : [{ id: 0, name: "No cameras", location: "-", status: "offline" as const, streamUrl: undefined, imageUrl: frontDoorImg }]).map((camera, idx) => (
+            {focusedCamera ? (
+              <div className="space-y-3">
                 <CameraFeed
-                  key={idx}
-                  name={camera.name}
-                  location={camera.location}
-                  status={camera.status}
-                  cameraId={camera.id || undefined}
-                  streamUrl={camera.streamUrl}
-                  imageUrl={camera.imageUrl}
+                  name={focusedCamera.name}
+                  location={focusedCamera.location}
+                  status={focusedCamera.status}
+                  cameraId={focusedCamera.id || undefined}
+                  imageUrl={focusedCamera.imageUrl}
+                  health={focusedCamera.health}
                   timestamp={new Date().toLocaleTimeString()}
                 />
-              ))}
-            </div>
+                <Button
+                  variant="outline"
+                  className="w-full"
+                  onClick={() => setFocusedCameraId(null)}
+                >
+                  <Minimize2 className="w-4 h-4 mr-2" />
+                  Return To Multi-Camera View
+                </Button>
+                {compactCameras.length > 0 && (
+                  <div className="grid grid-cols-1 gap-2">
+                    {compactCameras.map((camera) => (
+                      <button
+                        key={camera.id}
+                        onClick={() => setFocusedCameraId(camera.id)}
+                        className="text-left"
+                      >
+                        <CameraFeed
+                          name={camera.name}
+                          location={camera.location}
+                          status={camera.status}
+                          cameraId={camera.id || undefined}
+                          imageUrl={camera.imageUrl}
+                          health={camera.health}
+                        />
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-1 gap-3">
+                {(filteredCameras.length > 0
+                  ? filteredCameras
+                  : [{ id: 0, name: "No cameras", location: "-", status: "offline" as const, imageUrl: frontDoorImg, health: undefined }]
+                ).map((camera, idx) => (
+                  <button
+                    key={camera.id || idx}
+                    onClick={() => camera.id && setFocusedCameraId(camera.id)}
+                    className="text-left"
+                  >
+                    <CameraFeed
+                      name={camera.name}
+                      location={camera.location}
+                      status={camera.status}
+                      cameraId={camera.id || undefined}
+                      imageUrl={camera.imageUrl}
+                      health={camera.health}
+                      timestamp={new Date().toLocaleTimeString()}
+                    />
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
           <div className="flex gap-2">
-            <Button variant="outline" className="flex-1" data-testid="button-fullscreen">
+            <Button variant="outline" className="flex-1" data-testid="button-fullscreen" onClick={() => setIsFullscreenOpen(true)}>
               <Maximize2 className="w-4 h-4 mr-2" />
               View Fullscreen
             </Button>
@@ -294,7 +384,9 @@ export default function Dashboard() {
                 {communityActivity.map((activity, idx) => (
                   <div key={idx} className="text-sm">
                     <p className="text-muted-foreground text-xs mb-1">{activity.time}</p>
-                    <p>{activity.action}</p>
+                    <p className="font-medium">{activity.title}</p>
+                    <p className="text-xs text-muted-foreground">{activity.actor} · {activity.type}</p>
+                    {activity.description && <p className="text-xs text-muted-foreground mt-0.5">{activity.description}</p>}
                   </div>
                 ))}
               </div>
@@ -302,6 +394,29 @@ export default function Dashboard() {
           </div>
         </div>
       </div>
+
+      <Dialog open={isFullscreenOpen} onOpenChange={setIsFullscreenOpen}>
+        <DialogContent className="max-w-6xl">
+          <DialogHeader>
+            <DialogTitle>All Camera Feeds</DialogTitle>
+          </DialogHeader>
+          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3 max-h-[70vh] overflow-y-auto">
+            {(filteredCameras.length > 0 ? filteredCameras : cameras).map((camera) => (
+              <div key={camera.id}>
+                <CameraFeed
+                  name={camera.name}
+                  location={camera.location}
+                  status={camera.status}
+                  cameraId={camera.id || undefined}
+                  imageUrl={camera.imageUrl}
+                  health={camera.health}
+                  timestamp={new Date().toLocaleTimeString()}
+                />
+              </div>
+            ))}
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

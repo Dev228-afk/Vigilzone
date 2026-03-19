@@ -91,6 +91,10 @@ class Camera(TimeStamped):
                 self.stream_path = self.ai_camera_id
             elif self.name:
                 self.stream_path = slugify(self.name)
+        # Keep AI camera id aligned with stream_path when unset.
+        # This avoids legacy cam_<pk> IDs and reduces snapshot/preview mismatches.
+        if not self.ai_camera_id and self.stream_path:
+            self.ai_camera_id = self.stream_path
         super().save(*args, **kwargs)
 
 
@@ -180,12 +184,20 @@ class KnownEntity(TimeStamped):
     category = models.CharField(max_length=20, choices=Category.choices, default=Category.PERSON)
     group = models.CharField(max_length=20, choices=Group.choices, default=Group.HOUSEHOLD)
     notes = models.TextField(blank=True)
+    cameras = models.ManyToManyField(Camera, related_name="known_entities", blank=True)
     ai_entity_id = models.CharField(
         max_length=200, blank=True, default="",
         help_text="Identifier returned by the AI module after enrollment",
     )
     thumbnail_url = models.CharField(max_length=512, blank=True, default="")
     last_seen = models.DateTimeField(null=True, blank=True)
+    last_camera = models.ForeignKey(
+        Camera,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="last_seen_entities",
+    )
 
     def __str__(self):
         return f"{self.name} ({self.category})"

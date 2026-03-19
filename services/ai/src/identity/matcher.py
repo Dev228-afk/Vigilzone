@@ -182,22 +182,24 @@ class IdentityMatcher:
         return _NumpyIndex(ids, matrix), centroids
 
     # ── Match ─────────────────────────────────────────────────────────
-    def match_face(self, embedding: np.ndarray) -> IdentityMatch:
+    def match_face(self, embedding: np.ndarray, camera_id: Optional[str] = None) -> IdentityMatch:
         """Match a 512-d face embedding. Returns IdentityMatch."""
         return self._match(embedding, self._face_index, self._face_centroids,
                            self.face_threshold, self.face_margin,
+                           camera_id=camera_id,
                            known_cat=EntityCategory.KNOWN_PERSON,
                            unknown_cat=EntityCategory.UNKNOWN_PERSON)
 
-    def match_pet(self, embedding: np.ndarray) -> IdentityMatch:
+    def match_pet(self, embedding: np.ndarray, camera_id: Optional[str] = None) -> IdentityMatch:
         """Match a pet CLIP embedding. Returns IdentityMatch."""
         return self._match(embedding, self._pet_index, self._pet_centroids,
                            self.pet_threshold, self.pet_margin,
+                           camera_id=camera_id,
                            known_cat=EntityCategory.PET,
                            unknown_cat=EntityCategory.UNKNOWN_ANIMAL)
 
     def _match(self, embedding: np.ndarray, index, centroids: Dict[str, np.ndarray],
-               threshold: float, min_margin: float,
+               threshold: float, min_margin: float, camera_id: Optional[str],
                known_cat: str, unknown_cat: str) -> IdentityMatch:
         _unknown = IdentityMatch(
             entity_id=None, name=None, category=unknown_cat,
@@ -228,6 +230,11 @@ class IdentityMatcher:
 
         # Sort by score descending
         sorted_entities = sorted(entity_scores.items(), key=lambda x: x[1], reverse=True)
+        if camera_id:
+            sorted_entities = [
+                (eid, score) for eid, score in sorted_entities
+                if self._is_camera_allowed(eid, camera_id)
+            ]
         if not sorted_entities:
             return _unknown
 
@@ -259,3 +266,15 @@ class IdentityMatcher:
             second_sim=round(second_sim, 4),
             margin=round(margin, 4),
         )
+
+    def _is_camera_allowed(self, entity_id: str, camera_id: str) -> bool:
+        """Apply optional camera restriction from entity metadata."""
+        entity = self.store.get_entity(entity_id)
+        if not entity:
+            return False
+        metadata = entity.get("metadata") or {}
+        allowed = metadata.get("allowed_camera_ids")
+        if not isinstance(allowed, list) or len(allowed) == 0:
+            return True
+        allowed_str = {str(cam).strip() for cam in allowed if str(cam).strip()}
+        return str(camera_id).strip() in allowed_str

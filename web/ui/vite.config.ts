@@ -41,8 +41,6 @@ export default defineConfig({
         target: process.env.VITE_PROXY_TARGET || "http://127.0.0.1:8000",
         changeOrigin: true,
       },
-      // /webrtc and /hls are handled by Express middleware in server/index.ts
-      // to prevent crashes when MediaMTX is unavailable.
     },
   },
 });

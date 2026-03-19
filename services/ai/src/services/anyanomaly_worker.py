@@ -64,6 +64,36 @@ class AnyAnomalyEngine:
         self.enabled = False
         self._entry_script: Optional[str] = None
 
+    def _required_packages(self) -> List[str]:
+        script_name = (self._entry_script_name or "").lower()
+        if "demo.py" in script_name:
+            return ["transformers"]
+        return ["vllm"]
+
+    def _missing_packages(self, required: List[str]) -> List[str]:
+        if not required:
+            return []
+        try:
+            code = (
+                "import importlib.util, json, sys; "
+                "pkgs=sys.argv[1:]; "
+                "print(json.dumps([p for p in pkgs if importlib.util.find_spec(p) is None]))"
+            )
+            proc = subprocess.run(
+                [self.python_exe, "-c", code, *required],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if proc.returncode != 0:
+                return required
+            parsed = json.loads((proc.stdout or "[]").strip())
+            if isinstance(parsed, list):
+                return [str(p) for p in parsed]
+            return required
+        except Exception:
+            return required
+
     def initialize(self) -> bool:
         """Validate that repo_dir and entry_script exist."""
         if not self.repo_dir.exists():
@@ -91,6 +121,20 @@ class AnyAnomalyEngine:
             return False
 
         self._entry_script = str(script_path)
+
+        required = self._required_packages()
+        missing = self._missing_packages(required)
+        if missing:
+            pip_cmd = f"{self.python_exe} -m pip install {' '.join(missing)}"
+            logger.warning(
+                "AnyAnomaly disabled: missing dependencies for entry_script %s: %s. "
+                "Install with: %s",
+                self._entry_script_name,
+                ", ".join(missing),
+                pip_cmd,
+            )
+            return False
+
         self.enabled = True
         logger.info(f"AnyAnomaly entry_script validated: {script_path}")
         return True

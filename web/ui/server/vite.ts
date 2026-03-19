@@ -46,7 +46,7 @@ export async function setupVite(app: Express, server: Server) {
     const url = req.originalUrl;
 
     // Never serve SPA HTML for proxied paths — let them 404 normally
-    if (url.startsWith("/api") || url.startsWith("/webrtc") || url.startsWith("/hls")) {
+    if (url.startsWith("/api")) {
       return next();
     }
 

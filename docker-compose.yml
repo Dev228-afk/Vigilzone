@@ -25,15 +25,14 @@ services:
       - vigilzone
     restart: unless-stopped
 
-  # ── MediaMTX RTSP server ────────────────────────────────────
-  # Receives RTSP publish from webcam_publisher and serves it
-  # to the AI module (and anyone else) via RTSP on port 8554.
+  # ── MediaMTX RTSP server (optional relay for AI ingest) ─────
+  # Browser preview does not depend on this service.
   mediamtx:
     image: bluenviron/mediamtx:latest-ffmpeg
     ports:
       - "8554:8554"     # RTSP
-      - "8889:8889"     # WebRTC (optional, for browser preview)
-      - "8888:8888"     # HLS   (optional, for browser preview)
+      - "8889:8889"
+      - "8888:8888"
     environment:
       - MTX_PROTOCOLS=tcp
     networks:

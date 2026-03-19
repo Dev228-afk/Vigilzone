@@ -1,0 +1,80 @@
+{
+  "dcsd": {
+    "camera_id": "dcsd",
+    "rtsp_url": "rtsp://administrator:@169.254.57.139/rtsp/defaultPrimary-0?streamType=u",
+    "ingest_backend": "opencv",
+    "enabled_lanes": [
+      "rt_detr",
+      "yolov8_fallback",
+      "fire_smoke_yolo",
+      "person_zone"
+    ],
+    "sample_hz": 2.0,
+    "registered_at": 1773190013.0826316
+  },
+  "home_cam": {
+    "camera_id": "home_cam",
+    "rtsp_url": "rtmp://semerkandglb.mediatriple.net:1935/semerkandliveedge/semerkand2",
+    "ingest_backend": "opencv",
+    "enabled_lanes": [
+      "rt_detr",
+      "yolov8_fallback",
+      "fire_smoke_yolo",
+      "person_zone"
+    ],
+    "sample_hz": 2.0,
+    "registered_at": 1773279193.9624991
+  },
+  "sfsgs": {
+    "camera_id": "sfsgs",
+    "rtsp_url": "rtsp://170.93.143.139/rtplive/470011e600ef003a004ee33696235daa",
+    "ingest_backend": "opencv",
+    "enabled_lanes": [
+      "rt_detr",
+      "yolov8_fallback",
+      "fire_smoke_yolo",
+      "person_zone"
+    ],
+    "sample_hz": 2.0,
+    "registered_at": 1773279316.6805284
+  },
+  "home": {
+    "camera_id": "home",
+    "rtsp_url": "http://195.196.36.242/mjpg/video.mjpg",
+    "ingest_backend": "opencv",
+    "enabled_lanes": [
+      "rt_detr",
+      "yolov8_fallback",
+      "fire_smoke_yolo",
+      "person_zone"
+    ],
+    "sample_hz": 2.0,
+    "registered_at": 1773885716.8775027
+  },
+  "street": {
+    "camera_id": "street",
+    "rtsp_url": "http://47.51.131.147/-wvhttp-01-/GetOneShot?image_size=1280x720&frame_count=1000000000",
+    "ingest_backend": "opencv",
+    "enabled_lanes": [
+      "rt_detr",
+      "yolov8_fallback",
+      "fire_smoke_yolo",
+      "person_zone"
+    ],
+    "sample_hz": 2.0,
+    "registered_at": 1773885722.1733325
+  },
+  "backyard": {
+    "camera_id": "backyard",
+    "rtsp_url": "http://webcam.rhein-taunus-krematorium.de/mjpg/video.mjpg",
+    "ingest_backend": "opencv",
+    "enabled_lanes": [
+      "rt_detr",
+      "yolov8_fallback",
+      "fire_smoke_yolo",
+      "person_zone"
+    ],
+    "sample_hz": 2.0,
+    "registered_at": 1773885727.9220552
+  }
+}

@@ -1,16 +1,24 @@
 import os
 import logging
+import hashlib
+import hmac
+import time
+from typing import List
 from rest_framework import viewsets, permissions, status
 from rest_framework.exceptions import PermissionDenied, NotAuthenticated
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from django.db import transaction
+from django.db.models import Q, TextField
+from django.db.models.functions import Cast
+from django.conf import settings
 from django.utils import timezone
 from .models import (
     Tenant, Membership, Camera, CameraZone, Incident, Detection,
     Alert, AuditLog, Profile, Invitation, KnownEntity, NotificationChannel,
 )
+from .stream_workers import STREAM_WORKERS
 from .serializers import (
     TenantSerializer, MyTenantSerializer, MembershipSerializer,
     CameraSafeSerializer, CameraAdminSerializer, CameraWriteSerializer,
@@ -209,11 +217,24 @@ class CameraViewSet(TenantScopedViewSet):
     def sync_to_ai(self, request, pk=None):
         """POST /api/cameras/{id}/sync_to_ai/ — register camera with AI module."""
         import requests as http_client
+        import re
+        from django.utils.text import slugify
         camera = self.get_object()
         ai_base = os.getenv("AI_BASE_INTERNAL", "http://127.0.0.1:8080")
 
+        # Prefer stable IDs that match what the UI/streams use.
+        # Avoid the old fallback cam_<pk> unless absolutely necessary.
+        def _default_camera_id() -> str:
+            if camera.ai_camera_id and not re.match(r"^cam_\d+$", camera.ai_camera_id):
+                return camera.ai_camera_id
+            if camera.stream_path:
+                return camera.stream_path
+            if camera.name:
+                return slugify(camera.name)
+            return f"cam_{camera.pk}"
+
         payload = {
-            "camera_id": camera.ai_camera_id or f"cam_{camera.pk}",
+            "camera_id": _default_camera_id(),
             "rtsp_url": camera.rtsp_url or "",
             "ingest_backend": "opencv",
             "enabled_lanes": ["rt_detr", "yolov8_fallback", "fire_smoke_yolo", "person_zone"],
@@ -361,10 +382,20 @@ class IncidentViewSet(TenantScopedViewSet):
         qs = super().get_queryset().order_by("-started_at")
         status_filter = self.request.query_params.get("status")
         type_filter = self.request.query_params.get("type")
+        search = (self.request.query_params.get("search") or "").strip()
         if status_filter:
             qs = qs.filter(status=status_filter)
         if type_filter:
             qs = qs.filter(type=type_filter)
+        if search:
+            query = (
+                Q(type__icontains=search)
+                | Q(camera__name__icontains=search)
+                | Q(details_text__icontains=search)
+            )
+            if search.isdigit():
+                query |= Q(id=int(search))
+            qs = qs.annotate(details_text=Cast("details", output_field=TextField())).filter(query)
         return qs
 
     @action(detail=True, methods=["post"], url_path="acknowledge")
@@ -556,6 +587,19 @@ def dashboard_summary(request):
 def auth_context(request):
     tenant = get_active_tenant(request, required=False)
 
+    # Demo-safety net: if a user has no tenant memberships (e.g., created via admin/import),
+    # create a personal community on first login so they never hit a dead-end.
+    auto_create_first_login = getattr(
+        settings, "AUTO_CREATE_TENANT_ON_FIRST_LOGIN", True
+    )
+    if tenant is None and auto_create_first_login:
+        memberships_qs = Membership.objects.select_related("tenant").filter(user=request.user)
+        if memberships_qs.count() == 0:
+            with transaction.atomic():
+                t = Tenant.objects.create(name=f"{request.user.username}'s Community")
+                Membership.objects.create(user=request.user, tenant=t, role=Membership.Role.OWNER)
+            tenant = t
+
     # If no tenant header, and user has exactly one membership, auto-select it
     if tenant is None:
         memberships = Membership.objects.select_related("tenant").filter(user=request.user)
@@ -677,10 +721,26 @@ class KnownEntityViewSet(TenantScopedViewSet):
                 # Build thumbnail URL from first saved image
                 saved_urls = ai_data.get("saved_image_urls", [])
                 if saved_urls:
-                    entity.thumbnail_url = f"/api/ai{saved_urls[0]}"
+                    # IMPORTANT: store a URL that the frontend can fetch through
+                    # the Django API base (/api) without double-prefixing.
+                    # Frontend axios baseURL is "/api", so we store paths like "/ai/...".
+                    # AI returns paths like "/enroll_images/<id>/<file>", which are served
+                    # through Django at "/api/ai/enroll_images/...".
+                    p = str(saved_urls[0])
+                    if p.startswith("/api/"):
+                        p = p[4:]  # "/api/ai/..." -> "/ai/..."
+                    if p.startswith("/enroll_images/"):
+                        p = f"/ai{p}"  # -> "/ai/enroll_images/..."
+                    entity.thumbnail_url = p
                 elif ai_data.get("thumbnail"):
-                    entity.thumbnail_url = ai_data["thumbnail"]
+                    p = str(ai_data["thumbnail"])
+                    if p.startswith("/api/"):
+                        p = p[4:]
+                    if p.startswith("/enroll_images/"):
+                        p = f"/ai{p}"
+                    entity.thumbnail_url = p
                 entity.save(update_fields=["ai_entity_id", "thumbnail_url", "updated_at"])
+                self._sync_entity_to_ai(entity)
         except Exception as exc:
             import logging
             logging.getLogger(__name__).warning("AI enrollment failed: %s", exc)
@@ -688,6 +748,7 @@ class KnownEntityViewSet(TenantScopedViewSet):
 
         headers = self.get_success_headers(serializer.data)
         result = self.get_serializer(entity).data
+        result = self._merge_ai_identity_state(result)
         # Include AI enrollment details for the frontend
         result["ai_enrollment"] = {
             "embeddings_stored": ai_data.get("embeddings_stored", 0),
@@ -695,6 +756,101 @@ class KnownEntityViewSet(TenantScopedViewSet):
             "failed_images": ai_data.get("failed_images", []),
         }
         return Response(result, status=status.HTTP_201_CREATED, headers=headers)
+
+    def list(self, request, *args, **kwargs):
+        response = super().list(request, *args, **kwargs)
+        ai_map = self._fetch_ai_entity_state_map()
+        if isinstance(response.data, list):
+            response.data = [self._merge_ai_identity_state(item, ai_map=ai_map) for item in response.data]
+        elif isinstance(response.data, dict) and isinstance(response.data.get("results"), list):
+            response.data["results"] = [
+                self._merge_ai_identity_state(item, ai_map=ai_map)
+                for item in response.data["results"]
+            ]
+        return response
+
+    def retrieve(self, request, *args, **kwargs):
+        response = super().retrieve(request, *args, **kwargs)
+        if isinstance(response.data, dict):
+            response.data = self._merge_ai_identity_state(response.data, ai_map=self._fetch_ai_entity_state_map())
+        return response
+
+    def update(self, request, *args, **kwargs):
+        partial = kwargs.pop("partial", False)
+        instance = self.get_object()
+        serializer = self.get_serializer(instance, data=request.data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+        entity = serializer.save()
+        self._sync_entity_to_ai(entity)
+        return Response(self.get_serializer(entity).data)
+
+    def partial_update(self, request, *args, **kwargs):
+        kwargs["partial"] = True
+        return self.update(request, *args, **kwargs)
+
+    def _allowed_ai_camera_ids(self, entity) -> List[str]:
+        allowed = []
+        for cam in entity.cameras.all():
+            cam_id = (cam.ai_camera_id or "").strip() or str(cam.id)
+            allowed.append(cam_id)
+        return sorted(set(allowed))
+
+    def _sync_entity_to_ai(self, entity):
+        if not entity.ai_entity_id:
+            return
+
+        import requests as http_client
+
+        ai_base = os.getenv("AI_BASE_INTERNAL", "http://127.0.0.1:8080")
+        payload = {
+            "name": entity.name,
+            "metadata": {
+                "allowed_camera_ids": self._allowed_ai_camera_ids(entity),
+            },
+        }
+        try:
+            http_client.put(
+                f"{ai_base}/entities/{entity.ai_entity_id}",
+                json=payload,
+                timeout=10,
+            )
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("AI entity metadata sync failed: %s", exc)
+
+    def _fetch_ai_entity_state_map(self):
+        import requests as http_client
+
+        ai_base = os.getenv("AI_BASE_INTERNAL", "http://127.0.0.1:8080")
+        try:
+            resp = http_client.get(f"{ai_base}/entities", timeout=5)
+            if resp.status_code != 200:
+                return {}
+            raw = resp.json()
+            entities = raw if isinstance(raw, list) else []
+            return {
+                str(item.get("entity_id") or item.get("id") or ""): item
+                for item in entities
+                if isinstance(item, dict)
+            }
+        except Exception:
+            return {}
+
+    def _merge_ai_identity_state(self, payload: dict, ai_map=None):
+        """Overlay AI-managed identity state (last_seen/last_camera_id) in API responses."""
+        ai_entity_id = str(payload.get("ai_entity_id") or "").strip()
+        if not ai_entity_id:
+            return payload
+
+        by_id = ai_map if isinstance(ai_map, dict) else self._fetch_ai_entity_state_map()
+        ai_item = by_id.get(ai_entity_id)
+        if not ai_item:
+            return payload
+        if ai_item.get("last_seen"):
+            payload["last_seen"] = ai_item.get("last_seen")
+        if ai_item.get("last_camera_id"):
+            payload["last_camera_id"] = ai_item.get("last_camera_id")
+        return payload
 
     def perform_destroy(self, instance):
         """Delete from AI then from Django."""
@@ -791,14 +947,58 @@ class InvitationViewSet(viewsets.ModelViewSet):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# §B  STREAM ENDPOINTS (WebRTC/HLS URLs)
+# §B  STREAM ENDPOINTS (OpenCV preview + MJPEG)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+def _stream_preview_config() -> dict:
+    return {
+        "fps": int(getattr(settings, "STREAM_PREVIEW_FPS", 3)),
+        "max_width": int(getattr(settings, "STREAM_PREVIEW_MAX_WIDTH", 960)),
+        "jpeg_quality": int(getattr(settings, "STREAM_PREVIEW_JPEG_QUALITY", 70)),
+        "idle_ttl_s": int(getattr(settings, "STREAM_IDLE_TTL_SECONDS", 60)),
+        "ffmpeg_capture_options": str(
+            getattr(settings, "OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp|stimeout;3000000")
+        ),
+    }
+
+
+def _build_stream_token(camera_id: int, ttl_s: int = 60) -> tuple[str, int]:
+    exp = int(time.time()) + ttl_s
+    payload = f"{camera_id}.{exp}".encode()
+    sig = hmac.new(settings.SECRET_KEY.encode(), payload, hashlib.sha256).hexdigest()[:32]
+    return f"{camera_id}.{exp}.{sig}", ttl_s
+
+
+def _verify_stream_token(token: str, camera_id: int) -> tuple[bool, dict]:
+    try:
+        tok_cam, tok_exp, tok_sig = token.split(".")
+        if int(tok_cam) != int(camera_id):
+            return False, {"error": "camera_mismatch"}
+        if time.time() > float(tok_exp):
+            return False, {"error": "expired"}
+        payload = f"{tok_cam}.{tok_exp}".encode()
+        expected = hmac.new(settings.SECRET_KEY.encode(), payload, hashlib.sha256).hexdigest()[:32]
+        if not hmac.compare_digest(expected, tok_sig):
+            return False, {"error": "signature_mismatch"}
+        return True, {"camera_id": int(tok_cam), "exp": int(tok_exp)}
+    except Exception:
+        return False, {"error": "malformed"}
+
+
+def _camera_from_jwt_scope(request, camera_id: int) -> Camera:
+    tenant = get_active_tenant(request)
+    if not assert_member(request, tenant):
+        raise PermissionDenied()
+    try:
+        return Camera.objects.get(pk=camera_id, tenant=tenant)
+    except Camera.DoesNotExist:
+        raise PermissionDenied("Camera not found for tenant")
 
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def streams_list(request):
-    """GET /api/streams/ — list cameras with derived WebRTC/HLS URLs."""
     tenant = get_active_tenant(request)
     if not assert_member(request, tenant):
         raise PermissionDenied()
@@ -809,7 +1009,6 @@ def streams_list(request):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def streams_detail(request, camera_id):
-    """GET /api/streams/<camera_id>/ — single camera stream URLs."""
     tenant = get_active_tenant(request)
     if not assert_member(request, tenant):
         raise PermissionDenied()
@@ -822,163 +1021,7 @@ def streams_detail(request, camera_id):
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
-def streams_snapshot(request, camera_id):
-    """
-    GET /api/streams/<camera_id>/snapshot/
-    AI-first snapshot pipeline:
-      1. Background cache (instant)
-      2. AI module /frame/<ai_id>  (2 s timeout)
-      3. ffmpeg from RTSP           (8 s timeout)
-    Returns image/jpeg with X-Snapshot-Source header.
-    """
-    import subprocess
-    import time as _time
-    import requests as http_client
-    from django.http import HttpResponse
-
-    tenant = get_active_tenant(request)
-    if not assert_member(request, tenant):
-        raise PermissionDenied()
-    try:
-        camera = Camera.objects.get(pk=camera_id, tenant=tenant)
-    except Camera.DoesNotExist:
-        return Response({"error": "Camera not found"}, status=status.HTTP_404_NOT_FOUND)
-
-    # ── Identifiers ──────────────────────────────────────────
-    ai_candidates = []
-    for cand in (camera.ai_camera_id, camera.stream_path, f"cam_{camera.pk}"):
-        if cand and cand not in ai_candidates:
-            ai_candidates.append(cand)
-    ai_id = ai_candidates[0]
-    stream_path = camera.stream_path or ai_id
-    mediamtx_rtsp_base = os.getenv("MEDIAMTX_RTSP_BASE", "rtsp://127.0.0.1:8554")
-    rtsp_url = camera.rtsp_url or f"{mediamtx_rtsp_base}/{stream_path}"
-    ai_base = os.getenv("AI_BASE_INTERNAL", "http://127.0.0.1:8080")
-
-    active_ids = _get_ai_active_camera_ids(ai_base)
-    if active_ids is not None:
-        ai_candidates = [c for c in ai_candidates if c in active_ids]
-
-    # ── Per-request in-memory cache (3 s TTL) ────────────────
-    cache_key = f"_snapshot_{camera.pk}"
-    if not hasattr(streams_snapshot, "_cache"):
-        streams_snapshot._cache = {}
-    inline_cached = streams_snapshot._cache.get(cache_key)
-    now = _time.time()
-    if inline_cached and (now - inline_cached["ts"]) < 3.0:
-        resp = HttpResponse(inline_cached["data"], content_type="image/jpeg")
-        resp["Cache-Control"] = "no-store"
-        resp["X-Snapshot-Source"] = inline_cached.get("source", "cache")
-        return resp
-
-    def _make_jpeg_response(data: bytes, source: str):
-        streams_snapshot._cache[cache_key] = {"ts": _time.time(), "data": data, "source": source}
-        resp = HttpResponse(data, content_type="image/jpeg")
-        resp["Cache-Control"] = "no-store"
-        resp["X-Snapshot-Source"] = source
-        return resp
-
-    ai_errors = []
-    ffmpeg_err = ""
-
-    # ── Step 1: AI module (primary — try both endpoints) ─────
-    ai_endpoints = []
-    for cand in ai_candidates:
-        ai_endpoints.extend([
-            f"{ai_base}/frame/{cand}?maxw=1280&quality=70",
-            f"{ai_base}/api/v1/cameras/{cand}/snapshot?maxw=1280&quality=70",
-        ])
-    if not ai_endpoints and active_ids is not None:
-        ai_errors.append("No matching active camera_id in AI /cameras")
-    for ai_endpoint in ai_endpoints:
-        try:
-            ai_resp = http_client.get(ai_endpoint, timeout=2)
-            ct = ai_resp.headers.get("Content-Type", "")
-            if ai_resp.status_code == 200 and "image" in ct and ai_resp.content:
-                return _make_jpeg_response(ai_resp.content, f"ai:{ai_endpoint.split(ai_base)[1].split('?')[0]}")
-            ai_errors.append(f"{ai_endpoint} -> {ai_resp.status_code}")
-        except Exception as exc:
-            ai_errors.append(f"{ai_endpoint} -> {exc}")
-
-    # ── Step 2: ffmpeg from RTSP (fallback) ──────────────────
-    try:
-        result = subprocess.run(
-            [
-                "ffmpeg", "-hide_banner", "-loglevel", "error",
-                "-rtsp_transport", "tcp",
-                "-rw_timeout", "3000000",
-                "-i", rtsp_url,
-                "-frames:v", "1",
-                "-q:v", "5",
-                "-f", "image2", "-vcodec", "mjpeg",
-                "pipe:1",
-            ],
-            capture_output=True,
-            timeout=8,
-        )
-        if result.returncode == 0 and result.stdout:
-            return _make_jpeg_response(result.stdout, "ffmpeg")
-        ffmpeg_err = (result.stderr or b"").decode(errors="replace").strip()[:300]
-    except FileNotFoundError:
-        ffmpeg_err = "ffmpeg not installed"
-    except subprocess.TimeoutExpired:
-        ffmpeg_err = "ffmpeg timed out (8s)"
-    except Exception as exc:
-        ffmpeg_err = str(exc)[:200]
-
-    # ── Both failed ──────────────────────────────────────────
-    _log = logging.getLogger("vigilzone.snapshot")
-    _log.error(
-        "Snapshot failed camera=%s ai_candidates=%s rtsp=%s | AI: %s | ffmpeg: %s",
-        camera_id, ai_candidates, rtsp_url, "; ".join(ai_errors), ffmpeg_err,
-    )
-    return Response(
-        {"error": "Snapshot unavailable — AI and ffmpeg both failed", "code": "SNAPSHOT_UPSTREAM_UNAVAILABLE"},
-        status=status.HTTP_502_BAD_GATEWAY,
-    )
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# §3b  MJPEG STREAM  (robust live-video fallback)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def _verify_stream_token(token: str, camera_id: int) -> bool:
-    """Verify an HMAC-signed short-lived stream token."""
-    import hashlib
-    import hmac
-    import time as _time
-    from django.conf import settings
-
-    try:
-        parts = token.split(".")
-        if len(parts) != 3:
-            return False
-        tok_cam, tok_exp, tok_sig = parts
-        if int(tok_cam) != camera_id:
-            return False
-        if _time.time() > float(tok_exp):
-            return False
-        payload = f"{tok_cam}.{tok_exp}".encode()
-        expected = hmac.new(
-            settings.SECRET_KEY.encode(), payload, hashlib.sha256
-        ).hexdigest()[:32]
-        return hmac.compare_digest(expected, tok_sig)
-    except Exception:
-        return False
-
-
-@api_view(["GET"])
-@permission_classes([IsAuthenticated])
 def streams_signed_token(request, camera_id):
-    """
-    GET /api/streams/<camera_id>/signed_stream_token/
-    Returns a 60-second HMAC token so <img src="...?token=..."> works for MJPEG.
-    """
-    import hashlib
-    import hmac
-    import time as _time
-    from django.conf import settings
-
     tenant = get_active_tenant(request)
     if not assert_member(request, tenant):
         raise PermissionDenied()
@@ -987,129 +1030,177 @@ def streams_signed_token(request, camera_id):
     except Camera.DoesNotExist:
         return Response({"error": "Camera not found"}, status=status.HTTP_404_NOT_FOUND)
 
-    ttl = 60
-    exp = str(int(_time.time()) + ttl)
-    payload = f"{camera_id}.{exp}".encode()
-    sig = hmac.new(
-        settings.SECRET_KEY.encode(), payload, hashlib.sha256
-    ).hexdigest()[:32]
-    token = f"{camera_id}.{exp}.{sig}"
-
+    token, ttl = _build_stream_token(camera_id, ttl_s=60)
     return Response({"token": token, "ttl": ttl})
 
 
-def _get_ai_active_camera_ids(ai_base: str, ttl_s: float = 3.0):
-    """Best-effort cached fetch of active AI camera IDs from /cameras."""
-    import time as _time
-    import requests as http_client
-
-    now = _time.time()
-    cache = getattr(_get_ai_active_camera_ids, "_cache", None)
-    if cache and cache.get("base") == ai_base and (now - cache.get("ts", 0.0)) < ttl_s:
-        return cache.get("ids")
-
-    try:
-        r = http_client.get(f"{ai_base}/cameras", timeout=1.0)
-        ids = set()
-        if r.status_code == 200:
-            payload = r.json() if r.content else []
-            if isinstance(payload, list):
-                for item in payload:
-                    if isinstance(item, dict):
-                        cam_id = item.get("camera_id")
-                        if cam_id:
-                            ids.add(str(cam_id))
-        _get_ai_active_camera_ids._cache = {"base": ai_base, "ts": now, "ids": ids}
-        return ids
-    except Exception:
-        # None means "unknown" (do not filter candidates).
-        return None
-
-
-def _mjpeg_generator(camera_id: int, ai_base: str, ai_ids, fps: int = 3):
-    """Yield multipart MJPEG frames at ~fps rate by pulling from AI module."""
-    import time as _time
-    import requests as http_client
-
-    interval = 1.0 / fps
-    boundary = b"--frame\r\n"
-
-    while True:
-        frame = None
-        for ai_id in ai_ids:
-            try:
-                r = http_client.get(
-                    f"{ai_base}/frame/{ai_id}",
-                    params={"maxw": 1280, "quality": 60},
-                    timeout=2,
-                )
-                ct = r.headers.get("Content-Type", "")
-                if r.status_code == 200 and "image" in ct and r.content:
-                    frame = r.content
-                    break
-            except Exception:
-                continue
-
-        if frame:
-            yield (
-                boundary
-                + b"Content-Type: image/jpeg\r\nContent-Length: "
-                + str(len(frame)).encode()
-                + b"\r\n\r\n"
-                + frame
-                + b"\r\n"
-            )
-        else:
-            _time.sleep(0.5)
-            continue
-
-        _time.sleep(interval)
-
-
 @api_view(["GET"])
-@permission_classes([])  # auth handled manually (JWT or signed token)
-def streams_mjpeg(request, camera_id):
-    """
-    GET /api/streams/<camera_id>/mjpeg/?token=<signed_token>
-    MJPEG multipart stream — works in <img> tags (no JS/WebSocket needed).
-    Auth: either JWT Bearer header OR ?token= query param (from signed_stream_token).
-    """
-    from django.http import StreamingHttpResponse
+@permission_classes([])
+def streams_snapshot(request, camera_id):
+    """JWT member auth OR signed query token auth."""
+    from django.http import HttpResponse
 
-    # ── Auth: try JWT first, then signed token ───────────────
-    user = request.user
     token_param = request.GET.get("token", "")
+    camera = None
 
-    if user and user.is_authenticated:
-        tenant = get_active_tenant(request)
-        if not assert_member(request, tenant):
-            raise PermissionDenied()
-        try:
-            camera = Camera.objects.get(pk=camera_id, tenant=tenant)
-        except Camera.DoesNotExist:
-            return Response({"error": "Camera not found"}, status=status.HTTP_404_NOT_FOUND)
-    elif token_param and _verify_stream_token(token_param, camera_id):
+    if token_param:
+        ok, _payload = _verify_stream_token(token_param, camera_id)
+        if not ok:
+            return Response({"error": "Invalid stream token"}, status=status.HTTP_401_UNAUTHORIZED)
         try:
             camera = Camera.objects.get(pk=camera_id)
         except Camera.DoesNotExist:
             return Response({"error": "Camera not found"}, status=status.HTTP_404_NOT_FOUND)
+    elif request.user and request.user.is_authenticated:
+        try:
+            camera = _camera_from_jwt_scope(request, camera_id)
+        except PermissionDenied as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_403_FORBIDDEN)
     else:
         raise NotAuthenticated("Provide Authorization header or ?token= parameter")
 
-    ai_candidates = []
-    for cand in (camera.ai_camera_id, camera.stream_path, f"cam_{camera.pk}"):
-        if cand and cand not in ai_candidates:
-            ai_candidates.append(cand)
-    ai_base = os.getenv("AI_BASE_INTERNAL", "http://127.0.0.1:8080")
+    cfg = _stream_preview_config()
+    worker = STREAM_WORKERS.ensure_running(camera, **cfg)
+    worker.touch()
+    jpeg, frame_ts, last_error = STREAM_WORKERS.get_latest_jpeg(int(camera.pk))
 
-    active_ids = _get_ai_active_camera_ids(ai_base)
-    if active_ids is not None:
-        ai_candidates = [c for c in ai_candidates if c in active_ids]
-    if not ai_candidates:
-        ai_candidates = [camera.stream_path or camera.ai_camera_id or f"cam_{camera.pk}"]
+    if jpeg:
+        resp = HttpResponse(jpeg, content_type="image/jpeg")
+        resp["Cache-Control"] = "no-store"
+        resp["X-Frame-Timestamp"] = str(frame_ts or "")
+        resp["X-Stream-Status"] = "connected"
+        return resp
+
+    return Response(
+        {
+            "status": "warming_up",
+            "last_error": last_error,
+        },
+        status=status.HTTP_503_SERVICE_UNAVAILABLE,
+    )
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def community_activity(request):
+    """Unified tenant timeline for dashboard/community activity cards."""
+    tenant = get_active_tenant(request)
+    if not assert_member(request, tenant):
+        raise PermissionDenied()
+
+    limit = min(int(request.query_params.get("limit", 20)), 100)
+    events = []
+
+    for log in AuditLog.objects.filter(tenant=tenant).select_related("actor").order_by("-created_at")[:limit]:
+        actor_name = log.actor.username if log.actor else "System"
+        events.append({
+            "type": "audit",
+            "title": log.action.replace(".", " ").replace("_", " ").title(),
+            "description": log.meta.get("message") if isinstance(log.meta, dict) else "",
+            "timestamp": log.created_at,
+            "actor": actor_name,
+            "related_type": log.target_type,
+            "related_id": log.target_id,
+        })
+
+    for incident in Incident.objects.filter(tenant=tenant).select_related("camera").order_by("-updated_at")[:limit]:
+        status_label = incident.get_status_display()
+        events.append({
+            "type": "incident",
+            "title": f"Incident {incident.get_type_display()} {status_label}",
+            "description": f"Camera: {incident.camera.name}",
+            "timestamp": incident.updated_at,
+            "actor": None,
+            "related_type": "incident",
+            "related_id": str(incident.id),
+        })
+
+    for entity in KnownEntity.objects.filter(tenant=tenant).order_by("-updated_at")[:limit]:
+        events.append({
+            "type": "entity",
+            "title": f"Entity updated: {entity.name}",
+            "description": f"Category: {entity.category}",
+            "timestamp": entity.updated_at,
+            "actor": None,
+            "related_type": "entity",
+            "related_id": str(entity.id),
+        })
+
+    for camera in Camera.objects.filter(tenant=tenant).order_by("-updated_at")[:limit]:
+        events.append({
+            "type": "camera",
+            "title": f"Camera updated: {camera.name}",
+            "description": f"Status: {camera.status}",
+            "timestamp": camera.updated_at,
+            "actor": None,
+            "related_type": "camera",
+            "related_id": str(camera.id),
+        })
+
+    for inv in Invitation.objects.filter(tenant=tenant).select_related("invited_by").order_by("-updated_at")[:limit]:
+        inviter = inv.invited_by.username if inv.invited_by else "System"
+        events.append({
+            "type": "invitation",
+            "title": f"Invitation {inv.status}",
+            "description": f"{inv.email} ({inv.role})",
+            "timestamp": inv.updated_at,
+            "actor": inviter,
+            "related_type": "invitation",
+            "related_id": str(inv.id),
+        })
+
+    events.sort(key=lambda item: item["timestamp"], reverse=True)
+    payload = []
+    for item in events[:limit]:
+        payload.append({
+            **item,
+            "timestamp": item["timestamp"].isoformat() if item["timestamp"] else None,
+        })
+    return Response(payload)
+
+
+def _mjpeg_generator(camera_id: int, fps: int):
+    interval = 1.0 / max(1, fps)
+    boundary = b"--frame\r\n"
+    try:
+        while True:
+            STREAM_WORKERS.touch(camera_id)
+            jpeg, _frame_ts, _err = STREAM_WORKERS.get_latest_jpeg(camera_id)
+            if jpeg:
+                yield (
+                    boundary
+                    + b"Content-Type: image/jpeg\r\nContent-Length: "
+                    + str(len(jpeg)).encode()
+                    + b"\r\n\r\n"
+                    + jpeg
+                    + b"\r\n"
+                )
+            time.sleep(interval)
+    finally:
+        STREAM_WORKERS.remove_viewer(camera_id)
+
+
+@api_view(["GET"])
+@permission_classes([])
+def streams_mjpeg(request, camera_id):
+    """Signed query token auth for browser <img> compatibility."""
+    from django.http import StreamingHttpResponse
+
+    token_param = request.GET.get("token", "")
+    ok, _payload = _verify_stream_token(token_param, camera_id) if token_param else (False, {})
+    if not ok:
+        return Response({"error": "Invalid stream token"}, status=status.HTTP_401_UNAUTHORIZED)
+
+    try:
+        camera = Camera.objects.get(pk=camera_id)
+    except Camera.DoesNotExist:
+        return Response({"error": "Camera not found"}, status=status.HTTP_404_NOT_FOUND)
+
+    cfg = _stream_preview_config()
+    STREAM_WORKERS.ensure_running(camera, **cfg)
+    STREAM_WORKERS.add_viewer(int(camera.pk))
 
     resp = StreamingHttpResponse(
-        _mjpeg_generator(camera_id, ai_base, ai_candidates, fps=3),
+        _mjpeg_generator(int(camera.pk), cfg["fps"]),
         content_type="multipart/x-mixed-replace; boundary=frame",
     )
     resp["Cache-Control"] = "no-store"
@@ -1117,39 +1208,16 @@ def streams_mjpeg(request, camera_id):
     return resp
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# §3c  MEDIAMTX HEALTH CHECK
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
-def debug_mediamtx_health(request):
-    """
-    GET /api/debug/mediamtx/health/
-    Quick TCP-connect probe to MediaMTX WebRTC port.
-    """
-    import socket
-    from datetime import datetime, timezone as dt_timezone
+def streams_health(request):
+    tenant = get_active_tenant(request)
+    if not assert_member(request, tenant):
+        raise PermissionDenied()
 
-    host = os.getenv("MEDIAMTX_WEBRTC_HOST", os.getenv("MEDIAMTX_HOST", "127.0.0.1"))
-    port = int(os.getenv("MEDIAMTX_WEBRTC_PORT", "8889"))
-    timeout_s = 0.3
-
-    reachable = False
-    error = None
-    try:
-        sock = socket.create_connection((host, port), timeout=timeout_s)
-        sock.close()
-        reachable = True
-    except Exception as exc:
-        error = str(exc)
-
-    return Response({
-        "target": f"{host}:{port}",
-        "reachable": reachable,
-        "error": error,
-        "checked_at": datetime.now(dt_timezone.utc).isoformat(),
-    })
+    camera_ids = list(Camera.objects.filter(tenant=tenant).values_list("id", flat=True))
+    cfg = _stream_preview_config()
+    return Response(STREAM_WORKERS.health_for_cameras(camera_ids, default_fps=cfg["fps"]))
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

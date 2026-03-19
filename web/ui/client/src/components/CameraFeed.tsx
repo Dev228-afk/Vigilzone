@@ -16,6 +16,13 @@ interface CameraFeedProps {
   imageUrl?: string;
   /** WebRTC iframe URL — takes priority over imageUrl when provided */
   streamUrl?: string;
+  health?: {
+    connected: boolean;
+    last_frame_ts: number | null;
+    last_error: string;
+    fps_config: number;
+    viewers: number;
+  };
   timestamp?: string;
 }
 
@@ -36,7 +43,7 @@ function normalizeForAxios(url: string): string {
   return url;
 }
 
-export default function CameraFeed({ name, location, status, cameraId, imageUrl, streamUrl, timestamp }: CameraFeedProps) {
+export default function CameraFeed({ name, location, status, cameraId, imageUrl, streamUrl, health, timestamp }: CameraFeedProps) {
   const [blobSrc, setBlobSrc] = useState<string | null>(null);
   const [error, setError] = useState(false);
   const [iframeError, setIframeError] = useState(false);
@@ -157,6 +164,11 @@ export default function CameraFeed({ name, location, status, cameraId, imageUrl,
         {timestamp && (
           <div className="absolute bottom-2 right-2 bg-black/70 text-white text-xs px-2 py-1 rounded">
             {timestamp}
+          </div>
+        )}
+        {health && (
+          <div className="absolute bottom-2 left-2 bg-black/70 text-white text-[10px] px-2 py-1 rounded">
+            {health.connected ? "Connected" : "Warming"}
           </div>
         )}
       </div>

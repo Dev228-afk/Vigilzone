@@ -81,9 +81,9 @@ export default function IncidentDetails() {
   // Determine snapshot + clip URLs (safe even when data is undefined)
   const incident = incidentQ.data;
   const clipUrl = (incident?.details as any)?.clip_url ?? "";
-  const aiCameraId = (incident?.details as any)?.ai_camera_id ?? "";
+  const aiCameraId = String((incident?.details as any)?.ai_camera_id ?? "").trim();
   const snapshotUrl = incident?.media_key
-    || (aiCameraId ? `/ai/frame/${aiCameraId}/` : "");
+    || (aiCameraId ? `/ai/frame/${encodeURIComponent(aiCameraId)}/` : "");
 
   // Auto-refresh live frame every 3s when falling back to AI feed
   useEffect(() => {

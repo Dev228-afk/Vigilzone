@@ -146,7 +146,7 @@ class EntityIdentityLane(BaseLane):
                         quality_ok = best_face.quality_ok
 
             if best_face is not None and self._matcher:
-                match = self._matcher.match_face(best_face.embedding)
+                match = self._matcher.match_face(best_face.embedding, camera_id=self.camera_id)
                 match.quality_ok = quality_ok
             else:
                 match = IdentityMatch(
@@ -182,6 +182,12 @@ class EntityIdentityLane(BaseLane):
                     quality_ok=match.quality_ok,
                 )
 
+            if match.entity_id and self._matcher and getattr(self._matcher, "store", None):
+                try:
+                    self._matcher.store.record_sighting(match.entity_id, self.camera_id)
+                except Exception:
+                    pass
+
             self._set_cache(track_id, match, now)
             d = self._match_to_dict(match, track_id, pbox)
             if self._stabilizer is not None:
@@ -197,7 +203,7 @@ class EntityIdentityLane(BaseLane):
             if self._pet_embedder and self._pet_embedder.available and self._matcher:
                 emb = self._pet_embedder.embed(crop, frame_area=frame_area)
                 if emb is not None:
-                    match = self._matcher.match_pet(emb)
+                    match = self._matcher.match_pet(emb, camera_id=self.camera_id)
                 else:
                     match = IdentityMatch(
                         entity_id=None, name=None,
@@ -211,6 +217,11 @@ class EntityIdentityLane(BaseLane):
                     category=EntityCategory.UNKNOWN_ANIMAL,
                     confidence=0.0, score=0.0,
                 )
+            if match.entity_id and self._matcher and getattr(self._matcher, "store", None):
+                try:
+                    self._matcher.store.record_sighting(match.entity_id, self.camera_id)
+                except Exception:
+                    pass
             identities.append(self._match_to_dict(match, None, abox))
 
         # ── Build observation ─────────────────────────────────────────

@@ -842,7 +842,44 @@ class AlertServer:
             """List enrolled entities."""
             if self._entity_store is None:
                 return {"error": "Identity subsystem not enabled"}
-            return self._entity_store.list_entities(category)
+            entities = self._entity_store.list_entities(category)
+            for entity in entities:
+                metadata = entity.get("metadata") or {}
+                entity["allowed_camera_ids"] = metadata.get("allowed_camera_ids", [])
+                entity["last_seen"] = metadata.get("last_seen")
+                entity["last_camera_id"] = metadata.get("last_camera_id")
+            return entities
+
+        @self.app.put("/entities/{entity_id}")
+        async def update_entity(
+            entity_id: str,
+            payload: Dict[str, Any] = Body(default={}),
+        ):
+            """Update an enrolled entity's metadata and optional display fields."""
+            if self._entity_store is None:
+                return JSONResponse(
+                    status_code=503,
+                    content={"error": "Identity subsystem not enabled"},
+                )
+            updated = self._entity_store.update_entity(
+                entity_id=entity_id,
+                name=payload.get("name"),
+                role=payload.get("role"),
+                category=payload.get("category"),
+                metadata=payload.get("metadata"),
+            )
+            if updated is None:
+                return JSONResponse(
+                    status_code=404,
+                    content={"error": f"Entity not found: {entity_id}"},
+                )
+            if self._identity_matcher:
+                self._identity_matcher.reload_indices()
+            metadata = updated.get("metadata") or {}
+            updated["allowed_camera_ids"] = metadata.get("allowed_camera_ids", [])
+            updated["last_seen"] = metadata.get("last_seen")
+            updated["last_camera_id"] = metadata.get("last_camera_id")
+            return updated
 
         @self.app.post("/identity/reload")
         async def reload_identity():

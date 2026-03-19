@@ -34,11 +34,11 @@ export async function apiRequest(
 
 type UnauthorizedBehavior = "returnNull" | "throw";
 
-export const getQueryFn: <T>(options: {
+export const getQueryFn = <T>(options: {
   on401: UnauthorizedBehavior;
-}) => QueryFunction<T> =
-  ({ on401 }) =>
+}): QueryFunction<T> =>
   async ({ queryKey }) => {
+    const { on401 } = options;
     // Your old code used fetch(queryKey.join("/")) which is odd unless queryKey contains a full URL.
     // Minimal-change approach: support both:
     const path = queryKey.join("/") as string;

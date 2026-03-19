@@ -25,7 +25,7 @@ import {
 import { api } from "@/lib/api";
 import AuthImage from "@/components/AuthImage";
 import AuthedMjpeg from "@/components/AuthedMjpeg";
-import { useMediamtxHealth } from "@/hooks/use-mediamtx-health";
+import { useAuthImage } from "@/hooks/use-auth-image";
 
 /* ── Types ──────────────────────────────────────────────────── */
 interface AiCamera {
@@ -46,9 +46,14 @@ interface StreamInfo {
   ai_camera_id: string;
   stream_path: string;
   camera_type: string;
-  webrtc_url: string;
-  whep_url: string;
-  hls_url: string;
+}
+
+interface StreamHealth {
+  connected: boolean;
+  last_frame_ts: number | null;
+  last_error: string;
+  fps_config: number;
+  viewers: number;
 }
 
 interface AiAlert {
@@ -141,6 +146,38 @@ function entityIcon(type: string) {
   return <Car className="w-4 h-4" />;
 }
 
+function isValidAiCameraId(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function LiveAiEntityRow({ entity, accent }: { entity: AiEntity; accent: "household" | "neighbor" }) {
+  const img = useAuthImage(entity.imageUrl);
+  const fallbackClass = accent === "household"
+    ? "bg-green-600/10 text-green-700"
+    : "bg-blue-600/10 text-blue-700";
+
+  return (
+    <div className="px-4 py-2.5 flex items-center gap-3 hover:bg-accent/50 transition-colors">
+      <Avatar className="w-9 h-9">
+        {img ? <AvatarImage src={img} /> : null}
+        <AvatarFallback className={`${fallbackClass} text-xs`}>
+          {entityIcon(entity.type)}
+        </AvatarFallback>
+      </Avatar>
+      <div className="flex-1 min-w-0">
+        <p className="text-sm font-medium truncate">{entity.name}</p>
+        <p className="text-[11px] text-muted-foreground">
+          {entity.lastSeen ?? "Never seen"}
+          {entity.cameras?.length ? ` · ${entity.cameras.length} cam${entity.cameras.length > 1 ? "s" : ""}` : ""}
+        </p>
+      </div>
+      <Badge variant="secondary" className="text-[10px] px-1.5 py-0 capitalize shrink-0">
+        {entity.type}
+      </Badge>
+    </div>
+  );
+}
+
 /* ── Component ──────────────────────────────────────────────── */
 export default function LiveAI() {
   const [cameras, setCameras] = useState<AiCamera[]>([]);
@@ -148,11 +185,10 @@ export default function LiveAI() {
   const [alerts, setAlerts] = useState<AiAlert[]>([]);
   const [entities, setEntities] = useState<AiEntity[]>([]);
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
+  const [streamHealth, setStreamHealth] = useState<Record<string, StreamHealth>>({});
   const [selectedCamera, setSelectedCamera] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [isLive, setIsLive] = useState(false); // true = connected to real AI
-  const [webrtcFailed, setWebrtcFailed] = useState(false); // fallback to MJPEG
-  const { reachable: mtxReachable, checked: mtxChecked } = useMediamtxHealth();
 
   /* ── Fetch data — real AI first, fallback to demo ──────────── */
   const fetchData = useCallback(async () => {
@@ -163,8 +199,16 @@ export default function LiveAI() {
       const streamRes = await api.get("/streams/");
       const streamData: StreamInfo[] = Array.isArray(streamRes.data) ? streamRes.data : [];
       setStreams(streamData);
+
+      try {
+        const healthRes = await api.get("/streams/health/");
+        setStreamHealth((healthRes.data ?? {}) as Record<string, StreamHealth>);
+      } catch {
+        setStreamHealth({});
+      }
     } catch {
       setStreams([]);
+      setStreamHealth({});
     }
 
     try {
@@ -177,7 +221,8 @@ export default function LiveAI() {
         : camRes.data?.cameras ?? [];
       setCameras(camData);
       if (!selectedCamera && camData.length > 0) {
-        setSelectedCamera(camData[0].camera_id);
+        const firstValid = camData.find((c) => isValidAiCameraId(c.camera_id));
+        if (firstValid) setSelectedCamera(firstValid.camera_id);
       }
       const alertData: AiAlert[] = Array.isArray(alertRes.data)
         ? alertRes.data
@@ -185,20 +230,21 @@ export default function LiveAI() {
       setAlerts(alertData);
       setIsLive(true);
 
-      // Entities from AI
+      // Entities: use Django as the source-of-truth (stores thumbnail_url paths that
+      // are accessible through /api/ai/enroll_images/... with auth).
       try {
-        const entRes = await api.get("/ai/entities/");
-        const entData = Array.isArray(entRes.data) ? entRes.data : entRes.data?.entities ?? [];
+        const entRes = await api.get("/entities/");
+        const entData = Array.isArray(entRes.data) ? entRes.data : entRes.data?.results ?? [];
         setEntities(entData.map((e: Record<string, unknown>) => ({
-          id: String(e.entity_id ?? e.id ?? ""),
-          name: String(e.name ?? e.label ?? "Unknown"),
-          type: (e.category === "pet" || e.type === "pet") ? "pet" as const
-            : (e.category === "vehicle" || e.type === "vehicle") ? "vehicle" as const
+          id: String(e.id ?? ""),
+          name: String(e.name ?? "Unknown"),
+          type: (e.category === "pet") ? "pet" as const
+            : (e.category === "vehicle") ? "vehicle" as const
             : "person" as const,
           group: (e.group as AiEntity["group"]) ?? "household",
           lastSeen: e.last_seen ? String(e.last_seen) : undefined,
           cameras: Array.isArray(e.cameras) ? e.cameras.map(String) : undefined,
-          imageUrl: e.thumbnail ? String(e.thumbnail) : undefined,
+          imageUrl: e.thumbnail_url ? String(e.thumbnail_url) : undefined,
         })));
       } catch {
         setEntities(DEMO_ENTITIES);
@@ -218,7 +264,9 @@ export default function LiveAI() {
       setEntities(DEMO_ENTITIES);
       setSystemStatus(DEMO_SYSTEM);
       setIsLive(false);
-      if (!selectedCamera) setSelectedCamera(DEMO_CAMERAS[0].camera_id);
+      if (!selectedCamera && isValidAiCameraId(DEMO_CAMERAS[0].camera_id)) {
+        setSelectedCamera(DEMO_CAMERAS[0].camera_id);
+      }
     } finally {
       setLoading(false);
     }
@@ -230,19 +278,17 @@ export default function LiveAI() {
     return () => clearInterval(iv);
   }, [fetchData]);
 
-  /* ── Derive WebRTC URL for the selected camera ────────────── */
-  const getStreamUrl = useCallback((camId: string): string | null => {
+  /* ── Resolve mapped Django camera for selected AI camera ───── */
+  const getMappedStream = useCallback((camId: string): StreamInfo | null => {
     // Match by ai_camera_id or stream_path
-    const match = streams.find(
+    return streams.find(
       (s) => s.ai_camera_id === camId || s.stream_path === camId
-    );
-    return match?.webrtc_url ?? null;
+    ) ?? null;
   }, [streams]);
 
   const selectedCam = cameras.find((c) => c.camera_id === selectedCamera);
-  const selectedStreamUrl = selectedCamera ? getStreamUrl(selectedCamera) : null;
   const selectedStreamInfo = selectedCamera
-    ? streams.find((s) => s.ai_camera_id === selectedCamera || s.stream_path === selectedCamera)
+    ? getMappedStream(selectedCamera)
     : null;
 
   /* ── Render ─────────────────────────────────────────────────── */
@@ -333,29 +379,24 @@ export default function LiveAI() {
                 <div className="divide-y">
                   {cameras.map((cam) => {
                     const isSelected = selectedCamera === cam.camera_id;
-                    const stream = streams.find(
-                      (s) => s.ai_camera_id === cam.camera_id || s.stream_path === cam.camera_id
-                    );
-                    // Use snapshot endpoint for thumbnails (cached, no AI dependency)
-                    // URL is relative to axios baseURL (/api), so no /api prefix here
-                    const thumbUrl = stream ? `/streams/${stream.id}/snapshot/` : null;
+                    const stream = getMappedStream(cam.camera_id);
+                    const canUseAiFrame = isValidAiCameraId(cam.camera_id);
                     return (
                       <button
                         key={cam.camera_id}
                         className={`w-full text-left px-3 py-3 hover:bg-accent transition-colors ${
                           isSelected ? "bg-accent ring-2 ring-primary/30" : ""
                         }`}
-                        onClick={() => { setSelectedCamera(cam.camera_id); setWebrtcFailed(false); }}
+                        onClick={() => { setSelectedCamera(cam.camera_id); }}
                       >
                         <div className="flex gap-3">
                           {/* Thumbnail */}
                           <div className="w-20 h-14 rounded overflow-hidden bg-muted shrink-0">
-                            {thumbUrl ? (
-                              <AuthImage
-                                src={thumbUrl}
+                            {stream ? (
+                              <AuthedMjpeg
+                                cameraId={stream.id}
                                 alt={cam.camera_id}
                                 className="w-full h-full object-cover"
-                                refreshInterval={15_000}
                                 fallback={
                                   <div className="w-full h-full flex items-center justify-center text-muted-foreground">
                                     <Camera className="w-5 h-5" />
@@ -363,9 +404,23 @@ export default function LiveAI() {
                                 }
                               />
                             ) : (
-                              <div className="w-full h-full flex items-center justify-center text-muted-foreground">
-                                <Camera className="w-5 h-5" />
-                              </div>
+                              canUseAiFrame ? (
+                                <AuthImage
+                                  src={`/ai/frame/${encodeURIComponent(cam.camera_id)}/`}
+                                  alt={cam.camera_id}
+                                  className="w-full h-full object-cover"
+                                  refreshInterval={15_000}
+                                  fallback={
+                                    <div className="w-full h-full flex items-center justify-center text-muted-foreground">
+                                      <Camera className="w-5 h-5" />
+                                    </div>
+                                  }
+                                />
+                              ) : (
+                                <div className="w-full h-full flex items-center justify-center text-muted-foreground">
+                                  <Camera className="w-5 h-5" />
+                                </div>
+                              )
                             )}
                           </div>
                           <div className="flex-1 min-w-0">
@@ -426,17 +481,20 @@ export default function LiveAI() {
             </div>
           </CardHeader>
           <CardContent>
-            {selectedCamera ? (
-              selectedStreamUrl && !webrtcFailed && mtxChecked && mtxReachable ? (
+            {selectedCamera && isValidAiCameraId(selectedCamera) ? (
+              selectedStreamInfo ? (
                 <div className="relative">
-                  <iframe
-                    key={selectedCamera}
-                    src={selectedStreamUrl}
-                    title={`Live feed — ${selectedCamera}`}
-                    className="w-full rounded-lg border bg-muted aspect-video"
-                    allow="autoplay; encrypted-media"
-                    sandbox="allow-scripts allow-same-origin"
-                    onError={() => setWebrtcFailed(true)}
+                  <AuthedMjpeg
+                    cameraId={selectedStreamInfo.id}
+                    className="w-full rounded-lg border bg-muted aspect-video object-cover"
+                    fallback={
+                      <div className="aspect-video rounded-lg border bg-muted flex items-center justify-center text-muted-foreground">
+                        <div className="text-center">
+                          <Camera className="w-12 h-12 mx-auto mb-2 opacity-40" />
+                          <p className="text-sm">Warming up stream…</p>
+                        </div>
+                      </div>
+                    }
                   />
                   {/* Overlay info */}
                   <div className="absolute bottom-3 left-3 flex gap-2">
@@ -454,39 +512,44 @@ export default function LiveAI() {
                   </div>
                   <div className="absolute top-3 right-3">
                     <span className="text-[11px] bg-black/60 text-white px-2 py-0.5 rounded">
-                      WebRTC
+                      MJPEG
                     </span>
                   </div>
-                </div>
-              ) : selectedStreamInfo ? (
-                <div className="relative">
-                  <AuthedMjpeg
-                    cameraId={selectedStreamInfo.id}
-                    alt={`Live feed — ${selectedCamera}`}
-                    className="w-full rounded-lg border bg-muted aspect-video object-cover"
-                    fallback={
-                      <div className="aspect-video flex items-center justify-center bg-muted rounded-lg text-muted-foreground">
-                        <div className="text-center">
-                          <Camera className="w-12 h-12 mx-auto mb-2 opacity-40" />
-                          <p className="text-sm font-medium">Feed unavailable</p>
-                          <p className="text-xs mt-1">WebRTC and MJPEG fallback both failed.</p>
-                        </div>
-                      </div>
-                    }
-                  />
-                  <div className="absolute top-3 right-3">
-                    <span className="text-[11px] bg-yellow-600/80 text-white px-2 py-0.5 rounded">
-                      MJPEG fallback
-                    </span>
-                  </div>
+                  {streamHealth[String(selectedStreamInfo.id)] && (
+                    <div className="mt-3 text-xs text-muted-foreground">
+                      Health: {streamHealth[String(selectedStreamInfo.id)].connected ? "connected" : "warming_up"}
+                      {streamHealth[String(selectedStreamInfo.id)].last_error
+                        ? ` (${streamHealth[String(selectedStreamInfo.id)].last_error})`
+                        : ""}
+                    </div>
+                  )}
                 </div>
               ) : (
-                <div className="aspect-video flex items-center justify-center bg-muted rounded-lg text-muted-foreground">
-                  <div className="text-center">
-                    <Camera className="w-12 h-12 mx-auto mb-2 opacity-40" />
-                    <p className="text-sm font-medium">Feed unavailable</p>
-                    <p className="text-xs mt-1">No stream URL mapped for this camera.</p>
-                    <p className="text-xs">Check camera stream_path in Settings → Cameras.</p>
+                <div className="relative">
+                  {/* Always show a preview from AI so the page is usable even without DB mapping. */}
+                  <div className="aspect-video rounded-lg border bg-muted overflow-hidden">
+                    <AuthImage
+                      src={`/ai/frame/${encodeURIComponent(selectedCamera)}/`}
+                      alt={`Preview — ${selectedCamera}`}
+                      className="w-full h-full object-cover"
+                      refreshInterval={1_000}
+                      fallback={
+                        <div className="w-full h-full flex items-center justify-center text-muted-foreground">
+                          <div className="text-center">
+                            <Camera className="w-12 h-12 mx-auto mb-2 opacity-40" />
+                            <p className="text-sm font-medium">Preview unavailable</p>
+                            <p className="text-xs mt-1">AI frame endpoint returned no image.</p>
+                          </div>
+                        </div>
+                      }
+                    />
+                  </div>
+                  <div className="absolute top-3 right-3">
+                    <span className="text-[11px] bg-blue-600/80 text-white px-2 py-0.5 rounded">AI preview</span>
+                  </div>
+                  <div className="mt-3 text-xs text-muted-foreground">
+                    Stream mapping not found for this AI camera. To enable browser preview, create a camera in Settings → Cameras
+                    and set its <code>ai_camera_id</code> or <code>stream_path</code> to <b>{selectedCamera}</b>.
                   </div>
                 </div>
               )
@@ -526,24 +589,7 @@ export default function LiveAI() {
                       {entities
                         .filter((e) => e.group === "household")
                         .map((entity) => (
-                          <div key={entity.id} className="px-4 py-2.5 flex items-center gap-3 hover:bg-accent/50 transition-colors">
-                            <Avatar className="w-9 h-9">
-                              <AvatarImage src={entity.imageUrl} />
-                              <AvatarFallback className="bg-green-600/10 text-green-700 text-xs">
-                                {entityIcon(entity.type)}
-                              </AvatarFallback>
-                            </Avatar>
-                            <div className="flex-1 min-w-0">
-                              <p className="text-sm font-medium truncate">{entity.name}</p>
-                              <p className="text-[11px] text-muted-foreground">
-                                {entity.lastSeen ?? "Never seen"}
-                                {entity.cameras?.length ? ` · ${entity.cameras.length} cam${entity.cameras.length > 1 ? "s" : ""}` : ""}
-                              </p>
-                            </div>
-                            <Badge variant="secondary" className="text-[10px] px-1.5 py-0 capitalize shrink-0">
-                              {entity.type}
-                            </Badge>
-                          </div>
+                          <LiveAiEntityRow key={entity.id} entity={entity} accent="household" />
                         ))}
                     </>
                   )}
@@ -556,23 +602,7 @@ export default function LiveAI() {
                       {entities
                         .filter((e) => e.group === "neighbor")
                         .map((entity) => (
-                          <div key={entity.id} className="px-4 py-2.5 flex items-center gap-3 hover:bg-accent/50 transition-colors">
-                            <Avatar className="w-9 h-9">
-                              <AvatarImage src={entity.imageUrl} />
-                              <AvatarFallback className="bg-blue-600/10 text-blue-700 text-xs">
-                                {entityIcon(entity.type)}
-                              </AvatarFallback>
-                            </Avatar>
-                            <div className="flex-1 min-w-0">
-                              <p className="text-sm font-medium truncate">{entity.name}</p>
-                              <p className="text-[11px] text-muted-foreground">
-                                {entity.lastSeen ?? "Never seen"}
-                              </p>
-                            </div>
-                            <Badge variant="secondary" className="text-[10px] px-1.5 py-0 capitalize shrink-0">
-                              {entity.type}
-                            </Badge>
-                          </div>
+                          <LiveAiEntityRow key={entity.id} entity={entity} accent="neighbor" />
                         ))}
                     </>
                   )}

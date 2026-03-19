@@ -12,9 +12,7 @@ Browser ──▶ Nginx :8085
               │    └─ /api/ai/*  → Django proxies to AI :8080
               └─ /ai/ (internal) → AI FastAPI :8080 (not exposed to browser)
 
-MediaMTX :8554 (RTSP) ◀── webcam_publisher (FFmpeg, host webcam or test pattern)
-              │
-              └── AI Module reads rtsp://mediamtx:8554/webcam
+RTSP Camera/Webcam ──▶ Django OpenCV workers ──▶ MJPEG/Snapshot endpoints
 
 AI Module ──webhook──▶ Django /api/ai/webhook/receive/
 ```
@@ -30,7 +28,7 @@ AI Module ──webhook──▶ Django /api/ai/webhook/receive/
 # 1. Copy env file and adjust if needed
 cp .env.example .env
 
-# 2. Build and start all services (includes MediaMTX + webcam publisher)
+# 2. Build and start all services
 docker compose up --build
 
 # 3. (First run) Apply Django migrations + create superuser
@@ -58,7 +56,7 @@ python manage.py runserver 0.0.0.0:8000
 # 3. Start React UI dev server
 cd web\ui
 npm install
-npx vite                               # runs on :5173, proxies /api → :8000
+npm run dev                            # runs on :5000, serves UI + Vite middleware
 
 # 4. Register webhook (once, while AI + Django are running)
 set AI_BASE_INTERNAL=http://127.0.0.1:8080
@@ -66,7 +64,7 @@ set PUBLIC_BASE_URL=http://127.0.0.1:8000
 python manage.py register_ai_webhook
 ```
 
-Open **http://localhost:5173** — login with your user credentials.
+Open **http://localhost:5000** — login with your user credentials.
 
 ## Services
 
@@ -75,9 +73,8 @@ Open **http://localhost:5173** — login with your user credentials.
 | **Nginx** | 8085 | `/` | Reverse proxy + UI static files (Docker only) |
 | **Django** | 8000 | `/api/*` | REST API, JWT auth, incidents, cameras, AI proxy |
 | **AI** | 8080 | *(internal)* | CCTV AI detection — accessed only via Django proxy |
-| **MediaMTX** | 8554 | *(RTSP)* | RTSP relay: receives webcam feed, serves to AI |
-| **webcam_publisher** | — | — | FFmpeg: host webcam → RTSP → MediaMTX |
-| **Vite** | 5173 | `/` | Dev UI server (local dev only) |
+| **OpenCV Worker Pool** | in backend | `/api/streams/*` | In-process capture workers for snapshot + MJPEG preview |
+| **UI Dev Server (Express + Vite middleware)** | 5000 | `/` | Local dev server (`npm run dev`) |
 
 ## Key Endpoints
 
@@ -93,7 +90,13 @@ Open **http://localhost:5173** — login with your user credentials.
 - `DELETE /api/cameras/{id}/zones/{zone_id}/` — Delete zone
 - `POST /api/cameras/{id}/sync_zones_to_ai/` — Push zones to AI
 - `POST /api/cameras/{id}/sync_ai_settings/` — Push per-camera AI thresholds
-- `GET  /api/incidents/` — List incidents (filter: `?type=`, `?status=`)
+- `GET  /api/streams/` — List stream-capable cameras with derived stream URLs
+- `GET  /api/streams/{id}/` — Stream metadata for one camera
+- `GET  /api/streams/{id}/signed_stream_token/` — Issue short-lived token for MJPEG/snapshot image tags
+- `GET  /api/streams/{id}/snapshot/` — Fast latest JPEG snapshot (JWT or token auth)
+- `GET  /api/streams/{id}/mjpeg/` — Multipart MJPEG stream (`?token=...`)
+- `GET  /api/streams/health/` — Per-camera worker health and viewer counts
+- `GET  /api/incidents/` — List incidents (filter: `?type=`, `?status=`, `?search=`)
 - `POST /api/incidents/{id}/acknowledge/` — Acknowledge incident
 - `POST /api/incidents/{id}/resolve/` — Resolve incident
 - `GET  /api/incidents/stats/` — Incident statistics (today/week/month, breakdown)
@@ -114,6 +117,9 @@ Open **http://localhost:5173** — login with your user credentials.
 - `GET  /api/ai/entities/` — List known entities
 - `POST /api/ai/entities/enroll_person/` — Enroll person (multipart)
 - `POST /api/ai/entities/enroll_pet/` — Enroll pet (multipart)
+- `POST /api/ai/entities/enroll_person_from_upload/` — Enroll person from staged upload images
+- `POST /api/ai/entities/enroll_pet_from_upload/` — Enroll pet from staged upload images
+- `POST /api/ai/uploads/enroll_images/` — Stage enrollment images
 - `DELETE /api/ai/entities/<id>/` — Delete entity
 - `POST /api/ai/webhooks/register/` — Register webhook with AI
 - `GET  /api/ai/evidence/<camera_id>/<filename>` — Download evidence
@@ -123,138 +129,69 @@ Open **http://localhost:5173** — login with your user credentials.
   - Auth: `X-AI-WEBHOOK-TOKEN` header **or** `X-Vigilzone-Signature` (HMAC-SHA256)
   - Auto-creates camera if not found, deduplicates incidents (60s window)
 
-## Live Camera Feed (MediaMTX + FFmpeg)
+## Local Preview Streaming (OpenCV + MJPEG)
 
-The `webcam_publisher` service captures the host webcam and publishes it to MediaMTX via RTSP. The AI module then reads the RTSP stream.
+Live browser preview now runs directly from Django with OpenCV workers. No MediaMTX, WebRTC, or external streaming server is required.
 
 ### Streaming Architecture
 
-```
-Camera/Webcam ──RTSP──▶ MediaMTX :8554
-                           │
-                           ├── AI Module reads  rtsp://mediamtx:8554/<stream_path>
-                           ├── WebRTC viewer    /webrtc/<stream_path>  (port 8889, proxied via Nginx)
-                           └── HLS viewer       /hls/<stream_path>    (port 8888, proxied via Nginx)
+```text
+RTSP camera or webcam index "0"
+            │
+            └──▶ Django StreamWorker (OpenCV capture thread per camera)
+                        ├── latest JPEG in memory (cached snapshot)
+                        └── MJPEG multipart stream
 
-Nginx :8085
-   ├─ /webrtc/*  →  mediamtx:8889   (WebRTC signalling + media)
-   └─ /hls/*     →  mediamtx:8888   (HLS segments)
-
-React UI loads:
-   <iframe src="/webrtc/<stream_path>">   (main live feed via WebRTC)
-   AuthImage src="/api/streams/{id}/snapshot/"  (thumbnails — JWT-authenticated blob fetch)
+React UI
+  ├── GET /api/streams/<id>/signed_stream_token/
+  ├── <img src="/api/streams/<id>/mjpeg/?token=...">
+  └── optional health poll: GET /api/streams/health/
 ```
 
-### Stream Path Mapping
+### API Endpoints
 
-Each camera in Django has a `stream_path` field that maps to a MediaMTX publish path.
+- `GET /api/streams/<id>/signed_stream_token/` issues a short-lived stream token (default 60s).
+- `GET /api/streams/<id>/snapshot/` returns `image/jpeg`.
+  - Auth mode A: JWT + tenant membership.
+  - Auth mode B: `?token=` signed token.
+- `GET /api/streams/<id>/mjpeg/?token=...` returns multipart MJPEG stream for `<img>`.
+- `GET /api/streams/health/` returns per-camera worker health:
+  - `connected`, `last_frame_ts`, `last_error`, `fps_config`, `viewers`.
 
-| Camera Name | `stream_path` | MediaMTX RTSP URL | WebRTC URL |
-|-------------|---------------|-------------------|------------|
-| Webcam (dev) | `webcam` | `rtsp://mediamtx:8554/webcam` | `/webrtc/webcam` |
-| Front Door | `front-door` | `rtsp://mediamtx:8554/front-door` | `/webrtc/front-door` |
+### Runtime Reliability Notes
 
-If `stream_path` is left blank when creating a camera, it is auto-derived:
-1. From `ai_camera_id` if set
-2. From `slugify(name)` otherwise (e.g. "Front Door" → "front-door")
+- Stream capture reconnect uses exponential backoff (starts near 2s, capped at 60s) and resets on successful frames.
+- Lane scheduling in the AI processor uses per-lane in-flight backpressure to avoid runaway unfinished-future buildup.
+- AnyAnomaly lane performs dependency preflight and gracefully disables itself when required packages are missing.
 
-### Docker mode
-- `webcam_publisher` reads `/dev/video0` (Linux) or generates an SMPTE test pattern as fallback
-- Publishes to `rtsp://mediamtx:8554/webcam`
-- AI ingests via `cameras.docker.yaml` (`camera_id: webcam`, `rtsp_url: rtsp://mediamtx:8554/webcam`)
-- WebRTC/HLS proxied through Nginx at `/webrtc/webcam` and `/hls/webcam`
+### Runbook
 
-### Local dev (Windows)
-
-#### Without MediaMTX (simplest)
-The AI module uses `cam_live` with `live_camera` backend (OpenCV, index 0) — reads the webcam directly.
-No streaming URLs will work in the UI, but AI detection runs.
-
-#### With MediaMTX (full streaming)
-1. Download [MediaMTX](https://github.com/bluenviron/mediamtx/releases) for Windows
-2. Run `mediamtx.exe` (listens on :8554 RTSP, :8889 WebRTC, :8888 HLS)
-3. Publish your webcam:
-   ```powershell
-   ffmpeg -f dshow -i video="<webcam name>" -c:v libx264 -preset ultrafast -tune zerolatency -f rtsp rtsp://localhost:8554/webcam
-   ```
-4. In `cameras.yaml`, use the `cam1` entry with `rtsp_url: rtsp://localhost:8554/webcam`
-5. In Django, create a camera with `stream_path = webcam`
-6. Vite proxies `/webrtc` → `localhost:8889` and `/hls` → `localhost:8888` automatically
-
-### Adding a real RTSP camera
-1. Configure the camera to publish RTSP (e.g. `rtsp://192.168.1.100:554/stream1`)
-2. **(Option A) Direct** — Set `rtsp_url` on the Django camera and `stream_path` to match a MediaMTX path. Relay via MediaMTX: add a `paths:` entry in `mediamtx.yml` pointing the source to the camera's RTSP URL.
-3. **(Option B) AI-only** — Set `rtsp_url` on the Django camera and sync to AI. AI reads directly; no WebRTC in the UI.
-
-### Vite Dev Proxy
-
-The Vite dev server proxies `/api`, `/webrtc`, and `/hls` so the React app can reach all services.
-The `/webrtc` and `/hls` prefixes are **stripped** before forwarding (MediaMTX expects paths without the prefix).
-Defaults work for local dev; override with env vars when targets differ:
-
-```bash
-VITE_PROXY_TARGET=http://192.168.1.50:8000              # Django backend
-VITE_MEDIAMTX_WEBRTC_TARGET=http://192.168.1.50:8889    # MediaMTX WebRTC
-VITE_MEDIAMTX_HLS_TARGET=http://192.168.1.50:8888       # MediaMTX HLS
-```
-
-### How to Publish a Dev Stream
-
-MediaMTX accepts streams published via RTSP. You can loop a local video file to simulate a camera:
-
-```bash
-# Loop an MP4 file as an RTSP stream (works on any OS with FFmpeg)
-ffmpeg -re -stream_loop -1 -i file.mp4 -c copy -f rtsp rtsp://127.0.0.1:8554/<stream_path>
-```
-
-For a live webcam (Windows):
-```powershell
-ffmpeg -f dshow -i video="<webcam name>" -c:v libx264 -preset ultrafast -tune zerolatency -f rtsp rtsp://127.0.0.1:8554/webcam
-```
-
-Once published, verify:
-- **WebRTC** (via Vite proxy): open `http://localhost:5000/webrtc/<stream_path>` in a browser
-- **Snapshot** (Django API):
-  ```bash
-  curl -H "Authorization: Bearer <TOKEN>" -H "X-Tenant-ID: <ID>" \
-       http://127.0.0.1:8000/api/streams/<camera_id>/snapshot/ --output out.jpg
-  ```
-  Check the `X-Snapshot-Source` response header — it should say `ffmpeg` or `ai_fallback:<url>`.
-
-### Snapshot Endpoint Details
-
-`GET /api/streams/<id>/snapshot/` is JWT-protected and returns `image/jpeg`.
-
-Pipeline:
-1. **ffmpeg** grabs one frame from RTSP (`-rtsp_transport tcp`, 3 s timeout)
-2. **AI fallback** — auto-tries `/frame/<cam>`, `/api/v1/cameras/<cam>/snapshot`, `/api/v1/cameras/<cam>/frame`
-3. **Background cache** — a daemon thread refreshes snapshots every 2 s so responses are instant
-
-Environment variables:
-| Variable | Default (local) | Default (Docker) | Purpose |
-|----------|----------------|------------------|---------|
-| `MEDIAMTX_RTSP_BASE` | `rtsp://127.0.0.1:8554` | `rtsp://mediamtx:8554` | RTSP base for stream URLs |
-| `AI_BASE_INTERNAL` | `http://127.0.0.1:8080` | `http://ai:8080` | AI module base URL |
-| `SNAPSHOT_CACHE_INTERVAL` | `2` | `2` | Background cache refresh interval (seconds) |
-| `SNAPSHOT_CACHE_MAX_AGE` | `5` | `5` | Max cached image age (seconds) |
-
-### Fallback modes
-Set `WEBCAM_FALLBACK` env var:
-- `testsrc` (default) — SMPTE colour bars with timestamp overlay
-- `mp4` — Loop a test video file (set `FALLBACK_MP4` path)
+1. Configure stream env vars in `.env` (`STREAM_PREVIEW_*`, `OPENCV_FFMPEG_CAPTURE_OPTIONS`).
+2. Ensure cameras have a valid source:
+   - local webcam: `rtsp_url="0"`
+   - remote stream: `rtsp://...`
+3. Start backend and UI.
+4. Open Dashboard or Live AI. UI fetches a signed token and uses MJPEG `<img>` playback.
+5. Check `/api/streams/health/` for warm-up/errors/reconnect diagnostics.
 
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DJANGO_DEBUG` | `1` | Django debug mode |
+| `UI_PORT` | `5000` | Local UI dev server port |
 | `SECRET_KEY` | insecure default | Django secret key |
 | `ALLOWED_HOSTS` | `localhost,...` | Django allowed hosts |
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:8085,...` | CORS origins |
-| `AI_BASE_INTERNAL` | `http://ai:8080` | AI module URL (backend→AI internal network) |
+| `AI_BASE_INTERNAL` | `http://127.0.0.1:8080` (local) / `http://ai:8080` (docker) | AI module URL (backend→AI internal network) |
 | `AI_WEBHOOK_TOKEN` | *(empty)* | Flat token for `X-AI-WEBHOOK-TOKEN` auth |
 | `AI_WEBHOOK_SECRET` | `vigilzone-webhook-secret` | HMAC secret for `X-Vigilzone-Signature` auth |
-| `PUBLIC_BASE_URL` | `http://backend:8000` | Public URL for webhook callbacks |
+| `PUBLIC_BASE_URL` | `http://127.0.0.1:8000` (local) / `http://localhost:8085` (docker proxy) | Public URL for webhook callbacks |
+| `STREAM_PREVIEW_FPS` | `3` | Capture FPS per camera worker |
+| `STREAM_PREVIEW_MAX_WIDTH` | `960` | Optional max width for preview JPEG resizing |
+| `STREAM_PREVIEW_JPEG_QUALITY` | `70` | JPEG encoding quality for snapshots/MJPEG |
+| `STREAM_IDLE_TTL_SECONDS` | `60` | Stop worker after this idle period |
+| `OPENCV_FFMPEG_CAPTURE_OPTIONS` | `rtsp_transport;tcp|stimeout;3000000` | OpenCV FFmpeg capture options for RTSP reliability |
 | `WEBCAM_FALLBACK` | `testsrc` | Webcam publisher fallback: `testsrc` or `mp4` |
 | `EMAIL_BACKEND` | `django.core.mail.backends.console.EmailBackend` | Email backend (use `smtp.EmailBackend` for prod) |
 | `DEFAULT_FROM_EMAIL` | `vigilzone@localhost` | Sender address for notifications |
@@ -264,8 +201,6 @@ Set `WEBCAM_FALLBACK` env var:
 | `EMAIL_HOST_USER` | *(empty)* | SMTP username |
 | `EMAIL_HOST_PASSWORD` | *(empty)* | SMTP password / app-specific password |
 | `VITE_PROXY_TARGET` | `http://127.0.0.1:8000` | Vite dev proxy → Django backend |
-| `VITE_MEDIAMTX_TARGET` | `http://127.0.0.1:8889` | Vite dev proxy → MediaMTX WebRTC |
-| `VITE_MEDIAMTX_HLS_TARGET` | `http://127.0.0.1:8888` | Vite dev proxy → MediaMTX HLS |
 
 ## Project Structure
 
@@ -276,7 +211,7 @@ vigilzone-monolith/
       src/                  # AI module source code
       configs/
         cameras.yaml        # Local dev config (webcam direct)
-        cameras.docker.yaml # Docker config (RTSP from MediaMTX)
+        cameras.docker.yaml # Docker config
       models/               # YOLO weights
       Dockerfile
     backend/                # Django REST API (port 8000)
@@ -353,91 +288,3 @@ python manage.py register_ai_webhook
 # Close stale incidents (no updates for 5 minutes)
 python manage.py close_stale_incidents --minutes 5
 ```
-
-## What Changed (Integration v5 — Streaming Bug-Fixes)
-
-### A) Fix Snapshot 401
-- **AuthImage component** — Reusable `<AuthImage>` fetches images through the authenticated axios instance (blob), auto-refreshes on interval
-- **LiveAI.tsx** — Sidebar thumbnails and evidence images now use `AuthImage` instead of raw `<img>`, eliminating 401 errors
-
-### B) Fix "No stream URL mapped"
-- **Auto-derive `stream_path`** — `CameraWriteSerializer.validate()` and `Camera.save()` auto-set `stream_path` from `ai_camera_id` or `slugify(name)` when empty
-- **Cameras.tsx** — Added `stream_path` field to the Add Camera form and table view
-
-### C) Fix Vite Proxy ECONNREFUSED
-- **vite.config.ts** — Proxy targets now use `VITE_PROXY_TARGET`, `VITE_MEDIAMTX_TARGET`, `VITE_MEDIAMTX_HLS_TARGET` env vars with sensible defaults
-- **Added `/webrtc` and `/hls` proxy rules** for local dev without Nginx
-
-### D) AI Camera Hot-Load
-- **AlertServer.set_app_context()** — Receives shared evidence exporter, model config, etc. from CCTVAIModule
-- **Register endpoint** — `POST /api/v1/cameras/register` now immediately creates and starts a `CameraProcessor` (hot-load), no restart required
-- **sync_to_ai** — Django view now also back-fills `stream_path` and returns `hot_loaded` status
-
-### E) MediaMTX Mapping Strategy
-- **README** — Comprehensive streaming architecture docs: stream path mapping, dev/docker/real-camera workflows, Vite proxy configuration
-
----
-
-## What Changed (Integration v4)
-
-### RTSP Snapshot Fix (§1)
-- **FFmpegReader** — Fully rewritten subprocess-based reader with configurable `rtsp_transport`, reconnect logic, and `get_diagnostics()` method
-- **AI proxy** — Added `Cache-Control: no-store` header on streaming snapshot responses
-
-### Intrusion Zones & Camera Types (§2)
-- **Camera model** — Added `camera_type` (BACKYARD, FRONT_DOOR, BEDROOM, GARAGE, LIVING_ROOM, OTHER)
-- **CameraZone model** — Per-camera polygon zones (RESTRICTED / MONITOR), full CRUD via REST
-- **AI endpoints** — `PUT /cameras/{id}/zones` and `PUT /cameras/{id}/settings` to push zone/threshold config live
-- **CameraProcessor.update_zones()** — Propagates zone polygons to zone-aware lanes at runtime
-
-### False-Positive Reduction (§3)
-- **Per-camera AI settings** — `min_confidence`, `min_bbox_area`, `k_of_n_k`, `k_of_n_n`, `cooldown_s` on Camera model
-- **sync_ai_settings** view — Pushes thresholds from Django to AI module
-
-### Notification API (§4)
-- **NotificationChannel model** — OneToOne per Tenant: email/push toggles, email recipients, FCM tokens, severity threshold
-- **Settings/Test/Register views** — GET/PUT settings, POST test email, POST register FCM device
-- **dispatch_notifications()** — Auto-sends email on incident create/escalate (wired into webhook receiver)
-- **Email config** — Console backend (dev), SMTP env vars for production
-
-### YOLO12 Critical Lane (§5)
-- **yolo12_critical.py** — New detection lane: fire, smoke, knife, gun, bear, dog, wolf, deer
-- **Persistence tracking** — K-of-N confirmation (default 3-of-6) before alerting
-- **Registered** in `LANE_REGISTRY`, `_LANE_HZ_CATEGORY`, models.yaml, cameras.yaml
-
-### Debug Tab (§7)
-- **debug_system** API — Aggregates Django uptime, DB status, AI status + camera health
-- **Debug.tsx** — New UI page with system stats, camera health table, raw diagnostics
-- **Dashboard.tsx** — Removed system health section (moved to Debug)
-- **NavBar** — Added Debug nav item
-
-### Housekeeping
-- **Removed Watchlist** (§8) — Removed from KnownEntity model, serializers, views, UI
-- **MediaMTX** (§9) — Already complete in docker-compose
-- **Migration 0008** applied — All new models and fields
-
----
-
-## What Changed (Integration v3)
-
-### Phase 1 & 2 — UI + Backend wiring
-- **All 8+ UI pages** rewritten: Dashboard, Cameras, Incidents, IncidentDetails, Reports, Settings, Community, Entities — wired to real Django/AI APIs via `useQuery`/`useMutation`
-- **LiveAI.tsx** — Fixed `device` object rendering error; properly handles nested `SystemStatus.device`
-- **New Django endpoints**: `dashboard_summary`, `incidents/stats`, `incidents/{id}/acknowledge`, `incidents/{id}/resolve`, `profile/me` (GET/PATCH)
-- **Extended models**: Profile with notification/privacy/system settings (8 new fields)
-- **IncidentSerializer** — Added `camera_name` field
-
-### Phase 3 — MediaMTX + RTSP live camera
-- **docker-compose.yml** — Added `mediamtx` (RTSP server) and `webcam_publisher` (FFmpeg) services
-- **webcam_publisher/** — Dockerfile + `entrypoint.sh` (tries v4l2 webcam, falls back to SMPTE test pattern)
-- **cameras.docker.yaml** — Docker-specific AI camera config reading from `rtsp://mediamtx:8554/webcam`
-- **cameras.yaml** — Added commented RTSP camera entry for reference
-
-### Phase 4 — Webhook persistence
-- **Webhook auth aligned** — Django receiver now accepts both `X-AI-WEBHOOK-TOKEN` (flat) and `X-Vigilzone-Signature` (HMAC-SHA256)
-- **Auto-registration** — `AiIntegrationConfig.ready()` spawns background thread to register webhook with AI on startup
-- **register_ai_webhook** command — Now passes `AI_WEBHOOK_SECRET` as HMAC secret when registering
-
-### Phase 5 — Deliverables
-- **Acceptance tests** — `tests/acceptance.sh` (bash) + `tests/acceptance.ps1` (PowerShell)
-- **README** — Comprehensive docs with architecture, local dev, Docker, testing

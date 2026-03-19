@@ -612,3 +612,85 @@ class ProfileTests(APITestCase):
         """Test listing profiles (should only return own profile)."""
         response = self.client.get('/api/profile/')
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+
+@override_settings(
+    REST_FRAMEWORK={
+        'DEFAULT_AUTHENTICATION_CLASSES': [
+            'rest_framework_simplejwt.authentication.JWTAuthentication',
+        ],
+        'DEFAULT_PERMISSION_CLASSES': [
+            'rest_framework.permissions.IsAuthenticated',
+        ],
+    },
+    STREAM_PREVIEW_FPS=3,
+)
+class StreamEndpointTests(APITestCase):
+    """Test signed-token snapshot/MJPEG stream endpoints."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.user = User.objects.create_user(username='streamuser', email='stream@test.com', password='password123')
+        self.tenant = Tenant.objects.create(name='Stream Tenant')
+        Membership.objects.create(user=self.user, tenant=self.tenant, role='owner')
+        self.camera = Camera.objects.create(
+            tenant=self.tenant,
+            name='Front Door',
+            site='Entry',
+            rtsp_url='0',
+            ai_camera_id='front-door',
+            stream_path='front-door',
+        )
+
+        response = self.client.post('/api/auth/token/', {'username': 'streamuser', 'password': 'password123'}, format='json')
+        self.token = response.data['access']
+        self.client.credentials(
+            HTTP_AUTHORIZATION=f'Bearer {self.token}',
+            HTTP_X_TENANT_ID=str(self.tenant.id),
+        )
+
+    def test_signed_stream_token_endpoint(self):
+        response = self.client.get(f'/api/streams/{self.camera.id}/signed_stream_token/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn('token', response.data)
+        self.assertIn('ttl', response.data)
+
+    @patch('api.views.STREAM_WORKERS.get_latest_jpeg', return_value=(b'jpegdata', 123.4, ''))
+    @patch('api.views.STREAM_WORKERS.ensure_running')
+    def test_snapshot_with_jwt_auth(self, _mock_ensure, _mock_latest):
+        response = self.client.get(f'/api/streams/{self.camera.id}/snapshot/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response['Content-Type'], 'image/jpeg')
+
+    @patch('api.views.STREAM_WORKERS.get_latest_jpeg', return_value=(b'jpegdata', 123.4, ''))
+    @patch('api.views.STREAM_WORKERS.ensure_running')
+    def test_snapshot_with_signed_token(self, _mock_ensure, _mock_latest):
+        tok = self.client.get(f'/api/streams/{self.camera.id}/signed_stream_token/').data['token']
+        self.client.credentials()  # no auth header
+        response = self.client.get(f'/api/streams/{self.camera.id}/snapshot/?token={tok}')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response['Content-Type'], 'image/jpeg')
+
+    @patch('api.views.STREAM_WORKERS.get_latest_jpeg', return_value=(None, None, 'warming'))
+    @patch('api.views.STREAM_WORKERS.ensure_running')
+    def test_snapshot_warming_up(self, _mock_ensure, _mock_latest):
+        response = self.client.get(f'/api/streams/{self.camera.id}/snapshot/')
+        self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+        self.assertEqual(response.data['status'], 'warming_up')
+
+    @patch('api.views.STREAM_WORKERS.add_viewer')
+    @patch('api.views.STREAM_WORKERS.ensure_running')
+    def test_mjpeg_requires_valid_token(self, _mock_ensure, _mock_add_viewer):
+        bad = self.client.get(f'/api/streams/{self.camera.id}/mjpeg/?token=bad')
+        self.assertEqual(bad.status_code, status.HTTP_401_UNAUTHORIZED)
+
+        tok = self.client.get(f'/api/streams/{self.camera.id}/signed_stream_token/').data['token']
+        ok = self.client.get(f'/api/streams/{self.camera.id}/mjpeg/?token={tok}')
+        self.assertEqual(ok.status_code, status.HTTP_200_OK)
+        self.assertIn('multipart/x-mixed-replace', ok['Content-Type'])
+
+    @patch('api.views.STREAM_WORKERS.health_for_cameras', return_value={'1': {'connected': False, 'last_frame_ts': None, 'last_error': '', 'fps_config': 3, 'viewers': 0}})
+    def test_stream_health_endpoint(self, _mock_health):
+        response = self.client.get('/api/streams/health/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn('1', response.data)

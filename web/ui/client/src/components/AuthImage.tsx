@@ -31,6 +31,25 @@ export default function AuthImage({
   useEffect(() => {
     let cancelled = false;
 
+    if (!src || /\/ai\/frame\/\/?$/i.test(src) || src.includes("/ai/frame//")) {
+      setError(true);
+      setObjectUrl(null);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    const hasAuth = !!(
+      localStorage.getItem("accessToken") || sessionStorage.getItem("accessToken")
+    );
+    if (!hasAuth) {
+      setError(true);
+      setObjectUrl(null);
+      return () => {
+        cancelled = true;
+      };
+    }
+
     async function fetchBlob() {
       try {
         const resp = await api.get(src, { responseType: "blob" });

@@ -26,6 +26,26 @@ import logging
 from typing import Dict, List, Optional, Set, Tuple
 
 
+_CLASS_ALIASES: Dict[str, Set[str]] = {
+    "gun": {"gun", "handgun", "pistol", "revolver", "rifle", "shotgun", "firearm"},
+    "knife": {"knife", "dagger", "blade", "machete"},
+    "weapon": {
+        "weapon",
+        "gun",
+        "handgun",
+        "pistol",
+        "revolver",
+        "rifle",
+        "shotgun",
+        "firearm",
+        "knife",
+        "dagger",
+        "blade",
+        "machete",
+    },
+}
+
+
 def resolve_class_filter(
     model,
     class_names: Optional[List[str]] = None,
@@ -81,6 +101,26 @@ def resolve_class_filter(
         for cid, cname in model_names.items():
             lower_map[cname.strip().lower()] = cid
 
+        def _canonical_tokens(name: str) -> Set[str]:
+            token = name.strip().lower().replace("-", " ").replace("_", " ")
+            tokens = {token}
+            for alias_key, alias_tokens in _CLASS_ALIASES.items():
+                if token == alias_key or token in alias_tokens:
+                    tokens.update(alias_tokens)
+                    tokens.add(alias_key)
+            return {t for t in tokens if t}
+
+        def _matches(model_name: str, wanted_name: str) -> bool:
+            model_norm = model_name.strip().lower().replace("-", " ").replace("_", " ")
+            for candidate in _canonical_tokens(wanted_name):
+                if candidate == model_norm:
+                    return True
+                if candidate in model_norm:
+                    return True
+                if model_norm in candidate:
+                    return True
+            return False
+
         matched: Set[int] = set()
         unmatched: List[str] = []
         for wanted in class_names:
@@ -88,7 +128,11 @@ def resolve_class_filter(
             if key in lower_map:
                 matched.add(lower_map[key])
             else:
-                unmatched.append(wanted)
+                fuzzy = [cid for cid, cname in model_names.items() if _matches(cname, wanted)]
+                if fuzzy:
+                    matched.update(fuzzy)
+                else:
+                    unmatched.append(wanted)
 
         if matched:
             if unmatched and logger:
