@@ -18,13 +18,21 @@ interface Entity {
   name: string;
   type: "person" | "pet" | "vehicle";
   group: "household" | "neighbor";
+  notes?: string;
   lastSeen?: string;
   cameras?: string[];
+  cameraIds?: string[];
   imageUrl?: string;
+}
+
+interface CameraOption {
+  id: string;
+  name: string;
 }
 
 export default function Entities() {
   const [entities, setEntities] = useState<Entity[]>([]);
+  const [cameraOptions, setCameraOptions] = useState<CameraOption[]>([]);
 
   const [isLive, setIsLive] = useState(false);
   const [filterType, setFilterType] = useState("all");
@@ -37,6 +45,8 @@ export default function Entities() {
     group: "household" as const,
     notes: "",
     consentObtained: false,
+    restrictToCameras: false,
+    restrictedCameraIds: [] as string[],
   });
 
   // ── File upload state ──────────────────────────────────────
@@ -52,6 +62,16 @@ export default function Entities() {
   // Loading / error state for enrollment
   const [enrolling, setEnrolling] = useState(false);
   const [enrollError, setEnrollError] = useState<string | null>(null);
+  const [viewEntity, setViewEntity] = useState<Entity | null>(null);
+  const [editEntity, setEditEntity] = useState<Entity | null>(null);
+  const [editForm, setEditForm] = useState({
+    name: "",
+    group: "household" as "household" | "neighbor",
+    notes: "",
+    restrictToCameras: false,
+    restrictedCameraIds: [] as string[],
+  });
+  const [savingEdit, setSavingEdit] = useState(false);
 
   // Generate previews when files change
   useEffect(() => {
@@ -131,8 +151,28 @@ export default function Entities() {
           : e.category === "vehicle" ? "vehicle" as const
           : "person" as const),
         group: (e.group as Entity["group"]) ?? "household",
+        notes: e.notes ? String(e.notes) : "",
         lastSeen: e.last_seen ? new Date(String(e.last_seen)).toLocaleString() : undefined,
-        cameras: Array.isArray(e.cameras) ? e.cameras.map(String) : undefined,
+        cameras: Array.isArray(e.cameras)
+          ? e.cameras
+              .map((cam) => {
+                if (cam && typeof cam === "object" && "name" in (cam as Record<string, unknown>)) {
+                  return String((cam as Record<string, unknown>).name ?? "");
+                }
+                return String(cam);
+              })
+              .filter(Boolean)
+          : undefined,
+        cameraIds: Array.isArray(e.cameras)
+          ? e.cameras
+              .map((cam) => {
+                if (cam && typeof cam === "object" && "id" in (cam as Record<string, unknown>)) {
+                  return String((cam as Record<string, unknown>).id ?? "");
+                }
+                return String(cam);
+              })
+              .filter(Boolean)
+          : undefined,
         imageUrl: e.thumbnail_url ? String(e.thumbnail_url) : undefined,
       }));
       setEntities(mapped);
@@ -146,6 +186,37 @@ export default function Entities() {
   useEffect(() => {
     fetchEntities();
   }, [fetchEntities]);
+
+  useEffect(() => {
+    const fetchCameras = async () => {
+      try {
+        const res = await api.get("/cameras/");
+        const data = Array.isArray(res.data) ? res.data : res.data?.results ?? [];
+        const mapped = data
+          .map((cam: Record<string, unknown>) => ({
+            id: String(cam.id ?? ""),
+            name: String(cam.name ?? `Camera ${cam.id ?? ""}`),
+          }))
+          .filter((cam: CameraOption) => Boolean(cam.id));
+        setCameraOptions(mapped);
+      } catch {
+        setCameraOptions([]);
+      }
+    };
+    fetchCameras();
+  }, []);
+
+  const toggleRestrictedCamera = (cameraId: string, checked: boolean) => {
+    setNewEntity((prev) => {
+      const next = new Set(prev.restrictedCameraIds);
+      if (checked) {
+        next.add(cameraId);
+      } else {
+        next.delete(cameraId);
+      }
+      return { ...prev, restrictedCameraIds: Array.from(next) };
+    });
+  };
 
   const filteredEntities = entities.filter(entity => {
     const matchesType = filterType === "all" || entity.type === filterType;
@@ -163,6 +234,11 @@ export default function Entities() {
       fd.append("category", newEntity.type);
       fd.append("group", newEntity.group);
       fd.append("notes", newEntity.notes);
+      if (newEntity.restrictToCameras) {
+        for (const cameraId of newEntity.restrictedCameraIds) {
+          fd.append("camera_ids", cameraId);
+        }
+      }
       for (const file of selectedFiles) {
         fd.append("files", file);
       }
@@ -182,7 +258,15 @@ export default function Entities() {
     stopWebcam();
     setSelectedFiles([]);
     setEnrolling(false);
-    setNewEntity({ name: "", type: "person", group: "household", notes: "", consentObtained: false });
+    setNewEntity({
+      name: "",
+      type: "person",
+      group: "household",
+      notes: "",
+      consentObtained: false,
+      restrictToCameras: false,
+      restrictedCameraIds: [],
+    });
     setIsAddDialogOpen(false);
   };
 
@@ -192,6 +276,38 @@ export default function Entities() {
       await fetchEntities();
     } catch {
       console.error("Failed to delete entity");
+    }
+  };
+
+  const openEditEntity = (entity: Entity) => {
+    setEditEntity(entity);
+    setEditForm({
+      name: entity.name,
+      group: entity.group,
+      notes: entity.notes ?? "",
+      restrictToCameras: Boolean(entity.cameraIds && entity.cameraIds.length > 0),
+      restrictedCameraIds: entity.cameraIds ?? [],
+    });
+  };
+
+  const handleSaveEdit = async () => {
+    if (!editEntity) {
+      return;
+    }
+    setSavingEdit(true);
+    try {
+      await api.patch(`/entities/${editEntity.id}/`, {
+        name: editForm.name,
+        group: editForm.group,
+        notes: editForm.notes,
+        camera_ids: editForm.restrictToCameras ? editForm.restrictedCameraIds : [],
+      });
+      await fetchEntities();
+      setEditEntity(null);
+    } catch {
+      console.error("Failed to update entity");
+    } finally {
+      setSavingEdit(false);
     }
   };
 
@@ -364,6 +480,45 @@ export default function Entities() {
                 </Select>
               </div>
 
+              <div className="space-y-3">
+                <div className="flex items-center space-x-2">
+                  <Checkbox
+                    id="restrict-cameras"
+                    checked={newEntity.restrictToCameras}
+                    onCheckedChange={(checked) => {
+                      const enabled = checked === true;
+                      setNewEntity((prev) => ({
+                        ...prev,
+                        restrictToCameras: enabled,
+                        restrictedCameraIds: enabled ? prev.restrictedCameraIds : [],
+                      }));
+                    }}
+                  />
+                  <Label htmlFor="restrict-cameras" className="cursor-pointer">
+                    Restrict matching to specific cameras
+                  </Label>
+                </div>
+                {newEntity.restrictToCameras && (
+                  <div className="border rounded-md p-3 max-h-40 overflow-auto space-y-2">
+                    {cameraOptions.length === 0 && (
+                      <p className="text-xs text-muted-foreground">No cameras available.</p>
+                    )}
+                    {cameraOptions.map((camera) => (
+                      <div key={camera.id} className="flex items-center space-x-2">
+                        <Checkbox
+                          id={`camera-${camera.id}`}
+                          checked={newEntity.restrictedCameraIds.includes(camera.id)}
+                          onCheckedChange={(checked) => toggleRestrictedCamera(camera.id, checked === true)}
+                        />
+                        <Label htmlFor={`camera-${camera.id}`} className="cursor-pointer text-sm">
+                          {camera.name}
+                        </Label>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
               <div className="flex items-start space-x-2 pt-2">
                 <Checkbox
                   id="consent"
@@ -377,7 +532,21 @@ export default function Entities() {
               </div>
             </div>
             <DialogFooter>
-              <Button variant="outline" onClick={() => { stopWebcam(); setSelectedFiles([]); setEnrollError(null); setIsAddDialogOpen(false); }}>Cancel</Button>
+              <Button variant="outline" onClick={() => {
+                stopWebcam();
+                setSelectedFiles([]);
+                setEnrollError(null);
+                setNewEntity({
+                  name: "",
+                  type: "person",
+                  group: "household",
+                  notes: "",
+                  consentObtained: false,
+                  restrictToCameras: false,
+                  restrictedCameraIds: [],
+                });
+                setIsAddDialogOpen(false);
+              }}>Cancel</Button>
               <Button onClick={handleAddEntity} disabled={!newEntity.name || !newEntity.consentObtained || enrolling} data-testid="button-save-entity">
                 {enrolling ? "Enrolling…" : "Save Entity"}
               </Button>
@@ -442,11 +611,117 @@ export default function Entities() {
                 getTypeIcon={getTypeIcon}
                 getGroupBadge={getGroupBadge}
                 onDelete={handleDelete}
+                onView={setViewEntity}
+                onEdit={openEditEntity}
               />
             ))}
           </div>
         )}
       </Card>
+
+      <Dialog open={Boolean(viewEntity)} onOpenChange={(open) => !open && setViewEntity(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Entity Details</DialogTitle>
+          </DialogHeader>
+          {viewEntity && (
+            <div className="space-y-2 text-sm">
+              <p><strong>Name:</strong> {viewEntity.name}</p>
+              <p><strong>Type:</strong> {viewEntity.type}</p>
+              <p><strong>Group:</strong> {viewEntity.group}</p>
+              <p><strong>Last Seen:</strong> {viewEntity.lastSeen ?? "Never"}</p>
+              <p><strong>Cameras:</strong> {viewEntity.cameras && viewEntity.cameras.length > 0 ? viewEntity.cameras.join(", ") : "All cameras"}</p>
+              {viewEntity.notes && <p><strong>Notes:</strong> {viewEntity.notes}</p>}
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={Boolean(editEntity)} onOpenChange={(open) => !open && setEditEntity(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Edit Entity</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4 py-2">
+            <div className="space-y-2">
+              <Label htmlFor="edit-entity-name">Display Name</Label>
+              <Input
+                id="edit-entity-name"
+                value={editForm.name}
+                onChange={(e) => setEditForm((prev) => ({ ...prev, name: e.target.value }))}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="edit-entity-group">Group</Label>
+              <Select
+                value={editForm.group}
+                onValueChange={(value: "household" | "neighbor") => setEditForm((prev) => ({ ...prev, group: value }))}
+              >
+                <SelectTrigger id="edit-entity-group">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="household">Household</SelectItem>
+                  <SelectItem value="neighbor">Neighbor</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="edit-entity-notes">Notes</Label>
+              <Textarea
+                id="edit-entity-notes"
+                value={editForm.notes}
+                onChange={(e) => setEditForm((prev) => ({ ...prev, notes: e.target.value }))}
+              />
+            </div>
+            <div className="space-y-3">
+              <div className="flex items-center space-x-2">
+                <Checkbox
+                  id="edit-restrict-cameras"
+                  checked={editForm.restrictToCameras}
+                  onCheckedChange={(checked) => {
+                    const enabled = checked === true;
+                    setEditForm((prev) => ({
+                      ...prev,
+                      restrictToCameras: enabled,
+                      restrictedCameraIds: enabled ? prev.restrictedCameraIds : [],
+                    }));
+                  }}
+                />
+                <Label htmlFor="edit-restrict-cameras">Restrict to specific cameras</Label>
+              </div>
+              {editForm.restrictToCameras && (
+                <div className="border rounded-md p-3 max-h-40 overflow-auto space-y-2">
+                  {cameraOptions.map((camera) => (
+                    <div key={camera.id} className="flex items-center space-x-2">
+                      <Checkbox
+                        id={`edit-camera-${camera.id}`}
+                        checked={editForm.restrictedCameraIds.includes(camera.id)}
+                        onCheckedChange={(checked) => {
+                          const yes = checked === true;
+                          setEditForm((prev) => {
+                            const next = new Set(prev.restrictedCameraIds);
+                            if (yes) next.add(camera.id);
+                            else next.delete(camera.id);
+                            return { ...prev, restrictedCameraIds: Array.from(next) };
+                          });
+                        }}
+                      />
+                      <Label htmlFor={`edit-camera-${camera.id}`}>{camera.name}</Label>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+            <DialogFooter>
+              <Button variant="outline" onClick={() => setEditEntity(null)}>Cancel</Button>
+              <Button onClick={handleSaveEdit} disabled={!editForm.name || savingEdit}>
+                {savingEdit ? "Saving..." : "Save Changes"}
+              </Button>
+            </DialogFooter>
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
@@ -457,11 +732,15 @@ function EntityCard({
   getTypeIcon,
   getGroupBadge,
   onDelete,
+  onView,
+  onEdit,
 }: {
   entity: Entity;
   getTypeIcon: (type: string) => React.ReactNode;
   getGroupBadge: (group: string) => React.ReactNode;
   onDelete: (id: string) => void;
+  onView: (entity: Entity) => void;
+  onEdit: (entity: Entity) => void;
 }) {
   const thumbSrc = useAuthImage(entity.imageUrl);
 
@@ -489,11 +768,23 @@ function EntityCard({
         </div>
       </div>
       <div className="flex gap-2 mt-4">
-        <Button size="sm" variant="outline" className="flex-1" data-testid={`button-view-${entity.id}`}>
+        <Button
+          size="sm"
+          variant="outline"
+          className="flex-1"
+          data-testid={`button-view-${entity.id}`}
+          onClick={() => onView(entity)}
+        >
           <Eye className="w-3 h-3 mr-1" />
           View
         </Button>
-        <Button size="sm" variant="outline" className="flex-1" data-testid={`button-edit-${entity.id}`}>
+        <Button
+          size="sm"
+          variant="outline"
+          className="flex-1"
+          data-testid={`button-edit-${entity.id}`}
+          onClick={() => onEdit(entity)}
+        >
           <Edit className="w-3 h-3 mr-1" />
           Edit
         </Button>

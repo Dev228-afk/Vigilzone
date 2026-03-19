@@ -3,6 +3,7 @@ import logging
 import hashlib
 import hmac
 import time
+from typing import List
 from rest_framework import viewsets, permissions, status
 from rest_framework.exceptions import PermissionDenied, NotAuthenticated
 from rest_framework.decorators import action, api_view, permission_classes
@@ -739,6 +740,7 @@ class KnownEntityViewSet(TenantScopedViewSet):
                         p = f"/ai{p}"
                     entity.thumbnail_url = p
                 entity.save(update_fields=["ai_entity_id", "thumbnail_url", "updated_at"])
+                self._sync_entity_to_ai(entity)
         except Exception as exc:
             import logging
             logging.getLogger(__name__).warning("AI enrollment failed: %s", exc)
@@ -746,6 +748,7 @@ class KnownEntityViewSet(TenantScopedViewSet):
 
         headers = self.get_success_headers(serializer.data)
         result = self.get_serializer(entity).data
+        result = self._merge_ai_identity_state(result)
         # Include AI enrollment details for the frontend
         result["ai_enrollment"] = {
             "embeddings_stored": ai_data.get("embeddings_stored", 0),
@@ -753,6 +756,101 @@ class KnownEntityViewSet(TenantScopedViewSet):
             "failed_images": ai_data.get("failed_images", []),
         }
         return Response(result, status=status.HTTP_201_CREATED, headers=headers)
+
+    def list(self, request, *args, **kwargs):
+        response = super().list(request, *args, **kwargs)
+        ai_map = self._fetch_ai_entity_state_map()
+        if isinstance(response.data, list):
+            response.data = [self._merge_ai_identity_state(item, ai_map=ai_map) for item in response.data]
+        elif isinstance(response.data, dict) and isinstance(response.data.get("results"), list):
+            response.data["results"] = [
+                self._merge_ai_identity_state(item, ai_map=ai_map)
+                for item in response.data["results"]
+            ]
+        return response
+
+    def retrieve(self, request, *args, **kwargs):
+        response = super().retrieve(request, *args, **kwargs)
+        if isinstance(response.data, dict):
+            response.data = self._merge_ai_identity_state(response.data, ai_map=self._fetch_ai_entity_state_map())
+        return response
+
+    def update(self, request, *args, **kwargs):
+        partial = kwargs.pop("partial", False)
+        instance = self.get_object()
+        serializer = self.get_serializer(instance, data=request.data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+        entity = serializer.save()
+        self._sync_entity_to_ai(entity)
+        return Response(self.get_serializer(entity).data)
+
+    def partial_update(self, request, *args, **kwargs):
+        kwargs["partial"] = True
+        return self.update(request, *args, **kwargs)
+
+    def _allowed_ai_camera_ids(self, entity) -> List[str]:
+        allowed = []
+        for cam in entity.cameras.all():
+            cam_id = (cam.ai_camera_id or "").strip() or str(cam.id)
+            allowed.append(cam_id)
+        return sorted(set(allowed))
+
+    def _sync_entity_to_ai(self, entity):
+        if not entity.ai_entity_id:
+            return
+
+        import requests as http_client
+
+        ai_base = os.getenv("AI_BASE_INTERNAL", "http://127.0.0.1:8080")
+        payload = {
+            "name": entity.name,
+            "metadata": {
+                "allowed_camera_ids": self._allowed_ai_camera_ids(entity),
+            },
+        }
+        try:
+            http_client.put(
+                f"{ai_base}/entities/{entity.ai_entity_id}",
+                json=payload,
+                timeout=10,
+            )
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("AI entity metadata sync failed: %s", exc)
+
+    def _fetch_ai_entity_state_map(self):
+        import requests as http_client
+
+        ai_base = os.getenv("AI_BASE_INTERNAL", "http://127.0.0.1:8080")
+        try:
+            resp = http_client.get(f"{ai_base}/entities", timeout=5)
+            if resp.status_code != 200:
+                return {}
+            raw = resp.json()
+            entities = raw if isinstance(raw, list) else []
+            return {
+                str(item.get("entity_id") or item.get("id") or ""): item
+                for item in entities
+                if isinstance(item, dict)
+            }
+        except Exception:
+            return {}
+
+    def _merge_ai_identity_state(self, payload: dict, ai_map=None):
+        """Overlay AI-managed identity state (last_seen/last_camera_id) in API responses."""
+        ai_entity_id = str(payload.get("ai_entity_id") or "").strip()
+        if not ai_entity_id:
+            return payload
+
+        by_id = ai_map if isinstance(ai_map, dict) else self._fetch_ai_entity_state_map()
+        ai_item = by_id.get(ai_entity_id)
+        if not ai_item:
+            return payload
+        if ai_item.get("last_seen"):
+            payload["last_seen"] = ai_item.get("last_seen")
+        if ai_item.get("last_camera_id"):
+            payload["last_camera_id"] = ai_item.get("last_camera_id")
+        return payload
 
     def perform_destroy(self, instance):
         """Delete from AI then from Django."""
@@ -980,6 +1078,84 @@ def streams_snapshot(request, camera_id):
         },
         status=status.HTTP_503_SERVICE_UNAVAILABLE,
     )
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def community_activity(request):
+    """Unified tenant timeline for dashboard/community activity cards."""
+    tenant = get_active_tenant(request)
+    if not assert_member(request, tenant):
+        raise PermissionDenied()
+
+    limit = min(int(request.query_params.get("limit", 20)), 100)
+    events = []
+
+    for log in AuditLog.objects.filter(tenant=tenant).select_related("actor").order_by("-created_at")[:limit]:
+        actor_name = log.actor.username if log.actor else "System"
+        events.append({
+            "type": "audit",
+            "title": log.action.replace(".", " ").replace("_", " ").title(),
+            "description": log.meta.get("message") if isinstance(log.meta, dict) else "",
+            "timestamp": log.created_at,
+            "actor": actor_name,
+            "related_type": log.target_type,
+            "related_id": log.target_id,
+        })
+
+    for incident in Incident.objects.filter(tenant=tenant).select_related("camera").order_by("-updated_at")[:limit]:
+        status_label = incident.get_status_display()
+        events.append({
+            "type": "incident",
+            "title": f"Incident {incident.get_type_display()} {status_label}",
+            "description": f"Camera: {incident.camera.name}",
+            "timestamp": incident.updated_at,
+            "actor": None,
+            "related_type": "incident",
+            "related_id": str(incident.id),
+        })
+
+    for entity in KnownEntity.objects.filter(tenant=tenant).order_by("-updated_at")[:limit]:
+        events.append({
+            "type": "entity",
+            "title": f"Entity updated: {entity.name}",
+            "description": f"Category: {entity.category}",
+            "timestamp": entity.updated_at,
+            "actor": None,
+            "related_type": "entity",
+            "related_id": str(entity.id),
+        })
+
+    for camera in Camera.objects.filter(tenant=tenant).order_by("-updated_at")[:limit]:
+        events.append({
+            "type": "camera",
+            "title": f"Camera updated: {camera.name}",
+            "description": f"Status: {camera.status}",
+            "timestamp": camera.updated_at,
+            "actor": None,
+            "related_type": "camera",
+            "related_id": str(camera.id),
+        })
+
+    for inv in Invitation.objects.filter(tenant=tenant).select_related("invited_by").order_by("-updated_at")[:limit]:
+        inviter = inv.invited_by.username if inv.invited_by else "System"
+        events.append({
+            "type": "invitation",
+            "title": f"Invitation {inv.status}",
+            "description": f"{inv.email} ({inv.role})",
+            "timestamp": inv.updated_at,
+            "actor": inviter,
+            "related_type": "invitation",
+            "related_id": str(inv.id),
+        })
+
+    events.sort(key=lambda item: item["timestamp"], reverse=True)
+    payload = []
+    for item in events[:limit]:
+        payload.append({
+            **item,
+            "timestamp": item["timestamp"].isoformat() if item["timestamp"] else None,
+        })
+    return Response(payload)
 
 
 def _mjpeg_generator(camera_id: int, fps: int):

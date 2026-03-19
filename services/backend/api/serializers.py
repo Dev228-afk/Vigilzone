@@ -185,14 +185,49 @@ class ProfileSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "user", "username", "email"]
 
 class KnownEntitySerializer(serializers.ModelSerializer):
+    camera_ids = serializers.PrimaryKeyRelatedField(
+        queryset=Camera.objects.all(),
+        source="cameras",
+        many=True,
+        required=False,
+        write_only=True,
+    )
+    cameras = serializers.SerializerMethodField(read_only=True)
+    last_camera_id = serializers.IntegerField(source="last_camera.id", read_only=True)
+
     class Meta:
         model = KnownEntity
         fields = [
             "id", "name", "category", "group", "notes",
-            "ai_entity_id", "thumbnail_url", "last_seen",
+            "camera_ids", "cameras",
+            "ai_entity_id", "thumbnail_url", "last_seen", "last_camera_id",
             "created_at", "updated_at", "tenant",
         ]
         read_only_fields = ["id", "ai_entity_id", "thumbnail_url", "last_seen", "created_at", "updated_at", "tenant"]
+
+    def get_cameras(self, obj):
+        return [
+            {
+                "id": cam.id,
+                "name": cam.name,
+                "ai_camera_id": cam.ai_camera_id,
+            }
+            for cam in obj.cameras.all().order_by("name")
+        ]
+
+    def validate_camera_ids(self, value):
+        request = self.context.get("request")
+        tenant = getattr(request, "tenant", None) if request else None
+        if tenant is None and self.instance is not None:
+            tenant = self.instance.tenant
+        if tenant is None:
+            return value
+        invalid = [cam.id for cam in value if cam.tenant_id != tenant.id]
+        if invalid:
+            raise serializers.ValidationError(
+                f"Cameras not in current tenant: {invalid}"
+            )
+        return value
 
 
 class InvitationCreateSerializer(serializers.ModelSerializer):

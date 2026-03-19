@@ -4,14 +4,7 @@ import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { api } from "@/lib/api";
 import AuthedMjpeg from "@/components/AuthedMjpeg";
-
-interface StreamHealth {
-  connected: boolean;
-  last_frame_ts: number | null;
-  last_error: string;
-  fps_config: number;
-  viewers: number;
-}
+import { useMediamtxHealth } from "@/hooks/use-mediamtx-health";
 
 interface CameraFeedProps {
   name: string;
@@ -21,7 +14,15 @@ interface CameraFeedProps {
   cameraId?: number;
   /** Static image or API snapshot URL (legacy fallback) */
   imageUrl?: string;
-  health?: StreamHealth;
+  /** WebRTC iframe URL — takes priority over imageUrl when provided */
+  streamUrl?: string;
+  health?: {
+    connected: boolean;
+    last_frame_ts: number | null;
+    last_error: string;
+    fps_config: number;
+    viewers: number;
+  };
   timestamp?: string;
 }
 
@@ -42,16 +43,18 @@ function normalizeForAxios(url: string): string {
   return url;
 }
 
-export default function CameraFeed({ name, location, status, cameraId, imageUrl, health, timestamp }: CameraFeedProps) {
+export default function CameraFeed({ name, location, status, cameraId, imageUrl, streamUrl, health, timestamp }: CameraFeedProps) {
   const [blobSrc, setBlobSrc] = useState<string | null>(null);
   const [error, setError] = useState(false);
+  const [iframeError, setIframeError] = useState(false);
   const prevBlobRef = useRef<string | null>(null);
+  const { reachable: mtxReachable, checked: mtxChecked } = useMediamtxHealth();
 
   const needsAuth = imageUrl ? isApiUrl(imageUrl) : false;
 
-  // Legacy blob-fetch path used for fallback snapshots/images.
+  // Legacy blob-fetch path (only used when streamUrl is absent)
   useEffect(() => {
-    if (!imageUrl || !needsAuth) {
+    if (streamUrl || !imageUrl || !needsAuth) {
       setBlobSrc(null);
       setError(false);
       return;
@@ -76,7 +79,7 @@ export default function CameraFeed({ name, location, status, cameraId, imageUrl,
     return () => {
       cancelled = true;
     };
-  }, [imageUrl, needsAuth]);
+  }, [imageUrl, needsAuth, streamUrl]);
 
   useEffect(() => {
     return () => {
@@ -86,9 +89,23 @@ export default function CameraFeed({ name, location, status, cameraId, imageUrl,
 
   const displaySrc = needsAuth ? blobSrc : imageUrl;
 
-  /* ── Render priority: MJPEG > imageUrl > placeholder ── */
+  /* ── Render priority: streamUrl (WebRTC iframe) > MJPEG > imageUrl > placeholder ── */
   const renderMedia = () => {
-    if (cameraId && status === "active") {
+    // WebRTC iframe — only attempt when MediaMTX is confirmed reachable
+    if (streamUrl && !iframeError && mtxChecked && mtxReachable) {
+      return (
+        <iframe
+          src={streamUrl}
+          title={`Live feed — ${name}`}
+          className="w-full h-full border-0"
+          allow="autoplay; encrypted-media"
+          sandbox="allow-scripts allow-same-origin"
+          onError={() => setIframeError(true)}
+        />
+      );
+    }
+    // MJPEG fallback — when WebRTC fails or MediaMTX unreachable, but we have a camera ID
+    if ((iframeError || (mtxChecked && !mtxReachable)) && cameraId) {
       return (
         <AuthedMjpeg
           cameraId={cameraId}
@@ -112,7 +129,6 @@ export default function CameraFeed({ name, location, status, cameraId, imageUrl,
         />
       );
     }
-
     // Image fallback
     if (displaySrc && !error) {
       return (
@@ -128,7 +144,7 @@ export default function CameraFeed({ name, location, status, cameraId, imageUrl,
     return (
       <div className="w-full h-full flex items-center justify-center">
         <Video className="w-12 h-12 text-muted-foreground" />
-        {error && (
+        {(error || iframeError) && (
           <span className="absolute bottom-2 left-2 text-xs text-destructive">Feed unavailable</span>
         )}
       </div>

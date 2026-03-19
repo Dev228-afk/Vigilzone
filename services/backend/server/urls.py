@@ -5,6 +5,7 @@ from api.views import (
     TenantViewSet, MembershipViewSet, CameraViewSet, IncidentViewSet,
     DetectionViewSet, AlertViewSet, AuditLogViewSet, ProfileViewSet, auth_context, InvitationViewSet,
     dashboard_summary, KnownEntityViewSet,
+    community_activity,
     notification_settings, notification_test, notification_register_device,
     debug_system,
     streams_list, streams_detail, streams_snapshot, streams_mjpeg, streams_signed_token, streams_health,
@@ -38,6 +39,7 @@ urlpatterns += [
     path("api/auth/register/", RegisterView.as_view(), name="register"),
     path("api/auth/context/", auth_context),
     path("api/dashboard/summary/", dashboard_summary, name="dashboard-summary"),
+    path("api/community/activity/", community_activity, name="community-activity"),
 ]
 
 # Notifications (§4)

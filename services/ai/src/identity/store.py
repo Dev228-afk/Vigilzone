@@ -146,6 +146,55 @@ class EntityStore:
             row = conn.execute("SELECT * FROM entities WHERE entity_id = ?", (entity_id,)).fetchone()
         return self._row_to_dict(row) if row else None
 
+    def update_entity(
+        self,
+        entity_id: str,
+        *,
+        name: Optional[str] = None,
+        role: Optional[str] = None,
+        category: Optional[str] = None,
+        metadata: Optional[Dict] = None,
+    ) -> Optional[Dict]:
+        """Update mutable entity fields and merge metadata."""
+        entity = self.get_entity(entity_id)
+        if not entity:
+            return None
+
+        next_name = name if isinstance(name, str) and name.strip() else entity.get("name")
+        next_role = role if isinstance(role, str) and role.strip() else entity.get("role")
+        next_category = category if isinstance(category, str) and category.strip() else entity.get("category")
+        next_meta = dict(entity.get("metadata") or {})
+        if isinstance(metadata, dict):
+            next_meta.update(metadata)
+
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE entities SET name = ?, role = ?, category = ?, metadata_json = ? WHERE entity_id = ?",
+                (
+                    str(next_name),
+                    str(next_role),
+                    str(next_category),
+                    json.dumps(next_meta),
+                    entity_id,
+                ),
+            )
+        return self.get_entity(entity_id)
+
+    def record_sighting(self, entity_id: str, camera_id: str):
+        """Persist last_seen and last_camera_id in metadata for matched entities."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        entity = self.get_entity(entity_id)
+        if not entity:
+            return
+        metadata = dict(entity.get("metadata") or {})
+        metadata["last_seen"] = now_iso
+        metadata["last_camera_id"] = str(camera_id)
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE entities SET metadata_json = ? WHERE entity_id = ?",
+                (json.dumps(metadata), entity_id),
+            )
+
     def get_all_embeddings(self, modality: str) -> Tuple[List[str], Optional[np.ndarray]]:
         """
         Return ``(entity_ids, matrix_float32)`` for a given modality.

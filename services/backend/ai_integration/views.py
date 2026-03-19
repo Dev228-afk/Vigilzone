@@ -86,10 +86,13 @@ def ai_entities(request):
     return proxy_request(request, "/entities")
 
 
-@api_view(["DELETE"])
+@api_view(["PUT", "DELETE"])
 @permission_classes([IsAuthenticated])
 def ai_entity_detail(request, entity_id):
-    """DELETE /api/ai/entities/<entity_id>/ → remove entity."""
+    """
+    PUT    /api/ai/entities/<entity_id>/ → update AI entity metadata.
+    DELETE /api/ai/entities/<entity_id>/ → remove entity.
+    """
     return proxy_request(request, f"/entities/{entity_id}")
 
 
