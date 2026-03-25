@@ -10,8 +10,9 @@ User = get_user_model()
 
 # Feature flag — when True a personal Tenant + owner Membership are created
 # alongside the new user so they never get stuck on "Select community".
+# Disabled to allow new users to select from pending community invites instead.
 AUTO_CREATE_TENANT_ON_REGISTER = getattr(
-    settings, "AUTO_CREATE_TENANT_ON_REGISTER", True
+    settings, "AUTO_CREATE_TENANT_ON_REGISTER", False
 )
 
 

@@ -27,6 +27,7 @@ from .serializers import (
     ProfileSerializer, InvitationCreateSerializer, PendingInvitationSerializer,
     KnownEntitySerializer, CameraZoneSerializer, NotificationChannelSerializer,
 )
+from .notification_service import NotificationService
 
 class IsAuthenticatedOrReadOnly(permissions.IsAuthenticatedOrReadOnly):
     pass
@@ -378,6 +379,15 @@ class IncidentViewSet(TenantScopedViewSet):
     serializer_class = IncidentSerializer
     permission_classes = [permissions.IsAuthenticated]
 
+    def perform_create(self, serializer):
+        """Create incident. Notifications are sent automatically via Django signal."""
+        tenant = get_active_tenant(self.request)
+        if not assert_member(self.request, tenant):
+            raise PermissionDenied("Not a member of this tenant.")
+        
+        # Save the incident - the post_save signal will broadcast notifications
+        serializer.save(tenant=tenant)
+
     def get_queryset(self):
         qs = super().get_queryset().order_by("-started_at")
         status_filter = self.request.query_params.get("status")
@@ -589,8 +599,9 @@ def auth_context(request):
 
     # Demo-safety net: if a user has no tenant memberships (e.g., created via admin/import),
     # create a personal community on first login so they never hit a dead-end.
+    # Disabled to allow new users to select from pending community invites instead.
     auto_create_first_login = getattr(
-        settings, "AUTO_CREATE_TENANT_ON_FIRST_LOGIN", True
+        settings, "AUTO_CREATE_TENANT_ON_FIRST_LOGIN", False
     )
     if tenant is None and auto_create_first_login:
         memberships_qs = Membership.objects.select_related("tenant").filter(user=request.user)
@@ -1296,39 +1307,194 @@ def notification_register_device(request):
 
 
 def dispatch_notifications(incident: Incident):
-    """Fire email/push for an incident that meets severity threshold.
-    Called from webhook receiver after incident create/escalate."""
-    from django.core.mail import send_mail as django_send_mail
+    """Fire notifications for an incident.
+    Now broadcasts to all tenant members via WebSocket + creates alerts."""
+    NotificationService.broadcast_incident(incident)
 
-    try:
-        channel = NotificationChannel.objects.get(tenant=incident.tenant)
-    except NotificationChannel.DoesNotExist:
-        return
-    if incident.severity < channel.min_severity_int():
-        return
 
-    subject = f"[VigilZone] {incident.get_type_display()} — Severity {incident.severity}"
-    body = (
-        f"Incident #{incident.pk}\n"
-        f"Type: {incident.get_type_display()}\n"
-        f"Camera: {incident.camera.name}\n"
-        f"Severity: {incident.severity}/5\n"
-        f"Time: {incident.started_at}\n"
-        f"Details: {incident.details.get('message', '')}"
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# §5  REAL-TIME NOTIFICATION API
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def notifications_list(request):
+    """
+    GET /api/notifications/ — List notifications for current user.
+    
+    Query params:
+    - limit: Max notifications to return (default 50, max 100)
+    - offset: Pagination offset
+    - unread_only: If 'true', only return unread notifications
+    """
+    from django.db.models import Count, Q
+    
+    tenant = get_active_tenant(request)
+    if not assert_member(request, tenant):
+        raise PermissionDenied()
+    
+    limit = min(int(request.query_params.get("limit", 50)), 100)
+    offset = int(request.query_params.get("offset", 0))
+    unread_only = request.query_params.get("unread_only", "false").lower() == "true"
+    
+    # Get incidents for this tenant
+    incidents_qs = Incident.objects.filter(tenant=tenant)
+    
+    # Get alerts for these incidents
+    alerts_qs = Alert.objects.filter(
+        incident__in=incidents_qs
+    ).select_related("incident", "incident__camera").order_by("-created_at")
+    
+    if unread_only:
+        alerts_qs = alerts_qs.filter(delivered_at__isnull=True)
+    
+    total_count = alerts_qs.count()
+    alerts = list(alerts_qs[offset:offset + limit])
+    
+    notifications = []
+    for alert in alerts:
+        payload = alert.payload or {}
+        notifications.append({
+            "id": alert.id,
+            "type": "incident",
+            "title": payload.get("title", f"Incident #{alert.incident_id}"),
+            "message": payload.get("message", ""),
+            "data": payload.get("data", {}),
+            "is_read": alert.delivered_at is not None,
+            "created_at": alert.created_at.isoformat(),
+            "incident_id": alert.incident_id,
+            "incident_type": alert.incident.get_type_display() if alert.incident else None,
+            "severity": alert.incident.severity if alert.incident else None,
+            "camera_name": alert.incident.camera.name if alert.incident and alert.incident.camera else None,
+        })
+    
+    return Response({
+        "notifications": notifications,
+        "total": total_count,
+        "limit": limit,
+        "offset": offset,
+    })
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def notifications_mark_read(request):
+    """
+    POST /api/notifications/mark-read/ — Mark notifications as read.
+    
+    Body: { "notification_ids": [1, 2, 3] } or { "mark_all": true }
+    """
+    tenant = get_active_tenant(request)
+    if not assert_member(request, tenant):
+        raise PermissionDenied()
+    
+    notification_ids = request.data.get("notification_ids", [])
+    mark_all = request.data.get("mark_all", False)
+    
+    if mark_all:
+        # Mark all unread notifications for this tenant as read
+        incidents_qs = Incident.objects.filter(tenant=tenant)
+        updated = Alert.objects.filter(
+            incident__in=incidents_qs,
+            delivered_at__isnull=True
+        ).update(delivered_at=timezone.now())
+    elif notification_ids:
+        # Mark specific notifications as read
+        incidents_qs = Incident.objects.filter(tenant=tenant)
+        updated = Alert.objects.filter(
+            id__in=notification_ids,
+            incident__in=incidents_qs,
+        ).update(delivered_at=timezone.now())
+    else:
+        return Response({"error": "Provide notification_ids or mark_all=true"}, status=status.HTTP_400_BAD_REQUEST)
+    
+    return Response({
+        "marked_read": updated,
+        "success": True,
+    })
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def notifications_unread_count(request):
+    """
+    GET /api/notifications/unread-count/ — Get unread notification count.
+    """
+    tenant = get_active_tenant(request)
+    if not assert_member(request, tenant):
+        raise PermissionDenied()
+    
+    incidents_qs = Incident.objects.filter(tenant=tenant)
+    count = Alert.objects.filter(
+        incident__in=incidents_qs,
+        delivered_at__isnull=True
+    ).count()
+    
+    return Response({"unread_count": count})
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def notifications_broadcast(request):
+    """
+    POST /api/notifications/broadcast/ — Send a broadcast message to all tenant members.
+    Requires owner or admin role.
+    """
+    tenant = get_active_tenant(request)
+    if not assert_member(request, tenant):
+        raise PermissionDenied()
+    
+    assert_role_in(request, tenant, allowed_roles={"owner", "admin"})
+    
+    title = request.data.get("title", "").strip()
+    message = request.data.get("message", "").strip()
+    notification_type = request.data.get("type", "broadcast")
+    
+    if not title or not message:
+        return Response({"error": "title and message are required"}, status=status.HTTP_400_BAD_REQUEST)
+    
+    result = NotificationService.broadcast_message(
+        tenant_id=tenant.id,
+        title=title,
+        message=message,
+        notification_type=notification_type,
+        data=request.data.get("data", {})
     )
-    # Email
-    if channel.email_enabled and channel.email_recipients:
-        try:
-            django_send_mail(
-                subject=subject,
-                message=body,
-                from_email=None,
-                recipient_list=channel.email_recipients,
-            )
-        except Exception as exc:
-            logger.warning("Notification email failed: %s", exc)
+    
+    return Response({
+        "success": True,
+        "result": result,
+    })
 
-    # TODO: FCM push when service account configured
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def notifications_test_websocket(request):
+    """
+    POST /api/notifications/test-websocket/ — Send a test WebSocket notification.
+    Useful for testing real-time notifications are working.
+    """
+    tenant = get_active_tenant(request)
+    if not assert_member(request, tenant):
+        raise PermissionDenied()
+    
+    result = NotificationService.broadcast_message(
+        tenant_id=tenant.id,
+        title="🔔 Test Notification",
+        message="This is a test notification to verify WebSocket connectivity.",
+        notification_type="test",
+        data={
+            "test": True,
+            "user_id": request.user.id,
+            "username": request.user.username,
+        }
+    )
+    
+    return Response({
+        "success": True,
+        "result": result,
+        "message": "Test notification sent to all connected clients"
+    })
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

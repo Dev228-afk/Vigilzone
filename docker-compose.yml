@@ -1,6 +1,17 @@
 version: "3.9"
 
 services:
+  # ── Redis for Django Channels ────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - vigilzone
+    restart: unless-stopped
+
   # ── Django REST API ─────────────────────────────────────────
   backend:
     build:
@@ -17,10 +28,13 @@ services:
       - AI_WEBHOOK_SECRET=${AI_WEBHOOK_SECRET:-vigilzone-webhook-secret}
       - AI_WEBHOOK_TOKEN=${AI_WEBHOOK_TOKEN:-}
       - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-http://backend:8000}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
     volumes:
       - backend-db:/app/db
     depends_on:
       - ai
+      - redis
     networks:
       - vigilzone
     restart: unless-stopped
@@ -93,6 +107,7 @@ volumes:
   backend-db:
   ai-evidence:
   ai-data:
+  redis-data:
 
 networks:
   vigilzone:

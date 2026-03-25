@@ -35,28 +35,32 @@ export default function Register() {
     try {
       setLoading(true);
 
-      // Register the user (backend auto-creates tenant + membership)
+      // Register the user (no auto-creation of tenant - user selects from pending invites)
       await api.post("/auth/register/", { email, username, password });
 
       // Auto-login immediately so the user never has to re-enter credentials
       await login(username, password);
 
-      // Fetch auth context to pick up the auto-created tenant
+      // Fetch auth context to check for existing tenant or memberships
       const { data: ctx } = await api.get("/auth/context/");
 
-      if (ctx.tenant) {
-        setSelectedTenantId(String(ctx.tenant.id));
+      // Check for existing memberships (e.g., from accepted invites)
+      const { data: myTenants } = await api.get("/tenants/mine/");
+
+      if (myTenants && myTenants.length > 0) {
+        // User has memberships (e.g., accepted an invite during registration)
+        setSelectedTenantId(String(myTenants[0].id));
         queryClient.invalidateQueries();
         toast({
           title: "Welcome to VigilZone!",
-          description: "Your community is ready.",
+          description: "You have joined a community.",
         });
         setLocation("/dashboard");
       } else {
-        // Edge case: tenant wasn't auto-created (flag disabled)
+        // No memberships yet - go to select community page to accept invites
         toast({
           title: "Account created",
-          description: "Please select or create a community.",
+          description: "Please select or create a community to get started.",
         });
         setLocation("/select-community");
       }

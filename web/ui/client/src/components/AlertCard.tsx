@@ -1,9 +1,8 @@
-import { Flame, UserX, AlertTriangle, Car } from "lucide-react";
+import { Flame, UserX, AlertTriangle, Car, HelpCircle } from "lucide-react";
 import { Card } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
 
 interface AlertCardProps {
-  type: "fire" | "intrusion" | "violence" | "crash";
+  type: "fire" | "intrusion" | "violence" | "crash" | "robbery" | "stranger" | "other" | string;
   location: string;
   time: string;
   entity?: string;
@@ -11,7 +10,7 @@ interface AlertCardProps {
   onClick?: () => void;
 }
 
-const alertConfig = {
+const alertConfig: Record<string, { icon: React.ComponentType<{ className?: string }>; label: string; color: string }> = {
   fire: {
     icon: Flame,
     label: "Fire",
@@ -32,10 +31,31 @@ const alertConfig = {
     label: "Crash",
     color: "text-orange-600",
   },
+  robbery: {
+    icon: AlertTriangle,
+    label: "Robbery",
+    color: "text-orange-600",
+  },
+  stranger: {
+    icon: UserX,
+    label: "Stranger",
+    color: "text-orange-600",
+  },
+  other: {
+    icon: HelpCircle,
+    label: "Alert",
+    color: "text-muted-foreground",
+  },
+};
+
+const defaultConfig = {
+  icon: HelpCircle,
+  label: "Alert",
+  color: "text-muted-foreground",
 };
 
 export default function AlertCard({ type, location, time, entity, confidence, onClick }: AlertCardProps) {
-  const config = alertConfig[type];
+  const config = alertConfig[type] ?? defaultConfig;
   const Icon = config.icon;
 
   return (

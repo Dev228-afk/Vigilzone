@@ -7,3 +7,8 @@ python-dotenv==1.2.1
 requests==2.32.5
 PyJWT==2.10.1
 opencv-python-headless>=4.10.0
+
+# Real-time notifications
+channels==4.2.0
+channels-redis==4.2.1
+daphne==4.1.2

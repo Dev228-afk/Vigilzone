@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Link, useLocation } from "wouter";
 import {
   Shield,
@@ -26,11 +26,36 @@ import { ThemeToggle } from "./ThemeToggle";
 import { LogOut } from "lucide-react";
 import { logout } from "@/lib/auth";
 import { useAuth } from "@/auth/AuthProvider";
+import { NotificationBell } from "./NotificationBell";
+import { useNotifications } from "@/hooks/useNotifications";
 
 export default function NavBar() {
   const [location, setLocation] = useLocation();
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
-  const { user, role } = useAuth();
+  const { user, role, tenantId } = useAuth();
+  
+  // Get token and tenant for notifications
+  const token = typeof window !== 'undefined' ? localStorage.getItem("accessToken") : null;
+  const tenantIdNum = tenantId ? parseInt(String(tenantId), 10) : null;
+  
+  const {
+    notifications,
+    unreadCount,
+    isConnected,
+    connect,
+    disconnect,
+    markAsRead,
+    markAllAsRead,
+    testWebSocket,
+  } = useNotifications();
+  
+  // Connect WebSocket when authenticated
+  useEffect(() => {
+    if (token && tenantIdNum) {
+      connect(token, tenantIdNum);
+    }
+    return () => disconnect();
+  }, [token, tenantIdNum, connect, disconnect]);
   
   // Format role for display (capitalize first letter)
   const displayRole = role ? role.charAt(0).toUpperCase() + role.slice(1) : "Member";
@@ -90,6 +115,20 @@ export default function NavBar() {
 
         <div className="flex items-center gap-2 sm:gap-3">
           <ThemeToggle />
+          
+          {/* Notification Bell */}
+          {tenantIdNum && (
+            <NotificationBell
+              notifications={notifications}
+              unreadCount={unreadCount}
+              onMarkAsRead={markAsRead}
+              onMarkAllAsRead={markAllAsRead}
+              isConnected={isConnected}
+              onTestConnection={() => testWebSocket(tenantIdNum)}
+              onNavigate={(path) => setLocation(path)}
+            />
+          )}
+          
           <div className="text-right hidden sm:block">
             <p className="text-sm font-medium">{user?.username || "User"}</p>
             <p className="text-xs text-muted-foreground">{displayRole}</p>

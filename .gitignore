@@ -33,3 +33,6 @@ Thumbs.db
 
 # YOLO weights (large binary files)
 *.pt
+
+#evidence
+evidence/*

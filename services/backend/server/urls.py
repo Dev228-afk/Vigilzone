@@ -7,6 +7,8 @@ from api.views import (
     dashboard_summary, KnownEntityViewSet,
     community_activity,
     notification_settings, notification_test, notification_register_device,
+    notifications_list, notifications_mark_read, notifications_unread_count,
+    notifications_broadcast, notifications_test_websocket,
     debug_system,
     streams_list, streams_detail, streams_snapshot, streams_mjpeg, streams_signed_token, streams_health,
 )
@@ -42,11 +44,17 @@ urlpatterns += [
     path("api/community/activity/", community_activity, name="community-activity"),
 ]
 
-# Notifications (§4)
+# Notifications (§4 & §5)
 urlpatterns += [
     path("api/notifications/settings/", notification_settings, name="notification-settings"),
     path("api/notifications/test/", notification_test, name="notification-test"),
     path("api/notifications/register_device/", notification_register_device, name="notification-register-device"),
+    # Real-time notification endpoints
+    path("api/notifications/", notifications_list, name="notifications-list"),
+    path("api/notifications/mark-read/", notifications_mark_read, name="notifications-mark-read"),
+    path("api/notifications/unread-count/", notifications_unread_count, name="notifications-unread-count"),
+    path("api/notifications/broadcast/", notifications_broadcast, name="notifications-broadcast"),
+    path("api/notifications/test-websocket/", notifications_test_websocket, name="notifications-test-websocket"),
 ]
 # Debug (§7)
 urlpatterns += [

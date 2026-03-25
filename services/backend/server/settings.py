@@ -42,9 +42,22 @@ INSTALLED_APPS = [
     "django.contrib.staticfiles",
     "rest_framework",
     "corsheaders",
+    "channels",
     "api",
     "ai_integration",
 ]
+
+# Django Channels configuration
+CHANNEL_LAYERS = {
+    "default": {
+        "BACKEND": "channels_redis.core.RedisChannelLayer",
+        "CONFIG": {
+            "hosts": [
+                (os.getenv("REDIS_HOST", "redis"), int(os.getenv("REDIS_PORT", "6379")))
+            ],
+        },
+    },
+}
 
 MIDDLEWARE = [
     "corsheaders.middleware.CorsMiddleware",
@@ -168,14 +181,16 @@ STATIC_URL = "static/"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # ── VigilZone feature flags ──────────────────────────────────
+# Disabled by default to allow new users to select from pending community invites.
 AUTO_CREATE_TENANT_ON_REGISTER = bool(
-    int(os.getenv("AUTO_CREATE_TENANT_ON_REGISTER", "1"))
+    int(os.getenv("AUTO_CREATE_TENANT_ON_REGISTER", "0"))
 )
 
 # If a user logs in with zero tenant memberships (e.g., created via admin/import),
 # create a personal community on first login to avoid a demo-killing dead-end.
+# Disabled by default to allow new users to select from pending community invites.
 AUTO_CREATE_TENANT_ON_FIRST_LOGIN = bool(
-    int(os.getenv("AUTO_CREATE_TENANT_ON_FIRST_LOGIN", "1"))
+    int(os.getenv("AUTO_CREATE_TENANT_ON_FIRST_LOGIN", "0"))
 )
 
 # ── Email (§4 Notifications) ──────────────────────────────────
