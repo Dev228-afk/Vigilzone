@@ -34,5 +34,12 @@ Thumbs.db
 # YOLO weights (large binary files)
 *.pt
 
+
 #evidence
 evidence/*
+
+# Alerts data
+alerts/
+
+# Database files
+data/*.db
