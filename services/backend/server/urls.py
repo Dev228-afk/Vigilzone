@@ -1,5 +1,7 @@
 from django.contrib import admin
 from django.urls import path, include
+from django.conf import settings
+from django.conf.urls.static import static
 from rest_framework.routers import DefaultRouter
 from api.views import (
     TenantViewSet, MembershipViewSet, CameraViewSet, IncidentViewSet,
@@ -34,6 +36,10 @@ urlpatterns = [
     path("api/", include(router.urls)),
     # keep your JWT endpoints here if you've added them
 ]
+
+# Serve static files in development
+if settings.DEBUG:
+    urlpatterns += static(settings.STATIC_URL, document_root=settings.STATIC_ROOT)
 # !AUTH
 urlpatterns += [
     path("api/auth/token/", TokenObtainPairView.as_view(), name="token_obtain_pair"),
