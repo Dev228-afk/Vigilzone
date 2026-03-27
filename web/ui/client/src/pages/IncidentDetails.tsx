@@ -8,6 +8,7 @@ import { Play, Download, CheckCircle, ShieldCheck } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import { api } from "@/lib/api";
 import { queryClient } from "@/lib/queryClient";
+import { useAuth } from "@/auth/AuthProvider";
 
 interface Incident {
   id: number;
@@ -18,6 +19,8 @@ interface Incident {
   ended_at: string | null;
   camera: number;
   camera_name: string;
+  camera_source_type?: "registered" | "webcam";
+  camera_source_label?: string;
   details: Record<string, unknown>;
   media_key: string;
 }
@@ -32,6 +35,8 @@ export default function IncidentDetails() {
   const [, params] = useRoute("/incidents/:id");
   const incidentId = params?.id;
   const { toast } = useToast();
+  const { atLeast } = useAuth();
+  const canManageIncident = atLeast("member");
 
   const incidentQ = useQuery({
     queryKey: ["incident", incidentId],
@@ -141,6 +146,9 @@ export default function IncidentDetails() {
   // Build timeline from details JSON if available, otherwise show detection event
   const timeline: Array<{ time: string; event: string }> = [];
   const det = inc.details as any;
+  const recognizedEntity = (det?.recognized_entity && typeof det.recognized_entity === "object")
+    ? det.recognized_entity as Record<string, unknown>
+    : null;
   if (det?.timeline && Array.isArray(det.timeline)) {
     for (const t of det.timeline) {
       timeline.push({ time: t.time ?? "", event: t.event ?? t.description ?? "" });
@@ -213,7 +221,12 @@ export default function IncidentDetails() {
             </div>
             <div className="flex justify-between py-2 border-b">
               <span className="text-muted-foreground">Camera</span>
-              <span className="font-medium" data-testid="text-incident-location">{inc.camera_name || `#${inc.camera}`}</span>
+              <div className="flex items-center gap-2">
+                <span className="font-medium" data-testid="text-incident-location">{inc.camera_name || `#${inc.camera}`}</span>
+                <Badge variant={inc.camera_source_type === "webcam" ? "secondary" : "outline"}>
+                  {inc.camera_source_label || (inc.camera_source_type === "webcam" ? "Webcam" : "Registered")}
+                </Badge>
+              </div>
             </div>
             <div className="flex justify-between py-2 border-b">
               <span className="text-muted-foreground">Severity</span>
@@ -231,6 +244,18 @@ export default function IncidentDetails() {
               <span className="text-muted-foreground">Detected At</span>
               <span className="font-medium">{formatTime(inc.started_at)}</span>
             </div>
+            {recognizedEntity && (
+              <>
+                <div className="flex justify-between py-2 border-b">
+                  <span className="text-muted-foreground">Recognized Entity</span>
+                  <span className="font-medium">{String(recognizedEntity.name ?? recognizedEntity.id ?? "Unknown")}</span>
+                </div>
+                <div className="flex justify-between py-2 border-b">
+                  <span className="text-muted-foreground">Entity Type</span>
+                  <span className="font-medium capitalize">{String(recognizedEntity.type ?? recognizedEntity.kind ?? "unknown")}</span>
+                </div>
+              </>
+            )}
             {inc.ended_at && (
               <div className="flex justify-between py-2 border-b">
                 <span className="text-muted-foreground">Ended At</span>
@@ -240,13 +265,13 @@ export default function IncidentDetails() {
           </div>
 
           <div className="flex gap-3 mt-6">
-            {inc.status === "open" && (
+            {canManageIncident && inc.status === "open" && (
               <Button onClick={() => ackMut.mutate()} disabled={ackMut.isPending} className="flex-1" data-testid="button-acknowledge">
                 <CheckCircle className="w-4 h-4 mr-2" />
                 Acknowledge
               </Button>
             )}
-            {inc.status !== "resolved" && (
+            {canManageIncident && inc.status !== "resolved" && (
               <Button onClick={() => resolveMut.mutate()} disabled={resolveMut.isPending} variant="secondary" className="flex-1">
                 <ShieldCheck className="w-4 h-4 mr-2" />
                 Resolve

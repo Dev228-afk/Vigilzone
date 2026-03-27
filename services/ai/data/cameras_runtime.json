@@ -53,19 +53,6 @@
   },
   "street": {
     "camera_id": "street",
-    "rtsp_url": "http://47.51.131.147/-wvhttp-01-/GetOneShot?image_size=1280x720&frame_count=1000000000",
-    "ingest_backend": "opencv",
-    "enabled_lanes": [
-      "rt_detr",
-      "yolov8_fallback",
-      "fire_smoke_yolo",
-      "person_zone"
-    ],
-    "sample_hz": 2.0,
-    "registered_at": 1773885722.1733325
-  },
-  "backyard": {
-    "camera_id": "backyard",
     "rtsp_url": "http://webcam.rhein-taunus-krematorium.de/mjpg/video.mjpg",
     "ingest_backend": "opencv",
     "enabled_lanes": [
@@ -75,6 +62,45 @@
       "person_zone"
     ],
     "sample_hz": 2.0,
-    "registered_at": 1773885727.9220552
+    "registered_at": 1774576339.8422995
+  },
+  "backyard": {
+    "camera_id": "backyard",
+    "rtsp_url": "http://47.51.131.147/-wvhttp-01-/GetOneShot?image_size=1280x720&frame_count=1000000000",
+    "ingest_backend": "opencv",
+    "enabled_lanes": [
+      "rt_detr",
+      "yolov8_fallback",
+      "fire_smoke_yolo",
+      "person_zone"
+    ],
+    "sample_hz": 2.0,
+    "registered_at": 1774576343.4351065
+  },
+  "main-door": {
+    "camera_id": "main-door",
+    "rtsp_url": "http://195.196.36.242/mjpg/video.mjpg",
+    "ingest_backend": "opencv",
+    "enabled_lanes": [
+      "rt_detr",
+      "yolov8_fallback",
+      "fire_smoke_yolo",
+      "person_zone"
+    ],
+    "sample_hz": 2.0,
+    "registered_at": 1774572122.9175699
+  },
+  "entrance": {
+    "camera_id": "entrance",
+    "rtsp_url": "http://honjin1.miemasu.net/nphMotionJpeg?Resolution=640x480&Quality=Standard",
+    "ingest_backend": "opencv",
+    "enabled_lanes": [
+      "rt_detr",
+      "yolov8_fallback",
+      "fire_smoke_yolo",
+      "person_zone"
+    ],
+    "sample_hz": 2.0,
+    "registered_at": 1774576084.3160162
   }
 }

@@ -9,7 +9,8 @@ import hmac
 import json
 import logging
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone as dt_timezone
+from typing import Optional
 
 from django.db import transaction
 from django.utils import timezone
@@ -180,8 +181,11 @@ def ai_enroll_image(request, entity_id, filename):
 
 INCIDENT_TYPE_MAP = {
     "fire":             Incident.Type.FIRE,
+    "fire_smoke":       Incident.Type.FIRE,
     "weapon":           Incident.Type.ROBBERY,
+    "weapon_detected":  Incident.Type.ROBBERY,
     "intrusion":        Incident.Type.INTRUSION,
+    "intrusion_person_in_zone": Incident.Type.INTRUSION,
     "stranger":         Incident.Type.STRANGER,
     "loitering":        Incident.Type.INTRUSION,
     "abandoned_object": Incident.Type.OTHER,
@@ -191,22 +195,127 @@ INCIDENT_TYPE_MAP = {
     "anomaly":          Incident.Type.OTHER,
 }
 
-SEVERITY_MAP = {"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1}
+SEVERITY_MAP = {
+    "critical": 5,
+    "severe": 5,
+    "high": 4,
+    "medium": 3,
+    "med": 3,
+    "moderate": 3,
+    "low": 2,
+    "info": 1,
+}
 
 # Active-window: if last alert for same (camera, type) was within this many
 # seconds, update the existing incident instead of creating a new one.
 INCIDENT_ACTIVE_WINDOW_SECONDS = 60
 
 
-def _resolve_camera(camera_id_str: str):
-    """Find Camera by ai_camera_id → name → None."""
-    cam = Camera.objects.filter(ai_camera_id=camera_id_str).first()
-    if cam:
-        return cam, cam.tenant
-    cam = Camera.objects.filter(name=camera_id_str).first()
-    if cam:
-        return cam, cam.tenant
-    return None, None
+def _resolve_tenant_hint(data: dict) -> Optional[Tenant]:
+    """Resolve explicit tenant hint from webhook payload only."""
+    raw_tenant_id = data.get("tenant_id")
+    if raw_tenant_id is None:
+        return None
+    try:
+        return Tenant.objects.get(pk=int(raw_tenant_id))
+    except (TypeError, ValueError, Tenant.DoesNotExist):
+        return None
+
+
+def _resolve_camera(camera_id_str: str, tenant_hint: Optional[Tenant] = None):
+    """Find Camera by ai_camera_id/name, avoiding ambiguous cross-tenant matches."""
+    camera_id_str = (camera_id_str or "").strip()
+    if not camera_id_str:
+        return None, None, False
+
+    # If caller gives a tenant hint, prioritize deterministic lookup there.
+    if tenant_hint:
+        cam = Camera.objects.filter(
+            tenant=tenant_hint,
+            ai_camera_id=camera_id_str,
+        ).first()
+        if cam:
+            return cam, cam.tenant, False
+        cam = Camera.objects.filter(
+            tenant=tenant_hint,
+            name=camera_id_str,
+        ).first()
+        if cam:
+            return cam, cam.tenant, False
+        # Tenant hint is authoritative: allow caller flow to auto-create camera
+        # for this tenant instead of doing cross-tenant ambiguity checks.
+        return None, tenant_hint, False
+
+    ai_matches = list(
+        Camera.objects.filter(ai_camera_id=camera_id_str)
+        .select_related("tenant")[:2]
+    )
+    if len(ai_matches) == 1:
+        cam = ai_matches[0]
+        return cam, cam.tenant, False
+    if len(ai_matches) > 1:
+        logger.warning("Ambiguous ai_camera_id '%s' across tenants", camera_id_str)
+        return None, None, True
+
+    name_matches = list(
+        Camera.objects.filter(name=camera_id_str)
+        .select_related("tenant")[:2]
+    )
+    if len(name_matches) == 1:
+        cam = name_matches[0]
+        return cam, cam.tenant, False
+    if len(name_matches) > 1:
+        logger.warning("Ambiguous camera name '%s' across tenants", camera_id_str)
+        return None, None, True
+
+    return None, None, False
+
+
+def _resolve_tenant_for_unmapped_camera(data: dict):
+    """Resolve best tenant target for webhook alerts when camera is not mapped."""
+    default_tenant_id = os.getenv("DEFAULT_AI_TENANT_ID")
+    if default_tenant_id:
+        try:
+            return Tenant.objects.get(pk=int(default_tenant_id))
+        except (TypeError, ValueError, Tenant.DoesNotExist):
+            pass
+
+    tenant_hint = _resolve_tenant_hint(data)
+    if tenant_hint:
+        return tenant_hint
+
+    # Prefer tenants with active members over camera-count heuristics.
+    from django.db.models import Count
+    tenant = (
+        Tenant.objects.annotate(
+            member_count=Count("memberships", distinct=True),
+            cam_count=Count("cameras", distinct=True),
+        )
+        .order_by("-member_count", "-cam_count")
+        .first()
+    )
+    return tenant
+
+
+def _normalize_alert_type(raw) -> str:
+    text = str(raw or "other").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "fire_smoke": "fire_smoke",
+        "fire": "fire",
+        "weapon_detected": "weapon_detected",
+        "weapon": "weapon",
+        "intrusion_person_in_zone": "intrusion_person_in_zone",
+        "person_zone": "intrusion_person_in_zone",
+        "intrusion": "intrusion",
+        "stranger": "stranger",
+        "loitering": "loitering",
+        "abandoned_object": "abandoned_object",
+        "crowd": "crowd",
+        "fall": "fall",
+        "animal": "animal",
+        "anomaly": "anomaly",
+    }
+    return aliases.get(text, text)
 
 
 def _parse_severity(raw) -> int:
@@ -218,6 +327,11 @@ def _parse_severity(raw) -> int:
 
 
 def _parse_timestamp(raw) -> datetime:
+    if isinstance(raw, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(raw), tz=dt_timezone.utc)
+        except (ValueError, OSError, TypeError):
+            pass
     if isinstance(raw, str):
         try:
             dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
@@ -227,6 +341,24 @@ def _parse_timestamp(raw) -> datetime:
         except (ValueError, TypeError):
             pass
     return timezone.now()
+
+
+def _extract_entity_details(data: dict) -> dict:
+    """Normalize entity metadata from webhook payload variants."""
+    raw_entity = data.get("entity") or data.get("identity") or {}
+    if not isinstance(raw_entity, dict):
+        return {}
+
+    known_fields = {
+        "id": raw_entity.get("id") or raw_entity.get("entity_id"),
+        "name": raw_entity.get("name"),
+        "type": raw_entity.get("type") or raw_entity.get("entity_type"),
+        "kind": raw_entity.get("kind"),
+        "species": raw_entity.get("species"),
+        "confidence": raw_entity.get("confidence") or raw_entity.get("score"),
+        "known_entity_id": raw_entity.get("known_entity_id") or raw_entity.get("db_id"),
+    }
+    return {k: v for k, v in known_fields.items() if v not in (None, "")}
 
 
 @api_view(["POST"])
@@ -293,34 +425,46 @@ def ai_webhook_receive(request):
         logger.info("Ignoring webhook event: %s", event)
         return Response({"status": "ignored", "event": event})
 
-    camera_id_str = data.get("camera_id", "")
-    alert_type = data.get("type", "other")
+    camera_id_str = str(data.get("camera_id", "")).strip()
+    if not camera_id_str:
+        return Response(
+            {"error": "Invalid payload: data.camera_id is required"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    alert_type_raw = data.get("type", "other")
+    alert_type = _normalize_alert_type(alert_type_raw)
     severity_raw = data.get("severity", 3)
-    timestamp_raw = data.get("timestamp")
+    timestamp_raw = data.get("timestamp") or data.get("ts_utc") or payload.get("timestamp")
     message = data.get("message", "")
     confidence = data.get("confidence")
+    recognized_entity = _extract_entity_details(data)
 
     # ── Resolve / auto-create camera ──────────────────────────
-    camera, tenant = _resolve_camera(camera_id_str)
-    if not camera:
-        # Prefer tenant that has the most cameras (likely the active tenant)
-        from django.db.models import Count
-        tenant = (
-            Tenant.objects.annotate(cam_count=Count("camera"))
-            .order_by("-cam_count")
-            .first()
+    tenant_hint = _resolve_tenant_hint(data)
+    camera, tenant, ambiguous_camera = _resolve_camera(camera_id_str, tenant_hint=tenant_hint)
+    if ambiguous_camera:
+        return Response(
+            {
+                "error": "Ambiguous camera mapping",
+                "camera_id": camera_id_str,
+            },
+            status=status.HTTP_409_CONFLICT,
         )
-        if not tenant:
-            tenant = Tenant.objects.first()
+    if not camera:
+        tenant = _resolve_tenant_for_unmapped_camera(data) or Tenant.objects.first()
         if not tenant:
             return Response(
                 {"error": "No tenant configured"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        source_hint = str(data.get("source_type", "")).strip().lower()
+        is_webcam_source = camera_id_str == "cam_live" or source_hint in {"webcam", "live_camera"}
         camera = Camera.objects.create(
             tenant=tenant,
             name=camera_id_str,
             ai_camera_id=camera_id_str,
+            source_type=Camera.SourceType.WEBCAM if is_webcam_source else Camera.SourceType.REGISTERED,
             status=Camera.Status.ACTIVE,
         )
         logger.info("Auto-created camera '%s' for tenant '%s'", camera_id_str, tenant.name)
@@ -360,6 +504,8 @@ def ai_webhook_receive(request):
                 "last_message": message,
                 "alert_count": (existing.details or {}).get("alert_count", 1) + 1,
             }
+            if recognized_entity:
+                existing.details["recognized_entity"] = recognized_entity
             if clip_url:
                 existing.details["clip_url"] = clip_url
             if media_key:
@@ -372,9 +518,12 @@ def ai_webhook_receive(request):
                 "ai_alert_id": data.get("id", ""),
                 "message": message,
                 "alert_type": alert_type,
+                "alert_type_raw": alert_type_raw,
                 "confidence": confidence,
                 "alert_count": 1,
             }
+            if recognized_entity:
+                details_dict["recognized_entity"] = recognized_entity
             if clip_url:
                 details_dict["clip_url"] = clip_url
             incident = Incident.objects.create(
@@ -406,12 +555,13 @@ def ai_webhook_receive(request):
         camera_id_str,
     )
 
-    # §4 — dispatch email/push notifications
-    try:
-        from api.views import dispatch_notifications
-        dispatch_notifications(incident)
-    except Exception as exc:
-        logger.warning("Notification dispatch error: %s", exc)
+    # Incident creation is handled by post_save signal; explicit dispatch only on updates.
+    if not created:
+        try:
+            from api.views import dispatch_notifications
+            dispatch_notifications(incident)
+        except Exception as exc:
+            logger.warning("Notification dispatch error: %s", exc)
 
     return Response(
         {

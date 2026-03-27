@@ -46,6 +46,7 @@ interface StreamInfo {
   ai_camera_id: string;
   stream_path: string;
   camera_type: string;
+  source_type?: "registered" | "webcam";
 }
 
 interface StreamHealth {
@@ -189,10 +190,26 @@ export default function LiveAI() {
   const [selectedCamera, setSelectedCamera] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [isLive, setIsLive] = useState(false); // true = connected to real AI
+  const [webcamEnabled, setWebcamEnabled] = useState(false);
+  const [webcamRunning, setWebcamRunning] = useState<boolean | null>(null);
+  const [webcamApplying, setWebcamApplying] = useState(false);
+  const [webcamWarning, setWebcamWarning] = useState<string | null>(null);
+
+  const fetchWebcamState = useCallback(async () => {
+    try {
+      const { data } = await api.get("/ai/webcam-state/");
+      setWebcamEnabled(Boolean(data?.webcam_enabled));
+      setWebcamRunning(typeof data?.runtime?.running === "boolean" ? data.runtime.running : null);
+      setWebcamWarning(data?.warning ? String(data.warning) : null);
+    } catch {
+      setWebcamRunning(null);
+    }
+  }, []);
 
   /* ── Fetch data — real AI first, fallback to demo ──────────── */
   const fetchData = useCallback(async () => {
     setLoading(true);
+    await fetchWebcamState();
 
     // Always fetch streams from Django (no AI dependency)
     try {
@@ -270,7 +287,24 @@ export default function LiveAI() {
     } finally {
       setLoading(false);
     }
-  }, [selectedCamera]);
+  }, [selectedCamera, fetchWebcamState]);
+
+  const toggleWebcam = useCallback(async () => {
+    const nextEnabled = !webcamEnabled;
+    setWebcamApplying(true);
+    setWebcamWarning(null);
+    try {
+      const { data } = await api.post("/ai/webcam-state/", { enabled: nextEnabled });
+      setWebcamEnabled(Boolean(data?.webcam_enabled));
+      setWebcamRunning(typeof data?.runtime?.running === "boolean" ? data.runtime.running : null);
+      setWebcamWarning(data?.warning ? String(data.warning) : null);
+      await fetchData();
+    } catch (err: any) {
+      setWebcamWarning(err?.response?.data?.error || "Failed to update webcam runtime state");
+    } finally {
+      setWebcamApplying(false);
+    }
+  }, [webcamEnabled, fetchData]);
 
   useEffect(() => {
     fetchData();
@@ -321,8 +355,28 @@ export default function LiveAI() {
             <RefreshCw className="w-4 h-4 mr-1" />
             Refresh
           </Button>
+          <Button
+            variant={webcamEnabled ? "destructive" : "default"}
+            size="sm"
+            onClick={toggleWebcam}
+            disabled={webcamApplying}
+          >
+            {webcamApplying ? "Updating..." : webcamEnabled ? "Disable Webcam" : "Enable Webcam"}
+          </Button>
         </div>
       </div>
+
+      <Card>
+        <CardContent className="py-3 flex flex-wrap items-center gap-4 text-sm">
+          <span>
+            <strong>cam_live:</strong> {webcamEnabled ? "Enabled" : "Disabled"}
+          </span>
+          <span>
+            <strong>Runtime:</strong> {webcamRunning === null ? "Unknown" : webcamRunning ? "Running" : "Stopped"}
+          </span>
+          {webcamWarning && <span className="text-destructive">{webcamWarning}</span>}
+        </CardContent>
+      </Card>
 
       {/* ── System status bar ────────────────────────────────────── */}
       {systemStatus && (
@@ -452,6 +506,11 @@ export default function LiveAI() {
                                 {cam.active_tracks !== undefined ? ` · ${cam.active_tracks} tracks` : ""}
                               </p>
                             )}
+                            <div className="mt-1">
+                              <Badge variant={(stream?.source_type === "webcam" || cam.camera_id === "cam_live") ? "secondary" : "outline"} className="text-[10px] px-1.5 py-0">
+                                {(stream?.source_type === "webcam" || cam.camera_id === "cam_live") ? "Webcam" : "Registered"}
+                              </Badge>
+                            </div>
                           </div>
                         </div>
                       </button>

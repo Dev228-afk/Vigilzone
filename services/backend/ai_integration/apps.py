@@ -51,7 +51,15 @@ class AiIntegrationConfig(AppConfig):
     verbose_name = "AI Integration"
 
     def ready(self):
-        # Auto-register webhook in a background thread (non-blocking)
-        if os.getenv("RUN_MAIN") == "true" or not os.getenv("DJANGO_DEBUG"):
+        # Auto-register webhook in a background thread (non-blocking).
+        # In local debug, default to off to avoid noisy retries when AI service is down.
+        debug_mode = os.getenv("DJANGO_DEBUG", "1") not in ("0", "false", "False")
+        auto_register = os.getenv("AI_AUTO_REGISTER_WEBHOOK")
+        if auto_register is None:
+            auto_register_enabled = not debug_mode
+        else:
+            auto_register_enabled = auto_register.lower() in ("1", "true", "yes")
+
+        if auto_register_enabled and (os.getenv("RUN_MAIN") == "true" or not debug_mode):
             thread = threading.Thread(target=_auto_register_webhook, daemon=True)
             thread.start()

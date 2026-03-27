@@ -54,6 +54,7 @@ class CameraSafeSerializer(serializers.ModelSerializer):
         model = Camera
         fields = [
             "id", "name", "site", "status", "camera_type",
+            "source_type",
             "ai_camera_id", "stream_path",
             "min_confidence", "min_bbox_area", "k_of_n_k", "k_of_n_n", "cooldown_s",
             "created_at", "updated_at", "tenant",
@@ -68,7 +69,7 @@ class CameraStreamSerializer(serializers.ModelSerializer):
         model = Camera
         fields = [
             "id", "name", "site", "status", "ai_camera_id", "stream_path",
-            "camera_type",
+            "camera_type", "source_type",
         ]
 
 class CameraAdminSerializer(serializers.ModelSerializer):
@@ -92,7 +93,7 @@ class CameraWriteSerializer(serializers.ModelSerializer):
         model = Camera
         fields = [
             "id", "name", "site", "rtsp_url", "ai_camera_id", "stream_path", "status",
-            "camera_type", "min_confidence", "min_bbox_area",
+            "camera_type", "source_type", "min_confidence", "min_bbox_area",
             "k_of_n_k", "k_of_n_n", "cooldown_s",
             "created_at", "updated_at", "tenant",
             # legacy aliases
@@ -142,6 +143,8 @@ class CameraWriteSerializer(serializers.ModelSerializer):
 
 class IncidentSerializer(serializers.ModelSerializer):
     camera_name = serializers.CharField(source="camera.name", read_only=True, default="")
+    camera_source_type = serializers.CharField(source="camera.source_type", read_only=True, default=Camera.SourceType.REGISTERED)
+    camera_source_label = serializers.SerializerMethodField()
 
     class Meta:
         model = Incident
@@ -152,7 +155,15 @@ class IncidentSerializer(serializers.ModelSerializer):
         fields = super().get_field_names(declared_fields, info)
         if "camera_name" not in fields:
             fields = list(fields) + ["camera_name"]
+        if "camera_source_type" not in fields:
+            fields = list(fields) + ["camera_source_type"]
+        if "camera_source_label" not in fields:
+            fields = list(fields) + ["camera_source_label"]
         return fields
+
+    def get_camera_source_label(self, obj):
+        source_type = getattr(getattr(obj, "camera", None), "source_type", Camera.SourceType.REGISTERED)
+        return "Webcam" if source_type == Camera.SourceType.WEBCAM else "Registered"
 
 class DetectionSerializer(serializers.ModelSerializer):
     class Meta:

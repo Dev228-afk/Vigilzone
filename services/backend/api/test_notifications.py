@@ -311,6 +311,15 @@ class NotificationAPITests(APITestCase):
         
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertGreaterEqual(response.data['unread_count'], 1)
+
+    def test_transport_status_endpoint(self):
+        """Test GET /api/notifications/transport-status/ returns health payload."""
+        response = self.client.get('/api/notifications/transport-status/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn('uses_redis', response.data)
+        self.assertIn('redis_reachable', response.data)
+        self.assertIn('channel_backend', response.data)
     
     @patch('api.notification_service.get_channel_layer')
     def test_broadcast_requires_title_and_message(self, mock_get_layer):

@@ -10,7 +10,8 @@ from api.views import (
     community_activity,
     notification_settings, notification_test, notification_register_device,
     notifications_list, notifications_mark_read, notifications_unread_count,
-    notifications_broadcast, notifications_test_websocket,
+    notifications_broadcast, notifications_test_websocket, notifications_transport_status,
+    ai_webcam_state,
     debug_system,
     streams_list, streams_detail, streams_snapshot, streams_mjpeg, streams_signed_token, streams_health,
 )
@@ -59,8 +60,10 @@ urlpatterns += [
     path("api/notifications/", notifications_list, name="notifications-list"),
     path("api/notifications/mark-read/", notifications_mark_read, name="notifications-mark-read"),
     path("api/notifications/unread-count/", notifications_unread_count, name="notifications-unread-count"),
+    path("api/notifications/transport-status/", notifications_transport_status, name="notifications-transport-status"),
     path("api/notifications/broadcast/", notifications_broadcast, name="notifications-broadcast"),
     path("api/notifications/test-websocket/", notifications_test_websocket, name="notifications-test-websocket"),
+    path("api/ai/webcam-state/", ai_webcam_state, name="ai-webcam-state"),
 ]
 # Debug (§7)
 urlpatterns += [

@@ -73,14 +73,18 @@ class NotificationService:
             channel_settings = None
 
         # 2. Create Alert records for all members (do this first to get IDs)
-        alerts_created, alert_ids = cls._create_alerts_for_members(
+        alerts_created, alert_ids, user_alert_ids = cls._create_alerts_for_members(
             incident=incident,
             notification={}
         )
         results["alerts_created"] = alerts_created
 
         # 3. Build notification payload with alert IDs
-        notification = cls._build_incident_notification(incident, alert_ids)
+        notification = cls._build_incident_notification(
+            incident,
+            alert_ids=alert_ids,
+            user_alert_ids=user_alert_ids,
+        )
 
         # 4. WebSocket broadcast to all tenant members
         ws_result = cls._broadcast_to_channel(
@@ -193,7 +197,12 @@ class NotificationService:
             return f"error: {str(e)}"
 
     @classmethod
-    def _build_incident_notification(cls, incident: Incident, alert_ids: list = None) -> dict:
+    def _build_incident_notification(
+        cls,
+        incident: Incident,
+        alert_ids: list = None,
+        user_alert_ids: Optional[dict] = None,
+    ) -> dict:
         """Build notification payload from an incident."""
         severity_labels = {1: "Low", 2: "Medium-Low", 3: "Medium", 4: "High", 5: "Critical"}
         
@@ -213,6 +222,7 @@ class NotificationService:
                 "details": incident.details,
             },
             "created_at": timezone.now().isoformat(),
+            "alert_ids_by_user": user_alert_ids or {},
         }
         
         # Include first alert ID for mark-as-read functionality
@@ -226,7 +236,7 @@ class NotificationService:
         cls,
         incident: Incident,
         notification: dict
-    ) -> tuple[int, list]:
+    ) -> tuple[int, list, dict]:
         """
         Create Alert records for all tenant members.
         
@@ -238,7 +248,9 @@ class NotificationService:
         ).select_related("user")
 
         alerts = []
+        membership_by_username = {}
         for membership in memberships:
+            membership_by_username[membership.user.username] = membership.user_id
             alerts.append(Alert(
                 incident=incident,
                 channel="websocket",
@@ -255,8 +267,14 @@ class NotificationService:
             Alert.objects.bulk_create(alerts)
             # Get the IDs of the created alerts
             alert_ids = [alert.id for alert in alerts]
-            return len(alerts), alert_ids
-        return 0, []
+            user_alert_ids = {}
+            for alert in alerts:
+                username = (alert.payload or {}).get("username")
+                user_id = membership_by_username.get(username)
+                if user_id is not None:
+                    user_alert_ids[str(user_id)] = alert.id
+            return len(alerts), alert_ids, user_alert_ids
+        return 0, [], {}
 
     @classmethod
     def _send_email_notification(

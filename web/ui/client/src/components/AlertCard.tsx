@@ -1,5 +1,6 @@
 import { Flame, UserX, AlertTriangle, Car, HelpCircle } from "lucide-react";
 import { Card } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
 
 interface AlertCardProps {
   type: "fire" | "intrusion" | "violence" | "crash" | "robbery" | "stranger" | "other" | string;
@@ -7,6 +8,7 @@ interface AlertCardProps {
   time: string;
   entity?: string;
   confidence?: number;
+  sourceLabel?: string;
   onClick?: () => void;
 }
 
@@ -54,7 +56,7 @@ const defaultConfig = {
   color: "text-muted-foreground",
 };
 
-export default function AlertCard({ type, location, time, entity, confidence, onClick }: AlertCardProps) {
+export default function AlertCard({ type, location, time, entity, confidence, sourceLabel, onClick }: AlertCardProps) {
   const config = alertConfig[type] ?? defaultConfig;
   const Icon = config.icon;
 
@@ -74,6 +76,13 @@ export default function AlertCard({ type, location, time, entity, confidence, on
             {location} — {time}
             {confidence && ` — Confidence ${confidence}%`}
           </p>
+          {sourceLabel && (
+            <div className="mt-1.5">
+              <Badge variant={sourceLabel.toLowerCase() === "webcam" ? "secondary" : "outline"} className="text-[10px] px-1.5 py-0">
+                {sourceLabel}
+              </Badge>
+            </div>
+          )}
           {entity && (
             <p className="text-sm mt-1">
               <span className="text-muted-foreground">Entity:</span>{" "}

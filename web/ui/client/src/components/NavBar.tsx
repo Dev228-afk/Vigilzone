@@ -33,15 +33,18 @@ export default function NavBar() {
   const [location, setLocation] = useLocation();
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const { user, role, tenantId } = useAuth();
+  const canTestNotifications = role === "owner" || role === "admin";
   
   // Get token and tenant for notifications
-  const token = typeof window !== 'undefined' ? localStorage.getItem("accessToken") : null;
+  const token = typeof window !== 'undefined'
+    ? (localStorage.getItem("accessToken") || sessionStorage.getItem("accessToken"))
+    : null;
   const tenantIdNum = tenantId ? parseInt(String(tenantId), 10) : null;
   
   const {
     notifications,
     unreadCount,
-    isConnected,
+    redisReachable,
     connect,
     disconnect,
     markAsRead,
@@ -123,8 +126,9 @@ export default function NavBar() {
               unreadCount={unreadCount}
               onMarkAsRead={markAsRead}
               onMarkAllAsRead={markAllAsRead}
-              isConnected={isConnected}
-              onTestConnection={() => testWebSocket(tenantIdNum)}
+              isConnected={redisReachable}
+              tenantId={tenantIdNum}
+              onTestConnection={canTestNotifications ? () => testWebSocket(tenantIdNum) : undefined}
               onNavigate={(path) => setLocation(path)}
             />
           )}

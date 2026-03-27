@@ -3,6 +3,8 @@ import logging
 import hashlib
 import hmac
 import time
+import socket
+from urllib.parse import urlparse
 from typing import List
 from rest_framework import viewsets, permissions, status
 from rest_framework.exceptions import PermissionDenied, NotAuthenticated
@@ -17,6 +19,7 @@ from django.utils import timezone
 from .models import (
     Tenant, Membership, Camera, CameraZone, Incident, Detection,
     Alert, AuditLog, Profile, Invitation, KnownEntity, NotificationChannel,
+    TenantRuntimeSetting,
 )
 from .stream_workers import STREAM_WORKERS
 from .serializers import (
@@ -55,6 +58,21 @@ def assert_member(request, tenant):
         raise NotAuthenticated()
     return Membership.objects.filter(user=request.user, tenant=tenant).exists()
 
+
+def get_membership(request, tenant):
+    if not request.user or not request.user.is_authenticated:
+        raise NotAuthenticated()
+    return Membership.objects.filter(user=request.user, tenant=tenant).first()
+
+
+def assert_non_viewer(request, tenant):
+    membership = get_membership(request, tenant)
+    if not membership:
+        raise PermissionDenied("Not a member of this tenant.")
+    if membership.role == Membership.Role.VIEWER:
+        raise PermissionDenied("Viewer role is read-only.")
+    return membership
+
 class TenantScopedViewSet(viewsets.ModelViewSet):
     """
     Base ViewSet that filters by tenant={X-Tenant-ID} and sets tenant on create.
@@ -69,9 +87,18 @@ class TenantScopedViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         tenant = get_active_tenant(self.request)
-        if not assert_member(self.request, tenant):
-            raise PermissionDenied("Not a member of this tenant.")
+        assert_non_viewer(self.request, tenant)
         serializer.save(**{self.tenant_field: tenant})
+
+    def perform_update(self, serializer):
+        tenant = get_active_tenant(self.request)
+        assert_non_viewer(self.request, tenant)
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        tenant = get_active_tenant(self.request)
+        assert_non_viewer(self.request, tenant)
+        instance.delete()
 
 class TenantViewSet(viewsets.ModelViewSet):
     serializer_class = TenantSerializer
@@ -114,6 +141,21 @@ class MembershipViewSet(TenantScopedViewSet):
     queryset = Membership.objects.select_related("user", "tenant").all()
     serializer_class = MembershipSerializer
     permission_classes = [permissions.IsAuthenticated]
+
+    def perform_create(self, serializer):
+        tenant = get_active_tenant(self.request)
+        assert_role_in(self.request, tenant, allowed_roles={"owner", "admin"})
+        serializer.save(tenant=tenant)
+
+    def perform_update(self, serializer):
+        tenant = get_active_tenant(self.request)
+        assert_role_in(self.request, tenant, allowed_roles={"owner", "admin"})
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        tenant = get_active_tenant(self.request)
+        assert_role_in(self.request, tenant, allowed_roles={"owner", "admin"})
+        instance.delete()
 
 
 # ── RTSP probe helper (used by test_connection endpoints) ────
@@ -214,12 +256,17 @@ class CameraViewSet(TenantScopedViewSet):
             return CameraAdminSerializer
         return CameraSafeSerializer
 
+    def _assert_camera_write_access(self, request):
+        tenant = get_active_tenant(request)
+        return assert_non_viewer(request, tenant)
+
     @action(detail=True, methods=["post"], url_path="sync_to_ai")
     def sync_to_ai(self, request, pk=None):
         """POST /api/cameras/{id}/sync_to_ai/ — register camera with AI module."""
         import requests as http_client
         import re
         from django.utils.text import slugify
+        self._assert_camera_write_access(request)
         camera = self.get_object()
         ai_base = os.getenv("AI_BASE_INTERNAL", "http://127.0.0.1:8080")
 
@@ -255,8 +302,9 @@ class CameraViewSet(TenantScopedViewSet):
                 ai_data = resp.json()
                 camera.ai_camera_id = ai_data.get("camera_id", payload["camera_id"])
                 camera.status = Camera.Status.ACTIVE
+                camera.source_type = Camera.SourceType.REGISTERED
                 # Ensure stream_path is populated (auto-derive triggers on save)
-                update_fields = ["ai_camera_id", "status", "updated_at"]
+                update_fields = ["ai_camera_id", "status", "source_type", "updated_at"]
                 if not camera.stream_path:
                     camera.stream_path = camera.ai_camera_id
                     update_fields.append("stream_path")
@@ -288,6 +336,7 @@ class CameraViewSet(TenantScopedViewSet):
             qs = CameraZone.objects.filter(camera=camera).order_by("zone_name")
             return Response(CameraZoneSerializer(qs, many=True).data)
         # POST — create new zone
+        self._assert_camera_write_access(request)
         ser = CameraZoneSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
         ser.save(camera=camera)
@@ -296,6 +345,7 @@ class CameraViewSet(TenantScopedViewSet):
     @action(detail=True, methods=["put", "delete"], url_path=r"zones/(?P<zone_id>\d+)")
     def zone_detail(self, request, pk=None, zone_id=None):
         """PUT/DELETE /api/cameras/{id}/zones/{zone_id}/"""
+        self._assert_camera_write_access(request)
         camera = self.get_object()
         try:
             zone = CameraZone.objects.get(pk=zone_id, camera=camera)
@@ -314,6 +364,7 @@ class CameraViewSet(TenantScopedViewSet):
     def sync_zones_to_ai(self, request, pk=None):
         """POST /api/cameras/{id}/sync_zones_to_ai/ — push zones to AI."""
         import requests as http_client
+        self._assert_camera_write_access(request)
         camera = self.get_object()
         ai_base = os.getenv("AI_BASE_INTERNAL", "http://127.0.0.1:8080")
         cam_id = camera.ai_camera_id or f"cam_{camera.pk}"
@@ -335,6 +386,7 @@ class CameraViewSet(TenantScopedViewSet):
     def sync_ai_settings(self, request, pk=None):
         """POST /api/cameras/{id}/sync_ai_settings/ — push per-camera thresholds to AI."""
         import requests as http_client
+        self._assert_camera_write_access(request)
         camera = self.get_object()
         ai_base = os.getenv("AI_BASE_INTERNAL", "http://127.0.0.1:8080")
         cam_id = camera.ai_camera_id or f"cam_{camera.pk}"
@@ -357,6 +409,7 @@ class CameraViewSet(TenantScopedViewSet):
     @action(detail=True, methods=["post"], url_path="test_connection")
     def test_connection_detail(self, request, pk=None):
         """POST /api/cameras/{id}/test_connection/ — test stored RTSP URL."""
+        self._assert_camera_write_access(request)
         camera = self.get_object()
         rtsp_url = camera.rtsp_url
         if not rtsp_url:
@@ -368,6 +421,7 @@ class CameraViewSet(TenantScopedViewSet):
     @action(detail=False, methods=["post"], url_path="test_connection")
     def test_connection_list(self, request):
         """POST /api/cameras/test_connection/ — test an arbitrary RTSP URL."""
+        self._assert_camera_write_access(request)
         rtsp_url = request.data.get("rtsp_url", "").strip()
         if not rtsp_url:
             return Response({"ok": False, "error": "rtsp_url is required"}, status=status.HTTP_400_BAD_REQUEST)
@@ -382,8 +436,7 @@ class IncidentViewSet(TenantScopedViewSet):
     def perform_create(self, serializer):
         """Create incident. Notifications are sent automatically via Django signal."""
         tenant = get_active_tenant(self.request)
-        if not assert_member(self.request, tenant):
-            raise PermissionDenied("Not a member of this tenant.")
+        assert_non_viewer(self.request, tenant)
         
         # Save the incident - the post_save signal will broadcast notifications
         serializer.save(tenant=tenant)
@@ -410,13 +463,14 @@ class IncidentViewSet(TenantScopedViewSet):
 
     @action(detail=True, methods=["post"], url_path="acknowledge")
     def acknowledge(self, request, pk=None):
+        tenant = get_active_tenant(request)
+        assert_non_viewer(request, tenant)
         incident = self.get_object()
         if incident.status == "resolved":
             return Response({"error": "Incident already resolved"}, status=status.HTTP_400_BAD_REQUEST)
         incident.status = "acknowledged"
         incident.save(update_fields=["status", "updated_at"])
         # Audit
-        tenant = get_active_tenant(request)
         AuditLog.objects.create(
             tenant=tenant, actor=request.user,
             action="incident.acknowledge", target_type="incident", target_id=str(incident.pk),
@@ -425,11 +479,12 @@ class IncidentViewSet(TenantScopedViewSet):
 
     @action(detail=True, methods=["post"], url_path="resolve")
     def resolve(self, request, pk=None):
+        tenant = get_active_tenant(request)
+        assert_non_viewer(request, tenant)
         incident = self.get_object()
         incident.status = "resolved"
         incident.ended_at = timezone.now()
         incident.save(update_fields=["status", "ended_at", "updated_at"])
-        tenant = get_active_tenant(request)
         AuditLog.objects.create(
             tenant=tenant, actor=request.user,
             action="incident.resolve", target_type="incident", target_id=str(incident.pk),
@@ -506,6 +561,8 @@ class ProfileViewSet(viewsets.ModelViewSet):
         return Profile.objects.filter(user=self.request.user)
 
     def perform_update(self, serializer):
+        tenant = get_active_tenant(self.request)
+        assert_non_viewer(self.request, tenant)
         serializer.save(user=self.request.user)
 
     def list(self, request, *args, **kwargs):
@@ -518,6 +575,8 @@ class ProfileViewSet(viewsets.ModelViewSet):
         profile, _ = Profile.objects.get_or_create(user=request.user)
         if request.method == "GET":
             return Response(ProfileSerializer(profile).data)
+        tenant = get_active_tenant(request)
+        assert_non_viewer(request, tenant)
         serializer = ProfileSerializer(profile, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
         serializer.save()
@@ -543,7 +602,7 @@ def dashboard_summary(request):
     incidents = Incident.objects.filter(tenant=tenant)
 
     # Cameras
-    cameras = list(Camera.objects.filter(tenant=tenant).values("id", "name", "site", "status", "ai_camera_id"))
+    cameras = list(Camera.objects.filter(tenant=tenant).values("id", "name", "site", "status", "ai_camera_id", "source_type"))
 
     # Incident counts
     stats = {
@@ -556,7 +615,7 @@ def dashboard_summary(request):
     recent_incidents = list(
         incidents.order_by("-started_at")[:10].values(
             "id", "type", "status", "severity", "started_at",
-            "camera__name", "details",
+            "camera__name", "camera__source_type", "details",
         )
     )
 
@@ -685,8 +744,7 @@ class KnownEntityViewSet(TenantScopedViewSet):
         serializer.is_valid(raise_exception=True)
 
         tenant = get_active_tenant(self.request)
-        if not assert_member(self.request, tenant):
-            raise PermissionDenied("Not a member of this tenant.")
+        assert_non_viewer(self.request, tenant)
         entity = serializer.save(tenant=tenant)
 
         # Collect uploaded files
@@ -787,6 +845,8 @@ class KnownEntityViewSet(TenantScopedViewSet):
         return response
 
     def update(self, request, *args, **kwargs):
+        tenant = get_active_tenant(request)
+        assert_non_viewer(request, tenant)
         partial = kwargs.pop("partial", False)
         instance = self.get_object()
         serializer = self.get_serializer(instance, data=request.data, partial=partial)
@@ -866,6 +926,8 @@ class KnownEntityViewSet(TenantScopedViewSet):
     def perform_destroy(self, instance):
         """Delete from AI then from Django."""
         import requests as http_client
+        tenant = get_active_tenant(self.request)
+        assert_non_viewer(self.request, tenant)
 
         if instance.ai_entity_id:
             ai_base = os.getenv("AI_BASE_INTERNAL", "http://127.0.0.1:8080")
@@ -1248,6 +1310,7 @@ def notification_settings(request):
     channel, _ = NotificationChannel.objects.get_or_create(tenant=tenant)
     if request.method == "GET":
         return Response(NotificationChannelSerializer(channel).data)
+    assert_role_in(request, tenant, allowed_roles={"owner", "admin"})
     ser = NotificationChannelSerializer(channel, data=request.data, partial=True)
     ser.is_valid(raise_exception=True)
     ser.save()
@@ -1263,6 +1326,7 @@ def notification_test(request):
     tenant = get_active_tenant(request)
     if not assert_member(request, tenant):
         raise PermissionDenied()
+    assert_role_in(request, tenant, allowed_roles={"owner", "admin"})
     channel, _ = NotificationChannel.objects.get_or_create(tenant=tenant)
     results = {"email": None, "push": None}
     if channel.email_enabled and channel.email_recipients:
@@ -1312,6 +1376,179 @@ def dispatch_notifications(incident: Incident):
     NotificationService.broadcast_incident(incident)
 
 
+def _bool_from_env(value: str, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _coerce_bool(raw, default=False):
+    if isinstance(raw, bool):
+        return raw
+    if raw is None:
+        return default
+    text = str(raw).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _set_ai_webcam_runtime(enabled: bool) -> dict:
+    import requests as http_client
+
+    ai_base = os.getenv("AI_BASE_INTERNAL", "http://127.0.0.1:8080").rstrip("/")
+    control_url = f"{ai_base}/api/v1/cameras/cam_live/runtime-control"
+    status_url = f"{ai_base}/api/v1/cameras/cam_live/runtime-status"
+
+    timeout_s = 25
+    # AI endpoint currently accepts a raw JSON boolean body for `enabled`.
+    resp = http_client.post(control_url, json=bool(enabled), timeout=timeout_s)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"AI runtime-control failed: {resp.status_code} {resp.text[:200]}")
+
+    status_payload = {"running": None}
+    try:
+        status_resp = http_client.get(status_url, timeout=5)
+        if status_resp.ok:
+            status_payload = status_resp.json() or status_payload
+    except Exception:
+        pass
+
+    result = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+    result.update({"status": status_payload})
+    return result
+
+
+def _get_ai_webcam_runtime_status() -> dict:
+    import requests as http_client
+
+    ai_base = os.getenv("AI_BASE_INTERNAL", "http://127.0.0.1:8080").rstrip("/")
+    status_url = f"{ai_base}/api/v1/cameras/cam_live/runtime-status"
+    resp = http_client.get(status_url, timeout=5)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"AI runtime-status failed: {resp.status_code} {resp.text[:200]}")
+    payload = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+    return payload or {"running": None}
+
+
+@api_view(["GET", "POST"])
+@permission_classes([IsAuthenticated])
+def ai_webcam_state(request):
+    """
+    GET  /api/ai/webcam-state/ — persisted + runtime webcam state for cam_live.
+    POST /api/ai/webcam-state/ — update persisted webcam state and apply runtime toggle.
+    """
+    tenant = get_active_tenant(request)
+    if not assert_member(request, tenant):
+        raise PermissionDenied()
+
+    runtime_setting, _ = TenantRuntimeSetting.objects.get_or_create(tenant=tenant)
+
+    if request.method == "POST":
+        assert_role_in(request, tenant, allowed_roles={"owner", "admin"})
+        if "enabled" not in request.data:
+            return Response({"error": "enabled is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        enabled = _coerce_bool(request.data.get("enabled"), default=False)
+        runtime_setting.webcam_enabled = enabled
+        runtime_setting.save(update_fields=["webcam_enabled", "updated_at"])
+
+        try:
+            ai_result = _set_ai_webcam_runtime(enabled)
+            return Response({
+                "webcam_enabled": runtime_setting.webcam_enabled,
+                "runtime": ai_result.get("status", {}),
+                "applied": True,
+            })
+        except Exception as exc:
+            runtime = {"running": None}
+            try:
+                runtime = _get_ai_webcam_runtime_status()
+                if isinstance(runtime.get("running"), bool) and runtime["running"] == enabled:
+                    return Response({
+                        "webcam_enabled": runtime_setting.webcam_enabled,
+                        "runtime": runtime,
+                        "applied": True,
+                        "warning": str(exc),
+                    })
+            except Exception:
+                pass
+            return Response({
+                "webcam_enabled": runtime_setting.webcam_enabled,
+                "runtime": runtime,
+                "applied": False,
+                "warning": str(exc),
+            }, status=status.HTTP_502_BAD_GATEWAY)
+
+    runtime = {"running": None}
+    if _bool_from_env(os.getenv("FETCH_AI_RUNTIME_STATUS", "true"), default=True):
+        try:
+            runtime = _get_ai_webcam_runtime_status()
+        except Exception:
+            runtime = {"running": None}
+
+    return Response({
+        "webcam_enabled": runtime_setting.webcam_enabled,
+        "runtime": runtime,
+    })
+
+
+def _ensure_user_alert_backfill(tenant, user, max_incidents=300):
+    """Create per-user alerts for recent incidents that have no user-scoped alert yet."""
+    incidents = list(
+        Incident.objects.filter(tenant=tenant)
+        .select_related("camera")
+        .order_by("-started_at", "-id")[:max_incidents]
+    )
+    if not incidents:
+        return 0
+
+    incident_ids = [inc.id for inc in incidents]
+    existing_alert_incident_ids = set(
+        Alert.objects.filter(incident_id__in=incident_ids)
+        .filter(
+            Q(payload__user_id=user.id)
+            | Q(payload__user_id=str(user.id))
+            | Q(payload__user_id__isnull=True)
+        )
+        .values_list("incident_id", flat=True)
+    )
+
+    missing_incidents = [inc for inc in incidents if inc.id not in existing_alert_incident_ids]
+    if not missing_incidents:
+        return 0
+
+    severity_labels = {1: "Low", 2: "Medium-Low", 3: "Medium", 4: "High", 5: "Critical"}
+    alerts = []
+    for incident in missing_incidents:
+        alerts.append(Alert(
+            incident=incident,
+            channel="websocket",
+            payload={
+                "title": f"🚨 {incident.get_type_display()} Detected",
+                "message": f"{severity_labels.get(incident.severity, 'Unknown')} severity incident at {incident.camera.name if incident.camera else 'Unknown camera'}",
+                "data": {
+                    "incident_id": incident.id,
+                    "type": incident.type,
+                    "status": incident.status,
+                    "severity": incident.severity,
+                    "camera_id": incident.camera_id,
+                    "camera_name": incident.camera.name if incident.camera else None,
+                    "started_at": incident.started_at.isoformat() if incident.started_at else None,
+                    "details": incident.details,
+                },
+                "user_id": user.id,
+                "username": user.username,
+                "backfilled": True,
+            }
+        ))
+
+    Alert.objects.bulk_create(alerts)
+    return len(alerts)
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # §5  REAL-TIME NOTIFICATION API
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1332,6 +1569,8 @@ def notifications_list(request):
     tenant = get_active_tenant(request)
     if not assert_member(request, tenant):
         raise PermissionDenied()
+
+    _ensure_user_alert_backfill(tenant, request.user)
     
     limit = min(int(request.query_params.get("limit", 50)), 100)
     offset = int(request.query_params.get("offset", 0))
@@ -1342,7 +1581,11 @@ def notifications_list(request):
     
     # Get alerts for these incidents
     alerts_qs = Alert.objects.filter(
-        incident__in=incidents_qs
+        incident__in=incidents_qs,
+    ).filter(
+        Q(payload__user_id=request.user.id)
+        | Q(payload__user_id=str(request.user.id))
+        | Q(payload__user_id__isnull=True)
     ).select_related("incident", "incident__camera").order_by("-created_at")
     
     if unread_only:
@@ -1396,6 +1639,11 @@ def notifications_mark_read(request):
         incidents_qs = Incident.objects.filter(tenant=tenant)
         updated = Alert.objects.filter(
             incident__in=incidents_qs,
+            ).filter(
+            Q(payload__user_id=request.user.id)
+            | Q(payload__user_id=str(request.user.id))
+            | Q(payload__user_id__isnull=True)
+        ).filter(
             delivered_at__isnull=True
         ).update(delivered_at=timezone.now())
     elif notification_ids:
@@ -1404,6 +1652,10 @@ def notifications_mark_read(request):
         updated = Alert.objects.filter(
             id__in=notification_ids,
             incident__in=incidents_qs,
+            ).filter(
+            Q(payload__user_id=request.user.id)
+            | Q(payload__user_id=str(request.user.id))
+            | Q(payload__user_id__isnull=True)
         ).update(delivered_at=timezone.now())
     else:
         return Response({"error": "Provide notification_ids or mark_all=true"}, status=status.HTTP_400_BAD_REQUEST)
@@ -1423,14 +1675,78 @@ def notifications_unread_count(request):
     tenant = get_active_tenant(request)
     if not assert_member(request, tenant):
         raise PermissionDenied()
+
+    _ensure_user_alert_backfill(tenant, request.user)
     
     incidents_qs = Incident.objects.filter(tenant=tenant)
     count = Alert.objects.filter(
         incident__in=incidents_qs,
+    ).filter(
+        Q(payload__user_id=request.user.id)
+        | Q(payload__user_id=str(request.user.id))
+        | Q(payload__user_id__isnull=True)
+    ).filter(
         delivered_at__isnull=True
     ).count()
     
     return Response({"unread_count": count})
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def notifications_transport_status(request):
+    """
+    GET /api/notifications/transport-status/ — report notification transport health.
+
+    The status is Redis-based: green when Redis is reachable, red otherwise.
+    """
+    tenant = get_active_tenant(request)
+    if not assert_member(request, tenant):
+        raise PermissionDenied()
+
+    channel_cfg = settings.CHANNEL_LAYERS.get("default", {}) if hasattr(settings, "CHANNEL_LAYERS") else {}
+    backend_path = str(channel_cfg.get("BACKEND", ""))
+    uses_redis = "channels_redis" in backend_path
+
+    redis_host = str(os.getenv("REDIS_HOST", "")).strip() or "127.0.0.1"
+    redis_port = 6379
+    try:
+        redis_port = int(os.getenv("REDIS_PORT", "6379"))
+    except ValueError:
+        redis_port = 6379
+
+    # Prefer host/port from channel-layer config when present.
+    hosts_cfg = (channel_cfg.get("CONFIG") or {}).get("hosts") or []
+    if hosts_cfg:
+        first_host = hosts_cfg[0]
+        if isinstance(first_host, (list, tuple)) and len(first_host) >= 2:
+            redis_host = str(first_host[0]) or redis_host
+            try:
+                redis_port = int(first_host[1])
+            except (TypeError, ValueError):
+                pass
+        elif isinstance(first_host, str):
+            parsed = urlparse(first_host)
+            if parsed.hostname:
+                redis_host = parsed.hostname
+            if parsed.port:
+                redis_port = parsed.port
+
+    redis_reachable = False
+    try:
+        sock = socket.create_connection((redis_host, redis_port), timeout=0.75)
+        sock.close()
+        redis_reachable = True
+    except OSError:
+        redis_reachable = False
+
+    return Response({
+        "channel_backend": backend_path,
+        "uses_redis": uses_redis,
+        "redis_host": redis_host,
+        "redis_port": redis_port,
+        "redis_reachable": redis_reachable,
+    })
 
 
 @api_view(["POST"])
@@ -1477,6 +1793,7 @@ def notifications_test_websocket(request):
     tenant = get_active_tenant(request)
     if not assert_member(request, tenant):
         raise PermissionDenied()
+    assert_role_in(request, tenant, allowed_roles={"owner", "admin"})
     
     result = NotificationService.broadcast_message(
         tenant_id=tenant.id,

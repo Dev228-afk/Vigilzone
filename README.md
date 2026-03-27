@@ -44,7 +44,7 @@ Once running, open **http://localhost:8085** in your browser.
 ### Local Development (Windows)
 
 ```powershell
-# 1. Start AI module (uses local webcam via cameras.yaml cam_live)
+# 1. Start AI module (cam_live is optional and defaults to OFF)
 cd services\ai
 python run.py                          # runs on :8080
 
@@ -65,6 +65,14 @@ python manage.py register_ai_webhook
 ```
 
 Open **http://localhost:5000** — login with your user credentials.
+
+To start the webcam stream automatically at AI boot, set:
+
+```powershell
+set AI_WEBCAM_DEFAULT_ENABLED=true
+```
+
+Otherwise, enable/disable webcam runtime from **Live AI** (calls `/api/ai/webcam-state/`).
 
 ## Services
 
@@ -107,6 +115,8 @@ Open **http://localhost:5000** — login with your user credentials.
 - `GET/PUT /api/notifications/settings/` — Notification channel config
 - `POST /api/notifications/test/` — Send test notification
 - `POST /api/notifications/register_device/` — Store FCM token
+- `GET  /api/notifications/transport-status/` — Channel transport health (Redis/in-memory reachability)
+- `GET/POST /api/ai/webcam-state/` — Persisted + runtime cam_live toggle/status
 - `GET  /api/debug/system/` — Aggregated system diagnostics (Django + AI)
 
 ### Django AI Proxy (`/api/ai/`) — JWT-protected
@@ -163,6 +173,7 @@ React UI
 - Stream capture reconnect uses exponential backoff (starts near 2s, capped at 60s) and resets on successful frames.
 - Lane scheduling in the AI processor uses per-lane in-flight backpressure to avoid runaway unfinished-future buildup.
 - AnyAnomaly lane performs dependency preflight and gracefully disables itself when required packages are missing.
+- During Django autoreload, transient requests can return `503 {"detail":"Service restarting"}` instead of a noisy ASGI 500 traceback.
 
 ### Runbook
 
@@ -187,6 +198,13 @@ React UI
 | `AI_WEBHOOK_TOKEN` | *(empty)* | Flat token for `X-AI-WEBHOOK-TOKEN` auth |
 | `AI_WEBHOOK_SECRET` | `vigilzone-webhook-secret` | HMAC secret for `X-Vigilzone-Signature` auth |
 | `PUBLIC_BASE_URL` | `http://127.0.0.1:8000` (local) / `http://localhost:8085` (docker proxy) | Public URL for webhook callbacks |
+| `CHANNEL_LAYER_BACKEND` | `inmemory` (local) | Channels backend: `inmemory` for local dev, `redis` for docker/prod |
+| `REDIS_HOST` | *(empty local)* / `redis` (docker) | Redis hostname used when `CHANNEL_LAYER_BACKEND=redis` |
+| `REDIS_PORT` | `6379` | Redis port used by channel layer |
+| `AI_AUTO_REGISTER_WEBHOOK` | `0` (debug local) | Auto-register AI webhook on startup (`1` enables startup registration) |
+| `DEFAULT_AI_TENANT_ID` | *(empty)* | Optional tenant id used for AI webhook incidents when camera mapping is missing |
+| `FETCH_AI_RUNTIME_STATUS` | `true` | Whether `/api/ai/webcam-state/` GET actively polls AI runtime status |
+| `AI_WEBCAM_DEFAULT_ENABLED` | `false` | AI startup default for `cam_live` processor (`true` starts webcam automatically) |
 | `STREAM_PREVIEW_FPS` | `3` | Capture FPS per camera worker |
 | `STREAM_PREVIEW_MAX_WIDTH` | `960` | Optional max width for preview JPEG resizing |
 | `STREAM_PREVIEW_JPEG_QUALITY` | `70` | JPEG encoding quality for snapshots/MJPEG |
@@ -201,6 +219,42 @@ React UI
 | `EMAIL_HOST_USER` | *(empty)* | SMTP username |
 | `EMAIL_HOST_PASSWORD` | *(empty)* | SMTP password / app-specific password |
 | `VITE_PROXY_TARGET` | `http://127.0.0.1:8000` | Vite dev proxy → Django backend |
+| `VITE_ENABLE_WEBRTC` | `false` | Enable WebRTC-first playback in camera cards (`true` enables staged migration path) |
+| `VITE_WEBRTC_VIEWER_BASE_URL` | *(empty)* | Base URL for MediaMTX WebRTC viewer (example: `http://localhost:8889`) |
+
+### Local vs Docker `.env` presets
+
+Use one of these minimal presets to avoid environment-specific guesswork.
+
+#### Local development (Windows/macOS/Linux, no Redis required)
+
+```env
+DJANGO_DEBUG=1
+CHANNEL_LAYER_BACKEND=inmemory
+REDIS_HOST=
+REDIS_PORT=6379
+AI_AUTO_REGISTER_WEBHOOK=0
+AI_BASE_INTERNAL=http://127.0.0.1:8080
+PUBLIC_BASE_URL=http://127.0.0.1:8000
+VITE_PROXY_TARGET=http://127.0.0.1:8000
+VITE_ENABLE_WEBRTC=false
+VITE_WEBRTC_VIEWER_BASE_URL=
+```
+
+#### Docker / Compose development
+
+```env
+DJANGO_DEBUG=0
+CHANNEL_LAYER_BACKEND=redis
+REDIS_HOST=redis
+REDIS_PORT=6379
+AI_AUTO_REGISTER_WEBHOOK=1
+AI_BASE_INTERNAL=http://ai:8080
+PUBLIC_BASE_URL=http://localhost:8085
+VITE_PROXY_TARGET=http://backend:8000
+VITE_ENABLE_WEBRTC=true
+VITE_WEBRTC_VIEWER_BASE_URL=http://mediamtx:8889
+```
 
 ## Project Structure
 

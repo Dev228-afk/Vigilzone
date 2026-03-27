@@ -34,6 +34,7 @@ ALLOWED_HOSTS = os.getenv("ALLOWED_HOSTS", "localhost,127.0.0.1,backend,nginx").
 # Application definition
 
 INSTALLED_APPS = [
+    "daphne",
     "django.contrib.admin",
     "django.contrib.auth",
     "django.contrib.contenttypes",
@@ -48,16 +49,36 @@ INSTALLED_APPS = [
 ]
 
 # Django Channels configuration
-CHANNEL_LAYERS = {
-    "default": {
-        "BACKEND": "channels_redis.core.RedisChannelLayer",
-        "CONFIG": {
-            "hosts": [
-                (os.getenv("REDIS_HOST", "redis"), int(os.getenv("REDIS_PORT", "6379")))
-            ],
-        },
-    },
-}
+# Local dev (Windows/non-Docker) often has no redis DNS entry. Use in-memory
+# channel layer unless Redis is explicitly requested.
+_channel_backend = os.getenv("CHANNEL_LAYER_BACKEND", "").strip().lower()
+if _channel_backend == "inmemory":
+    CHANNEL_LAYERS = {
+        "default": {
+            "BACKEND": "channels.layers.InMemoryChannelLayer",
+        }
+    }
+else:
+    redis_host = os.getenv("REDIS_HOST", "").strip()
+    use_redis = _channel_backend == "redis" or bool(redis_host) or not DEBUG
+
+    if use_redis:
+        CHANNEL_LAYERS = {
+            "default": {
+                "BACKEND": "channels_redis.core.RedisChannelLayer",
+                "CONFIG": {
+                    "hosts": [
+                        (redis_host or "127.0.0.1", int(os.getenv("REDIS_PORT", "6379")))
+                    ],
+                },
+            },
+        }
+    else:
+        CHANNEL_LAYERS = {
+            "default": {
+                "BACKEND": "channels.layers.InMemoryChannelLayer",
+            }
+        }
 
 MIDDLEWARE = [
     "corsheaders.middleware.CorsMiddleware",
@@ -89,6 +110,7 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = "server.wsgi.application"
+ASGI_APPLICATION = "server.asgi.application"
 
 
 # Database

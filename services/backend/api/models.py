@@ -1,5 +1,6 @@
 from django.db import models
 from django.contrib.auth import get_user_model
+import uuid
 
 User = get_user_model()
 
@@ -62,11 +63,16 @@ class Camera(TimeStamped):
         LIVING_ROOM = "living_room", "Living Room"
         OTHER = "other", "Other"
 
+    class SourceType(models.TextChoices):
+        REGISTERED = "registered", "Registered"
+        WEBCAM = "webcam", "Webcam"
+
     tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="cameras")
     name = models.CharField(max_length=200)
     site = models.CharField(max_length=200, blank=True)
     status = models.CharField(max_length=16, choices=Status.choices, default=Status.ACTIVE)
     camera_type = models.CharField(max_length=20, choices=CameraType.choices, default=CameraType.OTHER)
+    source_type = models.CharField(max_length=20, choices=SourceType.choices, default=SourceType.REGISTERED)
     rtsp_url = models.CharField(max_length=512, blank=True)  # don't return this to clients
     ai_camera_id = models.CharField(
         max_length=200, blank=True, default="",
@@ -215,6 +221,7 @@ class Invitation(TimeStamped):
         EXPIRED = "expired", "Expired"
 
     tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="invitations")
+    public_id = models.UUIDField(default=uuid.uuid4, editable=False, unique=True)
     email = models.EmailField()
     role = models.CharField(max_length=20, choices=Membership.Role.choices, default=Membership.Role.MEMBER)
 
@@ -277,3 +284,13 @@ class NotificationChannel(TimeStamped):
 
     def __str__(self):
         return f"Notifications for {self.tenant.name}"
+
+
+class TenantRuntimeSetting(TimeStamped):
+    """Tenant-level runtime controls for AI integration behavior."""
+
+    tenant = models.OneToOneField(Tenant, on_delete=models.CASCADE, related_name="runtime_settings")
+    webcam_enabled = models.BooleanField(default=False)
+
+    def __str__(self):
+        return f"Runtime settings for {self.tenant.name}"

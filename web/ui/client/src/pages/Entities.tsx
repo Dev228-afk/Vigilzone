@@ -12,6 +12,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Search, Plus, User, Dog, Car, Eye, Edit, Trash2, Upload, Wifi, WifiOff, Camera, X } from "lucide-react";
 import { api } from "@/lib/api";
 import { useAuthImage } from "@/hooks/use-auth-image";
+import { useAuth } from "@/auth/AuthProvider";
 
 interface Entity {
   id: string;
@@ -31,6 +32,8 @@ interface CameraOption {
 }
 
 export default function Entities() {
+  const { atLeast } = useAuth();
+  const canManage = atLeast("member");
   const [entities, setEntities] = useState<Entity[]>([]);
   const [cameraOptions, setCameraOptions] = useState<CameraOption[]>([]);
 
@@ -226,6 +229,7 @@ export default function Entities() {
   });
 
   const handleAddEntity = async () => {
+    if (!canManage) return;
     setEnrolling(true);
     setEnrollError(null);
     try {
@@ -271,6 +275,7 @@ export default function Entities() {
   };
 
   const handleDelete = async (id: string) => {
+    if (!canManage) return;
     try {
       await api.delete(`/entities/${id}/`);
       await fetchEntities();
@@ -291,6 +296,7 @@ export default function Entities() {
   };
 
   const handleSaveEdit = async () => {
+    if (!canManage) return;
     if (!editEntity) {
       return;
     }
@@ -333,14 +339,15 @@ export default function Entities() {
           </Badge>
         </div>
         
-        <Dialog open={isAddDialogOpen} onOpenChange={setIsAddDialogOpen}>
-          <DialogTrigger asChild>
-            <Button data-testid="button-add-entity">
-              <Plus className="w-4 h-4 mr-2" />
-              Add Entity
-            </Button>
-          </DialogTrigger>
-          <DialogContent className="max-w-2xl">
+        {canManage && (
+          <Dialog open={isAddDialogOpen} onOpenChange={setIsAddDialogOpen}>
+            <DialogTrigger asChild>
+              <Button data-testid="button-add-entity">
+                <Plus className="w-4 h-4 mr-2" />
+                Add Entity
+              </Button>
+            </DialogTrigger>
+            <DialogContent className="max-w-2xl">
             <DialogHeader>
               <DialogTitle>Add New Entity</DialogTitle>
             </DialogHeader>
@@ -551,9 +558,13 @@ export default function Entities() {
                 {enrolling ? "Enrolling…" : "Save Entity"}
               </Button>
             </DialogFooter>
-          </DialogContent>
-        </Dialog>
+            </DialogContent>
+          </Dialog>
+        )}
       </div>
+      {!canManage && (
+        <p className="text-sm text-muted-foreground">Viewer role has read-only access to entities.</p>
+      )}
 
       <Card className="p-6">
         <div className="flex flex-wrap gap-4 mb-6">
@@ -597,10 +608,12 @@ export default function Entities() {
             <User className="w-16 h-16 mx-auto mb-4 text-muted-foreground" />
             <h3 className="text-lg font-semibold mb-2">No entities yet</h3>
             <p className="text-muted-foreground mb-4">Add family members, pets, or vehicles for smarter alerts.</p>
-            <Button onClick={() => setIsAddDialogOpen(true)}>
-              <Plus className="w-4 h-4 mr-2" />
-              Add Your First Entity
-            </Button>
+            {canManage && (
+              <Button onClick={() => setIsAddDialogOpen(true)}>
+                <Plus className="w-4 h-4 mr-2" />
+                Add Your First Entity
+              </Button>
+            )}
           </div>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -613,6 +626,7 @@ export default function Entities() {
                 onDelete={handleDelete}
                 onView={setViewEntity}
                 onEdit={openEditEntity}
+                canManage={canManage}
               />
             ))}
           </div>
@@ -637,7 +651,7 @@ export default function Entities() {
         </DialogContent>
       </Dialog>
 
-      <Dialog open={Boolean(editEntity)} onOpenChange={(open) => !open && setEditEntity(null)}>
+      <Dialog open={canManage && Boolean(editEntity)} onOpenChange={(open) => !open && setEditEntity(null)}>
         <DialogContent>
           <DialogHeader>
             <DialogTitle>Edit Entity</DialogTitle>
@@ -734,6 +748,7 @@ function EntityCard({
   onDelete,
   onView,
   onEdit,
+  canManage,
 }: {
   entity: Entity;
   getTypeIcon: (type: string) => React.ReactNode;
@@ -741,6 +756,7 @@ function EntityCard({
   onDelete: (id: string) => void;
   onView: (entity: Entity) => void;
   onEdit: (entity: Entity) => void;
+  canManage: boolean;
 }) {
   const thumbSrc = useAuthImage(entity.imageUrl);
 
@@ -778,24 +794,28 @@ function EntityCard({
           <Eye className="w-3 h-3 mr-1" />
           View
         </Button>
-        <Button
-          size="sm"
-          variant="outline"
-          className="flex-1"
-          data-testid={`button-edit-${entity.id}`}
-          onClick={() => onEdit(entity)}
-        >
-          <Edit className="w-3 h-3 mr-1" />
-          Edit
-        </Button>
-        <Button
-          size="sm"
-          variant="ghost"
-          onClick={() => onDelete(entity.id)}
-          data-testid={`button-delete-${entity.id}`}
-        >
-          <Trash2 className="w-3 h-3" />
-        </Button>
+        {canManage && (
+          <Button
+            size="sm"
+            variant="outline"
+            className="flex-1"
+            data-testid={`button-edit-${entity.id}`}
+            onClick={() => onEdit(entity)}
+          >
+            <Edit className="w-3 h-3 mr-1" />
+            Edit
+          </Button>
+        )}
+        {canManage && (
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={() => onDelete(entity.id)}
+            data-testid={`button-delete-${entity.id}`}
+          >
+            <Trash2 className="w-3 h-3" />
+          </Button>
+        )}
       </div>
     </Card>
   );

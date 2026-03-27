@@ -803,6 +803,10 @@ class CCTVAIModule:
         self.api_server: Optional[AlertServer] = None
         self.api_thread: Optional[threading.Thread] = None
 
+        self.webcam_default_enabled = str(
+            os.getenv("AI_WEBCAM_DEFAULT_ENABLED", "false")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+
         # §2.2 — shared latest-frame store across all cameras
         self.frame_store = LatestFrameStore()
 
@@ -825,6 +829,12 @@ class CCTVAIModule:
         for cam_cfg in self.camera_configs:
             try:
                 cid = cam_cfg["camera_id"]
+                if not cam_cfg.get("enabled", True):
+                    self.logger.info(f"Skipping disabled camera config for {cid}")
+                    continue
+                if cid == "cam_live" and not self.webcam_default_enabled:
+                    self.logger.info("Skipping cam_live startup (AI_WEBCAM_DEFAULT_ENABLED=false)")
+                    continue
                 zones = self.zones_cfg.get(cid, [])
                 proc = CameraProcessor(
                     cam_cfg, self.models_cfg, zones,
@@ -882,6 +892,7 @@ class CCTVAIModule:
             "evidence_exporter": self.evidence_exporter,
             "models_cfg": self.models_cfg,
             "zones_cfg": self.zones_cfg,
+            "camera_configs": self.camera_configs,
             "anyanomaly_client": getattr(self, "anyanomaly_client", None),
         })
         self.api_thread = threading.Thread(target=self.api_server.run, daemon=True)

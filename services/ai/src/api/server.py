@@ -143,6 +143,70 @@ class AlertServer:
         """
         self._app_context = ctx
 
+    def _find_camera_processor(self, camera_id: str):
+        for proc in self._camera_processors:
+            if proc.camera_id == camera_id:
+                return proc
+        return None
+
+    def _start_camera_processor(self, cam_cfg: Dict[str, Any]) -> bool:
+        """Start one camera processor at runtime; returns True when started."""
+        camera_id = str(cam_cfg.get("camera_id", "")).strip()
+        if not camera_id:
+            return False
+        if self._find_camera_processor(camera_id):
+            return True
+
+        ctx = getattr(self, "_app_context", {})
+        evidence_exp = ctx.get("evidence_exporter")
+        models_cfg = ctx.get("models_cfg")
+        zones_cfg = ctx.get("zones_cfg", {})
+        anyanomaly = ctx.get("anyanomaly_client")
+
+        if not (evidence_exp and models_cfg and self._aggregator):
+            self.logger.error("Cannot hot-load %s: missing app context", camera_id)
+            return False
+
+        try:
+            from ..app import CameraProcessor
+
+            cfg = dict(cam_cfg)
+            zones = zones_cfg.get(camera_id, [])
+            proc = CameraProcessor(
+                cfg, models_cfg, zones,
+                self._aggregator, evidence_exp,
+                gpu_scheduler=self._gpu_scheduler,
+                auto_throttle=self._auto_throttle,
+                anyanomaly_client=anyanomaly,
+                face_embedder=self._face_embedder,
+                pet_embedder=self._pet_embedder,
+                identity_matcher=self._identity_matcher,
+                identity_stabilizer=self._identity_stabilizer,
+                frame_store=self._frame_store,
+            )
+            proc.start()
+            self._camera_processors.append(proc)
+            self.logger.info("Hot-loaded camera processor for %s", camera_id)
+            return True
+        except Exception as exc:
+            self.logger.error("Hot-load failed for %s: %s", camera_id, exc)
+            return False
+
+    def _stop_camera_processor(self, camera_id: str) -> bool:
+        """Stop one running camera processor by id; returns True when stopped."""
+        proc = self._find_camera_processor(camera_id)
+        if not proc:
+            return False
+        try:
+            proc.stop()
+        except Exception as exc:
+            self.logger.warning("Camera stop error for %s: %s", camera_id, exc)
+        try:
+            self._camera_processors.remove(proc)
+        except ValueError:
+            pass
+        return True
+
     # ------------------------------------------------------------------
     def _setup_routes(self):
 
@@ -1199,6 +1263,53 @@ class AlertServer:
                 })
             return {"count": len(result), "cameras": result}
 
+        @self.app.get("/api/v1/cameras/{camera_id}/runtime-status")
+        async def api_camera_runtime_status(camera_id: str):
+            """Return runtime status for a specific camera id."""
+            proc = self._find_camera_processor(camera_id)
+            return {
+                "camera_id": camera_id,
+                "running": proc is not None,
+            }
+
+        @self.app.post("/api/v1/cameras/{camera_id}/runtime-control")
+        async def api_camera_runtime_control(
+            camera_id: str,
+            enabled: bool = Body(..., description="true to start, false to stop"),
+        ):
+            """Runtime start/stop control (cam_live only, no service restart)."""
+            if camera_id != "cam_live":
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "runtime-control is only supported for cam_live"},
+                )
+
+            running = self._find_camera_processor(camera_id) is not None
+            if enabled and running:
+                return {"camera_id": camera_id, "running": True, "changed": False}
+            if (not enabled) and (not running):
+                return {"camera_id": camera_id, "running": False, "changed": False}
+
+            if not enabled:
+                stopped = self._stop_camera_processor(camera_id)
+                return {"camera_id": camera_id, "running": False, "changed": stopped}
+
+            camera_configs = self._app_context.get("camera_configs", []) if isinstance(self._app_context, dict) else []
+            cfg = next((c for c in camera_configs if str(c.get("camera_id", "")) == camera_id), None)
+            if not cfg:
+                return JSONResponse(
+                    status_code=404,
+                    content={"error": f"Camera config '{camera_id}' not found"},
+                )
+
+            started = self._start_camera_processor(cfg)
+            if not started:
+                return JSONResponse(
+                    status_code=500,
+                    content={"error": f"Failed to start camera '{camera_id}'"},
+                )
+            return {"camera_id": camera_id, "running": True, "changed": True}
+
         @self.app.post("/api/v1/cameras/register")
         async def api_register_camera(
             camera_id: str = Body(..., description="Unique camera identifier"),
@@ -1246,44 +1357,15 @@ class AlertServer:
             )
 
             # ── Hot-load: create CameraProcessor and start it immediately ──
-            hot_loaded = False
-            ctx = getattr(self, "_app_context", {})
-            evidence_exp = ctx.get("evidence_exporter")
-            models_cfg = ctx.get("models_cfg")
-            zones_cfg = ctx.get("zones_cfg", {})
-            anyanomaly = ctx.get("anyanomaly_client")
-
-            if evidence_exp and models_cfg and self._aggregator:
-                try:
-                    from ..app import CameraProcessor
-
-                    cam_cfg = {
-                        "camera_id": camera_id,
-                        "rtsp_url": rtsp_url,
-                        "ingest_backend": ingest_backend,
-                        "enabled_lanes": enabled_lanes,
-                        "sample_hz": sample_hz,
-                        "source_type": "rtsp" if rtsp_url else "live_camera",
-                    }
-                    zones = zones_cfg.get(camera_id, [])
-                    proc = CameraProcessor(
-                        cam_cfg, models_cfg, zones,
-                        self._aggregator, evidence_exp,
-                        gpu_scheduler=self._gpu_scheduler,
-                        auto_throttle=self._auto_throttle,
-                        anyanomaly_client=anyanomaly,
-                        face_embedder=self._face_embedder,
-                        pet_embedder=self._pet_embedder,
-                        identity_matcher=self._identity_matcher,
-                        identity_stabilizer=self._identity_stabilizer,
-                        frame_store=self._frame_store,
-                    )
-                    proc.start()
-                    self._camera_processors.append(proc)
-                    hot_loaded = True
-                    self.logger.info(f"Hot-loaded camera processor for {camera_id}")
-                except Exception as e:
-                    self.logger.error(f"Hot-load failed for {camera_id}: {e}")
+            cam_cfg = {
+                "camera_id": camera_id,
+                "rtsp_url": rtsp_url,
+                "ingest_backend": ingest_backend,
+                "enabled_lanes": enabled_lanes,
+                "sample_hz": sample_hz,
+                "source_type": "rtsp" if rtsp_url else "live_camera",
+            }
+            hot_loaded = self._start_camera_processor(cam_cfg)
 
             return {
                 "status": "registered",

@@ -13,6 +13,8 @@ from typing import Optional
 
 from channels.generic.websocket import AsyncWebsocketConsumer
 from channels.db import database_sync_to_async
+from django.utils import timezone
+from django.db.models import Q
 from rest_framework_simplejwt.tokens import AccessToken
 from rest_framework_simplejwt.exceptions import TokenError, InvalidToken
 
@@ -165,8 +167,14 @@ class NotificationConsumer(AsyncWebsocketConsumer):
         Handler for 'notification_message' group messages.
         Broadcasts notification to all members in the tenant group.
         """
+        data = dict(event["data"])
+        per_user_ids = data.pop("alert_ids_by_user", None)
+        if isinstance(per_user_ids, dict) and self.user:
+            alert_id = per_user_ids.get(str(self.user.id)) or per_user_ids.get(self.user.id)
+            if alert_id:
+                data["alert_id"] = alert_id
         # Send notification to WebSocket
-        await self.send(text_data=json.dumps(event["data"]))
+        await self.send(text_data=json.dumps(data))
 
     async def broadcast_message(self, event):
         """
@@ -253,8 +261,11 @@ class NotificationConsumer(AsyncWebsocketConsumer):
         """Mark notifications as read for the user."""
         from .models import Alert
         Alert.objects.filter(
-            id__in=notification_ids
-        ).update(delivered_at=django.utils.timezone.now())
+            id__in=notification_ids,
+            incident__tenant_id=self.tenant_id,
+        ).filter(
+            Q(payload__user_id=self.user.id) | Q(payload__user_id=str(self.user.id))
+        ).update(delivered_at=timezone.now())
 
 
 # Import at module level to avoid circular imports

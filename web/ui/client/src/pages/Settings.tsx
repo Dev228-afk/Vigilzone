@@ -29,8 +29,9 @@ interface ProfileData {
 }
 
 export default function Settings() {
-  const { user } = useAuth();
+  const { user, atLeast } = useAuth();
   const { toast } = useToast();
+  const canManage = atLeast("member");
 
   const profileQ = useQuery({
     queryKey: ["profile-me"],
@@ -96,10 +97,12 @@ export default function Settings() {
   }, [p]);
 
   const handleSaveProfile = () => {
+    if (!canManage) return;
     saveMut.mutate({ bio: profile.bio });
   };
 
   const handleSaveNotifications = () => {
+    if (!canManage) return;
     saveMut.mutate({
       notify_email: notifications.email,
       notify_push: notifications.push,
@@ -108,6 +111,7 @@ export default function Settings() {
   };
 
   const handleSavePreferences = () => {
+    if (!canManage) return;
     saveMut.mutate({
       alert_sensitivity: preferences.alertSensitivity,
       data_retention_days: parseInt(preferences.dataRetention, 10),
@@ -123,11 +127,11 @@ export default function Settings() {
       {profileQ.isLoading && <p className="text-sm text-muted-foreground">Loading…</p>}
 
       <Tabs defaultValue="profile" className="w-full">
-        <TabsList className="grid w-full grid-cols-4">
+        <TabsList className={`grid w-full ${canManage ? "grid-cols-4" : "grid-cols-2"}`}>
           <TabsTrigger value="profile" data-testid="tab-profile">Profile</TabsTrigger>
           <TabsTrigger value="notifications" data-testid="tab-notifications">Notifications</TabsTrigger>
-          <TabsTrigger value="privacy" data-testid="tab-privacy">Privacy & Retention</TabsTrigger>
-          <TabsTrigger value="system" data-testid="tab-system">System Preferences</TabsTrigger>
+          {canManage && <TabsTrigger value="privacy" data-testid="tab-privacy">Privacy & Retention</TabsTrigger>}
+          {canManage && <TabsTrigger value="system" data-testid="tab-system">System Preferences</TabsTrigger>}
         </TabsList>
 
         {/* ── Profile ─────────────────────────────────────── */}
@@ -148,11 +152,12 @@ export default function Settings() {
                 <Input
                   id="bio"
                   value={profile.bio}
+                  disabled={!canManage}
                   onChange={(e) => setProfile({ ...profile, bio: e.target.value })}
                   placeholder="A short bio…"
                 />
               </div>
-              <Button onClick={handleSaveProfile} disabled={saveMut.isPending} data-testid="button-save-profile">
+              <Button onClick={handleSaveProfile} disabled={saveMut.isPending || !canManage} data-testid="button-save-profile">
                 {saveMut.isPending ? "Saving…" : "Save Changes"}
               </Button>
             </div>
@@ -170,6 +175,7 @@ export default function Settings() {
                   <p className="text-sm text-muted-foreground">Receive alerts via email</p>
                 </div>
                 <Switch id="email-alerts" checked={notifications.email}
+                  disabled={!canManage}
                   onCheckedChange={(checked) => setNotifications({ ...notifications, email: checked })}
                   data-testid="toggle-email" />
               </div>
@@ -179,6 +185,7 @@ export default function Settings() {
                   <p className="text-sm text-muted-foreground">Receive push notifications on your device</p>
                 </div>
                 <Switch id="push-alerts" checked={notifications.push}
+                  disabled={!canManage}
                   onCheckedChange={(checked) => setNotifications({ ...notifications, push: checked })}
                   data-testid="toggle-push" />
               </div>
@@ -188,15 +195,17 @@ export default function Settings() {
                   <p className="text-sm text-muted-foreground">Receive alerts via text message</p>
                 </div>
                 <Switch id="sms-alerts" checked={notifications.sms}
+                  disabled={!canManage}
                   onCheckedChange={(checked) => setNotifications({ ...notifications, sms: checked })}
                   data-testid="toggle-sms" />
               </div>
-              <Button onClick={handleSaveNotifications} disabled={saveMut.isPending}>Save Notifications</Button>
+              <Button onClick={handleSaveNotifications} disabled={saveMut.isPending || !canManage}>Save Notifications</Button>
             </div>
           </Card>
         </TabsContent>
 
         {/* ── Privacy & Retention ────────────────────────── */}
+        {canManage && (
         <TabsContent value="privacy" className="space-y-4 mt-6">
           <Card className="p-6">
             <h2 className="text-lg font-semibold mb-4">Privacy & Retention</h2>
@@ -204,6 +213,7 @@ export default function Settings() {
               <div className="space-y-2">
                 <Label htmlFor="retention-period">Data Retention Period</Label>
                 <Select value={preferences.dataRetention}
+                  disabled={!canManage}
                   onValueChange={(v) => setPreferences({ ...preferences, dataRetention: v })}>
                   <SelectTrigger id="retention-period" data-testid="select-retention-period">
                     <SelectValue />
@@ -222,6 +232,7 @@ export default function Settings() {
                   <p className="text-sm text-muted-foreground">Automatically blur faces in community-shared feeds</p>
                 </div>
                 <Switch checked={preferences.blurFaces}
+                  disabled={!canManage}
                   onCheckedChange={(c) => setPreferences({ ...preferences, blurFaces: c })}
                   data-testid="toggle-blur-faces" />
               </div>
@@ -231,15 +242,18 @@ export default function Settings() {
                   <p className="text-sm text-muted-foreground">Require consent before storing entity images</p>
                 </div>
                 <Switch checked={preferences.consentRequired}
+                  disabled={!canManage}
                   onCheckedChange={(c) => setPreferences({ ...preferences, consentRequired: c })}
                   data-testid="toggle-consent" />
               </div>
-              <Button onClick={handleSavePreferences} disabled={saveMut.isPending}>Save Privacy Settings</Button>
+              <Button onClick={handleSavePreferences} disabled={saveMut.isPending || !canManage}>Save Privacy Settings</Button>
             </div>
           </Card>
         </TabsContent>
+        )}
 
         {/* ── System ─────────────────────────────────────── */}
+        {canManage && (
         <TabsContent value="system" className="space-y-4 mt-6">
           <Card className="p-6">
             <h2 className="text-lg font-semibold mb-4">System Preferences</h2>
@@ -247,6 +261,7 @@ export default function Settings() {
               <div className="space-y-2">
                 <Label htmlFor="sensitivity">Alert Sensitivity</Label>
                 <Select value={preferences.alertSensitivity}
+                  disabled={!canManage}
                   onValueChange={(v) => setPreferences({ ...preferences, alertSensitivity: v })}>
                   <SelectTrigger id="sensitivity" data-testid="select-sensitivity">
                     <SelectValue placeholder="Select sensitivity" />
@@ -264,14 +279,19 @@ export default function Settings() {
                   <p className="text-sm text-muted-foreground">Detect anomalies using audio analysis</p>
                 </div>
                 <Switch id="audio-detection" checked={preferences.audioDetection}
+                  disabled={!canManage}
                   onCheckedChange={(c) => setPreferences({ ...preferences, audioDetection: c })}
                   data-testid="toggle-audio" />
               </div>
-              <Button onClick={handleSavePreferences} disabled={saveMut.isPending}>Save System Preferences</Button>
+              <Button onClick={handleSavePreferences} disabled={saveMut.isPending || !canManage}>Save System Preferences</Button>
             </div>
           </Card>
         </TabsContent>
+        )}
       </Tabs>
+      {!canManage && (
+        <p className="text-sm text-muted-foreground">Viewer role has read-only access to settings.</p>
+      )}
     </div>
   );
 }

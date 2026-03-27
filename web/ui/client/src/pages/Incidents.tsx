@@ -9,6 +9,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Badge } from "@/components/ui/badge";
 import { Search, Eye } from "lucide-react";
 import { api } from "@/lib/api";
+import { getSelectedTenantId } from "@/lib/tenant";
 
 interface Incident {
   id: number;
@@ -19,6 +20,8 @@ interface Incident {
   ended_at: string | null;
   camera: number;
   camera_name: string;
+  camera_source_type?: "registered" | "webcam";
+  camera_source_label?: string;
   details: Record<string, unknown>;
 }
 
@@ -34,6 +37,8 @@ export default function Incidents() {
   const [debouncedSearch, setDebouncedSearch] = useState("");
   const [filterType, setFilterType] = useState("all");
   const [filterStatus, setFilterStatus] = useState("all");
+  const selectedTenantId = getSelectedTenantId();
+  const hasActiveFilters = Boolean(debouncedSearch) || filterType !== "all" || filterStatus !== "all";
 
   useEffect(() => {
     const t = setTimeout(() => {
@@ -134,7 +139,33 @@ export default function Incidents() {
             {incidents.length === 0 && (
               <TableRow>
                 <TableCell colSpan={7} className="text-center text-muted-foreground py-8">
-                  No incidents found.
+                  <div className="space-y-2">
+                    <p>No incidents found.</p>
+                    <p className="text-xs">
+                      Scope: Community {selectedTenantId ? `#${selectedTenantId}` : "(none selected)"}
+                    </p>
+                    {(hasActiveFilters || !selectedTenantId) && (
+                      <div className="flex flex-wrap justify-center items-center gap-2 pt-1">
+                        <span className="text-xs">
+                          Filters: {debouncedSearch ? `search=\"${debouncedSearch}\"` : "search=any"}, type={filterType}, status={filterStatus}
+                        </span>
+                        {hasActiveFilters && (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() => {
+                              setSearchQuery("");
+                              setDebouncedSearch("");
+                              setFilterType("all");
+                              setFilterStatus("all");
+                            }}
+                          >
+                            Reset Filters
+                          </Button>
+                        )}
+                      </div>
+                    )}
+                  </div>
                 </TableCell>
               </TableRow>
             )}
@@ -142,7 +173,14 @@ export default function Incidents() {
               <TableRow key={incident.id} className="cursor-pointer hover-elevate" onClick={() => setLocation(`/incidents/${incident.id}`)}>
                 <TableCell className="font-medium" data-testid={`text-incident-${incident.id}`}>#{incident.id}</TableCell>
                 <TableCell className="capitalize">{incident.type}</TableCell>
-                <TableCell>{incident.camera_name || `Camera #${incident.camera}`}</TableCell>
+                <TableCell>
+                  <div className="flex items-center gap-2">
+                    <span>{incident.camera_name || `Camera #${incident.camera}`}</span>
+                    <Badge variant={incident.camera_source_type === "webcam" ? "secondary" : "outline"}>
+                      {incident.camera_source_label || (incident.camera_source_type === "webcam" ? "Webcam" : "Registered")}
+                    </Badge>
+                  </div>
+                </TableCell>
                 <TableCell>
                   <Badge variant={STATUS_BADGE[incident.status] ?? "default"} className="capitalize">
                     {incident.status}

@@ -11,6 +11,7 @@ import StatsCard from "@/components/StatsCard";
 import { Maximize2, Minimize2, Activity, Clock, TrendingUp, User, Dog, Car } from "lucide-react";
 import { PieChart, Pie, Cell, ResponsiveContainer, Legend, Tooltip } from "recharts";
 import { api } from "@/lib/api";
+import { buildWebRtcViewerUrl } from "@/lib/streaming";
 
 import frontDoorImg from '@assets/generated_images/Front_door_camera_view_eee34996.png';
 
@@ -54,11 +55,11 @@ export default function Dashboard() {
     queryFn: async () => {
       const { data } = await api.get("/dashboard/summary/");
       return data as {
-        cameras: Array<{ id: number; name: string; site: string; status: string; ai_camera_id: string }>;
+        cameras: Array<{ id: number; name: string; site: string; status: string; ai_camera_id: string; stream_path?: string }>;
         stats: { today: number; week: number; month: number };
         recent_incidents: Array<{
           id: number; type: string; status: string; severity: number;
-          started_at: string; camera__name: string; details: Record<string, unknown>;
+          started_at: string; camera__name: string; camera__source_type?: "registered" | "webcam"; details: Record<string, unknown>;
         }>;
         type_breakdown: Array<{ type: string; count: number }>;
         recent_audit: Array<{ id: number; action: string; actor: string; created_at: string }>;
@@ -114,6 +115,7 @@ export default function Dashboard() {
       location: c.site || "Unknown",
       status: (c.status === "active" ? "active" : "offline") as "active" | "offline",
       ai_camera_id: c.ai_camera_id,
+      streamUrl: buildWebRtcViewerUrl(c.stream_path, c.ai_camera_id),
       // Snapshot fallback (auth-protected) — fetched via CameraFeed blob fetch.
       // NOTE: this is relative to axios baseURL ("/api"), so do NOT prefix with /api.
       imageUrl: c.id ? `/streams/${c.id}/snapshot/` : frontDoorImg,
@@ -150,6 +152,7 @@ export default function Dashboard() {
     time: new Date(inc.started_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
     entity: (inc.details as any)?.entity_name ?? "Unknown",
     confidence: (inc.details as any)?.confidence ?? 0,
+    sourceLabel: inc.camera__source_type === "webcam" ? "Webcam" : "Registered",
   }));
 
   const stats = d?.stats ?? { today: 0, week: 0, month: 0 };
@@ -223,6 +226,7 @@ export default function Dashboard() {
                   status={focusedCamera.status}
                   cameraId={focusedCamera.id || undefined}
                   imageUrl={focusedCamera.imageUrl}
+                  streamUrl={focusedCamera.streamUrl}
                   health={focusedCamera.health}
                   timestamp={new Date().toLocaleTimeString()}
                 />
@@ -248,6 +252,7 @@ export default function Dashboard() {
                           status={camera.status}
                           cameraId={camera.id || undefined}
                           imageUrl={camera.imageUrl}
+                          streamUrl={camera.streamUrl}
                           health={camera.health}
                         />
                       </button>
@@ -272,6 +277,7 @@ export default function Dashboard() {
                       status={camera.status}
                       cameraId={camera.id || undefined}
                       imageUrl={camera.imageUrl}
+                      streamUrl={camera.streamUrl}
                       health={camera.health}
                       timestamp={new Date().toLocaleTimeString()}
                     />
@@ -302,6 +308,7 @@ export default function Dashboard() {
                   time={alert.time}
                   entity={alert.entity}
                   confidence={alert.confidence}
+                  sourceLabel={alert.sourceLabel}
                   onClick={() => setLocation(`/incidents/${alert.id}`)}
                 />
               ))}
@@ -409,6 +416,7 @@ export default function Dashboard() {
                   status={camera.status}
                   cameraId={camera.id || undefined}
                   imageUrl={camera.imageUrl}
+                  streamUrl={camera.streamUrl}
                   health={camera.health}
                   timestamp={new Date().toLocaleTimeString()}
                 />

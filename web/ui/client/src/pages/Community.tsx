@@ -36,8 +36,11 @@ import { getMembers, MembershipRow, removeMember } from "@/lib/memberships";
 import { queryClient } from "@/lib/queryClient";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { api } from "@/lib/api";
+import { useAuth } from "@/auth/AuthProvider";
 
 export default function Community() {
+  const { atLeast } = useAuth();
+  const canManage = atLeast("admin");
   /* ── Shared cameras from API ───────────────────────────────── */
   const camerasQ = useQuery({
     queryKey: ["cameras-community"],
@@ -191,17 +194,18 @@ export default function Community() {
             <p className="text-muted-foreground">
               Manage community members and their access levels
             </p>
-            <Dialog
-              open={isInviteDialogOpen}
-              onOpenChange={setIsInviteDialogOpen}
-            >
-              <DialogTrigger asChild>
-                <Button data-testid="button-invite-member">
-                  <UserPlus className="w-4 h-4 mr-2" />
-                  Invite Member
-                </Button>
-              </DialogTrigger>
-              <DialogContent>
+            {canManage ? (
+              <Dialog
+                open={isInviteDialogOpen}
+                onOpenChange={setIsInviteDialogOpen}
+              >
+                <DialogTrigger asChild>
+                  <Button data-testid="button-invite-member">
+                    <UserPlus className="w-4 h-4 mr-2" />
+                    Invite Member
+                  </Button>
+                </DialogTrigger>
+                <DialogContent>
                 <DialogHeader>
                   <DialogTitle>Invite New Member</DialogTitle>
                 </DialogHeader>
@@ -249,8 +253,11 @@ export default function Community() {
                     Send Invite
                   </Button>
                 </DialogFooter>
-              </DialogContent>
-            </Dialog>
+                </DialogContent>
+              </Dialog>
+            ) : (
+              <span className="text-xs text-muted-foreground">Read-only access</span>
+            )}
           </div>
 
           <Card>
@@ -276,7 +283,7 @@ export default function Community() {
                       {new Date(m.created_at).toLocaleDateString()}
                     </TableCell>
                     <TableCell className="text-right">
-                      {m.role !== "owner" && (
+                      {canManage && m.role !== "owner" && (
                         <Button
                           size="sm"
                           variant="ghost"
@@ -298,10 +305,12 @@ export default function Community() {
             <p className="text-muted-foreground">
               Manage camera sharing with community members
             </p>
-            <Button data-testid="button-share-camera">
-              <Share2 className="w-4 h-4 mr-2" />
-              Share Camera
-            </Button>
+            {canManage && (
+              <Button data-testid="button-share-camera">
+                <Share2 className="w-4 h-4 mr-2" />
+                Share Camera
+              </Button>
+            )}
           </div>
 
           <Card>
@@ -325,9 +334,13 @@ export default function Community() {
                       <Badge>{cam.status}</Badge>
                     </TableCell>
                     <TableCell className="text-right">
-                      <Button size="sm" variant="ghost">
-                        <Trash2 className="w-4 h-4" />
-                      </Button>
+                      {canManage ? (
+                        <Button size="sm" variant="ghost">
+                          <Trash2 className="w-4 h-4" />
+                        </Button>
+                      ) : (
+                        <span className="text-xs text-muted-foreground">Read-only</span>
+                      )}
                     </TableCell>
                   </TableRow>
                 ))}
@@ -376,6 +389,7 @@ export default function Community() {
                     </div>
                     <Switch
                       checked={zone.blurFaces}
+                      disabled={!canManage}
                       data-testid={`toggle-blur-${zone.name.toLowerCase()}`}
                     />
                   </div>
@@ -391,6 +405,7 @@ export default function Community() {
                     </div>
                     <Switch
                       checked={zone.shareOnlyIncidents}
+                      disabled={!canManage}
                       data-testid={`toggle-incidents-${zone.name.toLowerCase()}`}
                     />
                   </div>
@@ -406,6 +421,7 @@ export default function Community() {
                     </div>
                     <Switch
                       checked={zone.disableAudio}
+                      disabled={!canManage}
                       data-testid={`toggle-audio-${zone.name.toLowerCase()}`}
                     />
                   </div>

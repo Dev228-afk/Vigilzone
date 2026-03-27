@@ -14,6 +14,7 @@ interface NotificationBellProps {
   onMarkAsRead: (ids: number[]) => Promise<void>;
   onMarkAllAsRead: () => Promise<void>;
   isConnected: boolean;
+  tenantId?: number | null;
   onTestConnection?: () => Promise<void>;
   onNavigate?: (path: string) => void;  // Optional navigation callback
 }
@@ -24,6 +25,7 @@ export const NotificationBell: React.FC<NotificationBellProps> = ({
   onMarkAsRead,
   onMarkAllAsRead,
   isConnected,
+  tenantId,
   onTestConnection,
   onNavigate,
 }) => {
@@ -152,7 +154,7 @@ export const NotificationBell: React.FC<NotificationBellProps> = ({
           className={`absolute bottom-0 right-0 w-2 h-2 rounded-full border border-white ${
             isConnected ? 'bg-green-500' : 'bg-red-500'
           }`}
-          title={isConnected ? 'Connected' : 'Disconnected'}
+          title={isConnected ? 'Connected (Redis reachable)' : 'Disconnected (Redis unreachable)'}
         />
       </button>
 
@@ -210,6 +212,12 @@ export const NotificationBell: React.FC<NotificationBellProps> = ({
                 <p className="text-sm">No notifications yet</p>
                 <p className="text-xs text-gray-400 mt-1">
                   You'll see alerts here when incidents are detected
+                </p>
+                <p className="text-xs text-gray-400 mt-1">
+                  Scope: Community {tenantId ? `#${tenantId}` : "(none selected)"}
+                </p>
+                <p className="text-xs text-gray-400 mt-1">
+                  Transport: {isConnected ? "reachable" : "unreachable"}
                 </p>
               </div>
             ) : (

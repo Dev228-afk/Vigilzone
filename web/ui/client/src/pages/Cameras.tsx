@@ -12,6 +12,7 @@ import { Plus, Edit, Trash2, Wifi, WifiOff, Share2, RefreshCw } from "lucide-rea
 import { useToast } from "@/hooks/use-toast";
 import { api } from "@/lib/api";
 import { queryClient } from "@/lib/queryClient";
+import { useAuth } from "@/auth/AuthProvider";
 
 interface Camera {
   id: number | string;
@@ -27,6 +28,8 @@ interface Camera {
 
 export default function Cameras() {
   const { toast } = useToast();
+  const { atLeast } = useAuth();
+  const canManage = atLeast("member");
   const [isDialogOpen, setIsDialogOpen] = useState(false);
   const [newCamera, setNewCamera] = useState({
     name: "",
@@ -139,13 +142,18 @@ export default function Cameras() {
     });
   };
 
-  const handleAddCamera = () => addMut.mutate(newCamera);
+  const handleAddCamera = () => {
+    if (!canManage) return;
+    addMut.mutate(newCamera);
+  };
   const handleSaveEdit = () => {
+    if (!canManage) return;
     if (!editCamera) return;
     editMut.mutate({ id: editCamera.id, ...editForm });
   };
 
   const handleTestConnection = async () => {
+    if (!canManage) return;
     const url = newCamera.rtsp_url.trim();
     if (!url) {
       toast({ title: "No URL", description: "Enter an RTSP URL first.", variant: "destructive" });
@@ -175,14 +183,15 @@ export default function Cameras() {
     <div className="p-6 max-w-6xl mx-auto space-y-6">
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold">Camera Management</h1>
-        <Dialog open={isDialogOpen} onOpenChange={setIsDialogOpen}>
-          <DialogTrigger asChild>
-            <Button data-testid="button-add-camera">
-              <Plus className="w-4 h-4 mr-2" />
-              Add Camera
-            </Button>
-          </DialogTrigger>
-          <DialogContent>
+        {canManage && (
+          <Dialog open={isDialogOpen} onOpenChange={setIsDialogOpen}>
+            <DialogTrigger asChild>
+              <Button data-testid="button-add-camera">
+                <Plus className="w-4 h-4 mr-2" />
+                Add Camera
+              </Button>
+            </DialogTrigger>
+            <DialogContent>
             <DialogHeader>
               <DialogTitle>Add New Camera</DialogTitle>
             </DialogHeader>
@@ -214,9 +223,13 @@ export default function Cameras() {
                 {addMut.isPending ? "Saving…" : "Save"}
               </Button>
             </DialogFooter>
-          </DialogContent>
-        </Dialog>
+            </DialogContent>
+          </Dialog>
+        )}
       </div>
+      {!canManage && (
+        <p className="text-sm text-muted-foreground">Viewer role has read-only access to cameras.</p>
+      )}
 
       <Card>
         <Table>
@@ -262,22 +275,26 @@ export default function Cameras() {
                 </TableCell>
                 <TableCell>{new Date(camera.created_at).toLocaleDateString()}</TableCell>
                 <TableCell className="text-right">
-                  <div className="flex justify-end gap-2">
-                    <Button size="sm" variant="outline" onClick={() => syncMut.mutate(camera.id)} disabled={syncMut.isPending}>
-                      <RefreshCw className="w-3 h-3 mr-1" />
-                      Sync AI
-                    </Button>
-                    <Button size="sm" variant="outline">
-                      <Share2 className="w-3 h-3 mr-1" />
-                      Share
-                    </Button>
-                    <Button size="icon" variant="ghost" onClick={() => openEditModal(camera)}>
-                      <Edit className="w-4 h-4" />
-                    </Button>
-                    <Button size="icon" variant="ghost" onClick={() => deleteMut.mutate(camera.id)}>
-                      <Trash2 className="w-4 h-4" />
-                    </Button>
-                  </div>
+                  {canManage ? (
+                    <div className="flex justify-end gap-2">
+                      <Button size="sm" variant="outline" onClick={() => syncMut.mutate(camera.id)} disabled={syncMut.isPending}>
+                        <RefreshCw className="w-3 h-3 mr-1" />
+                        Sync AI
+                      </Button>
+                      <Button size="sm" variant="outline">
+                        <Share2 className="w-3 h-3 mr-1" />
+                        Share
+                      </Button>
+                      <Button size="icon" variant="ghost" onClick={() => openEditModal(camera)}>
+                        <Edit className="w-4 h-4" />
+                      </Button>
+                      <Button size="icon" variant="ghost" onClick={() => deleteMut.mutate(camera.id)}>
+                        <Trash2 className="w-4 h-4" />
+                      </Button>
+                    </div>
+                  ) : (
+                    <span className="text-xs text-muted-foreground">Read-only</span>
+                  )}
                 </TableCell>
               </TableRow>
             ))}
@@ -285,7 +302,7 @@ export default function Cameras() {
         </Table>
       </Card>
 
-      <Dialog open={!!editCamera} onOpenChange={(open) => { if (!open) setEditCamera(null); }}>
+      <Dialog open={canManage && !!editCamera} onOpenChange={(open) => { if (!open) setEditCamera(null); }}>
         <DialogContent>
           <DialogHeader>
             <DialogTitle>Edit Camera</DialogTitle>
