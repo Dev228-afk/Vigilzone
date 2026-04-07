@@ -5,7 +5,6 @@ AnyAnomaly subprocess, aggregation, evidence export, and alerting.
 
 Supports:
   - Mode A: Realtime (RTSP / live webcam)
-  - Mode B: Upload (offline video processing)
 """
 import argparse
 import time
@@ -16,6 +15,7 @@ from pathlib import Path
 from typing import Dict, List, Any, Optional
 import sys
 import os
+from dotenv import load_dotenv
 
 # Ensure import paths
 src_dir = Path(__file__).parent
@@ -23,6 +23,10 @@ parent_dir = src_dir.parent
 sys.path.insert(0, str(src_dir))
 sys.path.insert(0, str(parent_dir))
 os.chdir(parent_dir)
+
+# Load environment variables from .env
+load_dotenv()
+load_dotenv(parent_dir / ".env")  # Also try root .env
 
 from src.common.config import Config
 from src.common.log import setup_logger
@@ -32,15 +36,8 @@ from src.common.types import Observation, Alert
 # Ingest backends
 from src.ingest.opencv_reader import OpenCVReader
 from src.ingest.ffmpeg_reader import FFmpegReader
-from src.ingest.deepstream_stub import DeepStreamStub
 from src.ingest.live_camera import LiveCameraReader
 from src.ingest.frame_store import LatestFrameStore
-
-# Detection lanes (legacy)
-from src.lanes.person_zone import PersonZoneLane
-from src.lanes.fire_smoke import FireSmokeLane
-from src.lanes.violence import ViolenceLane
-from src.lanes.vad_generic import VADGenericLane
 
 # Detection lanes (new)
 from src.lanes.rt_detr import RTDETRLane
@@ -103,24 +100,16 @@ LANE_REGISTRY = {
     "anomalyclip": AnomalyCLIPLane,
     "temporal_verifier": TemporalVerifierLane,
     "entity_identity": EntityIdentityLane,
-    # Legacy lanes
-    "person_zone": PersonZoneLane,
-    "fire_smoke": FireSmokeLane,
-    "violence": ViolenceLane,
-    "vad_generic": VADGenericLane,
 }
 
 # Lanes that accept zones in constructor
-_ZONE_LANES = {"person_zone"}
+_ZONE_LANES = {"anyanomaly"}
 
-# Lane name → Hz config category (maps to cameras.yaml sample_hz keys)
+# Lane name → Hz config category
 _LANE_HZ_CATEGORY = {
     "rt_detr": "detector",
     "yolov8_fallback": "detector",
     "fire_smoke_yolo": "detector",
-    "fire_smoke": "detector",
-    "person_zone": "detector",
-    "violence": "detector",
     "violence_candidate": "anomaly",
     "fall_candidate": "anomaly",
     "yolo_pose": "detector",
@@ -128,7 +117,6 @@ _LANE_HZ_CATEGORY = {
     "accident": "anomaly",
     "anyanomaly": "anomaly",
     "anomalyclip": "anomaly",
-    "vad_generic": "anomaly",
     "temporal_verifier": "temporal",
     "entity_identity": "identity",
 }
@@ -174,8 +162,8 @@ class CameraProcessor:
         # Ingest
         self.reader = self._create_reader()
 
-        # Evidence ring buffer (20 s to cover 5+5+margin)
-        self.ringbuffer = FrameRingBuffer(self.camera_id, max_seconds=20.0, fps=10.0)
+        # Evidence ring buffer (15s — optimized overhead)
+        self.ringbuffer = FrameRingBuffer(self.camera_id, max_seconds=15.0, fps=10.0)
 
         # Lanes
         self.lanes = self._create_lanes()
@@ -226,8 +214,6 @@ class CameraProcessor:
             return LiveCameraReader(self.camera_id, camera_index=idx)
         elif backend == "ffmpeg":
             return FFmpegReader(self.camera_id, self.camera_cfg["rtsp_url"])
-        elif backend == "deepstream":
-            return DeepStreamStub(self.camera_id, self.camera_cfg["rtsp_url"])
         else:
             return OpenCVReader(self.camera_id, self.camera_cfg.get("rtsp_url", "0"))
 
@@ -262,10 +248,7 @@ class CameraProcessor:
                         lane.set_matcher(self._identity_matcher)
                     if self._identity_stabilizer:
                         lane.set_stabilizer(self._identity_stabilizer)
-                    # Share person detector from person_zone if available
-                    pz = lanes.get("person_zone")
-                    if pz and hasattr(pz, "model") and pz.model is not None:
-                        lane.set_person_detector(pz.model)
+                    # Identity lane specific setup could go here if needed
 
                 lane.init()
 
@@ -277,9 +260,7 @@ class CameraProcessor:
                 lanes[name] = lane
                 self.logger.info(f"Initialised lane: {name}")
 
-                # Wire person_zone into aggregator for loitering observation polling
-                if name == "person_zone":
-                    self.aggregator.set_person_zone_lane(self.camera_id, lane)
+                # Reserved for future lane wiring
 
             except Exception as e:
                 self.logger.error(f"Lane init failed ({name}): {e}")
@@ -369,7 +350,7 @@ class CameraProcessor:
         # GPU lanes eligible for scheduler dispatch
         _GPU_LANES = frozenset({
             "rt_detr", "yolov8_fallback", "fire_smoke_yolo",
-            "fire_smoke", "weapon_yolo", "entity_identity",
+            "weapon_yolo", "entity_identity",
             "yolo_pose",
         })
         _STUCK_WARN_AFTER_S = 5.0
@@ -527,15 +508,7 @@ class CameraProcessor:
                         lane_inflight[lane_name] = fut
                         lane_inflight_started[lane_name] = now
 
-                # ── Poll loitering observations from person_zone ──────
-                try:
-                    self.aggregator.process_loitering(
-                        self.camera_id,
-                        evidence_request_callback=self._request_evidence_async,
-                        ringbuffer=self.ringbuffer,
-                    )
-                except Exception as e:
-                    self.logger.error(f"Loitering processing error: {e}")
+                # ──────────────────────────────────────────────────────
 
                 frame_count += 1
                 self.stats["frames_processed"] = frame_count
@@ -606,10 +579,9 @@ class CameraProcessor:
                 "partial_clip": False,
             }
         except Exception as e:
-            self.logger.error(f"Evidence keyframe export failed: {e}")
+            self.logger.error(f"Evidence export failed: {e}")
             return {"keyframe_path": "", "clip_path": "", "partial_clip": True}
 
-    # ------------------------------------------------------------------
     def _export_clip_only(self, camera_id: str, alert_type: str, ts_utc: str,
                           clip_path, ev_cfg: dict):
         """Background clip export — waits for post-event frames then writes MP4."""
@@ -662,7 +634,9 @@ class CameraProcessor:
             "camera_id": self.camera_id,
             "source_type": self.camera_cfg.get("source_type", "rtsp"),
             "connected": self.reader.is_connected(),
+            "active": self.reader.is_connected(),
             "frames_processed": self.stats["frames_processed"],
+            "frame_count": self.stats["frames_processed"],
             "fps": round(self.stats["fps"], 2),
             "buffer_size": self.ringbuffer.size(),
             "active_lanes": list(self.lanes.keys()),
@@ -802,6 +776,7 @@ class CCTVAIModule:
         self.processors: List[CameraProcessor] = []
         self.api_server: Optional[AlertServer] = None
         self.api_thread: Optional[threading.Thread] = None
+        self._alert_dispatch_callback_registered = False
 
         self.webcam_default_enabled = str(
             os.getenv("AI_WEBCAM_DEFAULT_ENABLED", "false")
@@ -809,6 +784,52 @@ class CCTVAIModule:
 
         # §2.2 — shared latest-frame store across all cameras
         self.frame_store = LatestFrameStore()
+
+    # ------------------------------------------------------------------
+    def _build_alert_dispatch_payload(self, alert: Alert) -> Dict[str, Any]:
+        payload = alert.to_dict()
+        proc = next((item for item in self.processors if item.camera_id == alert.camera_id), None)
+        if proc is None:
+            return payload
+
+        camera_cfg = getattr(proc, "camera_cfg", {}) or {}
+        if camera_cfg.get("tenant_id") not in (None, ""):
+            payload["tenant_id"] = camera_cfg.get("tenant_id")
+        if camera_cfg.get("source_type"):
+            payload["source_type"] = camera_cfg.get("source_type")
+        if camera_cfg.get("camera_name"):
+            payload["camera_name"] = camera_cfg.get("camera_name")
+        return payload
+
+    def _register_dispatch_callbacks(self):
+        if self._alert_dispatch_callback_registered:
+            return
+
+        # 1. Alert callback (confirmed incidents)
+        def _alert_cb(alert: Alert):
+            if self.api_server:
+                payload = self._build_alert_dispatch_payload(alert)
+                asyncio.run(self.api_server.broadcast_alert(payload))
+
+        self.aggregator.add_alert_callback(_alert_cb)
+
+        # 2. Observation callback (real-time detections)
+        def _obs_cb(obs: Observation):
+            if self.api_server:
+                # We only broadcast if there's an actual detection (trigger or label)
+                if obs.trigger or obs.label:
+                    payload = {
+                        "ts_utc": obs.ts_utc,
+                        "camera_id": obs.camera_id,
+                        "lane": obs.lane,
+                        "label": obs.label,
+                        "score": round(obs.score, 3),
+                        "bbox": obs.bbox,
+                    }
+                    asyncio.run(self.api_server.broadcast_detection(payload))
+
+        self.aggregator.add_observation_callback(_obs_cb)
+        self._alert_dispatch_callback_registered = True
 
     # ------------------------------------------------------------------
     def start(self):
@@ -850,16 +871,8 @@ class CCTVAIModule:
                 )
                 proc.start()
                 self.processors.append(proc)
-                self.logger.info(f"Started processor for {cid}")
             except Exception as e:
                 self.logger.error(f"Failed to start camera {cam_cfg['camera_id']}: {e}")
-
-        # Alert -> WebSocket
-        if self.api_server:
-            def _ws_cb(alert: Alert):
-                if self.api_server:
-                    asyncio.run(self.api_server.broadcast_alert(alert.to_dict()))
-            self.aggregator.add_alert_callback(_ws_cb)
 
         self.start_api_server()
 
@@ -878,7 +891,6 @@ class CCTVAIModule:
         self.api_server.set_camera_processors(self.processors)
         self.api_server.set_gpu_scheduler(self.gpu_scheduler)
         self.api_server.set_auto_throttle(self.auto_throttle)
-        self.api_server.set_process_video_fn(self.process_uploaded_video)
         self.api_server.set_doctor_report(self.doctor_report)
         self.api_server.set_frame_store(self.frame_store)
         self.api_server.set_identity_components(
@@ -895,97 +907,11 @@ class CCTVAIModule:
             "camera_configs": self.camera_configs,
             "anyanomaly_client": getattr(self, "anyanomaly_client", None),
         })
+        # Register callbacks
+        self._register_dispatch_callbacks()
+
         self.api_thread = threading.Thread(target=self.api_server.run, daemon=True)
         self.api_thread.start()
-
-    # ------------------------------------------------------------------
-    def process_uploaded_video(self, video_path: str, job_id: str,
-                               fps: float, force_anyanomaly: bool = False,
-                               progress_callback=None) -> List[Dict]:
-        """
-        Offline mode: process an uploaded video through all lanes.
-        Uses frame index math for evidence extraction.
-        Returns list of alert dicts.
-        """
-        self.logger.info(f"Processing uploaded video: {video_path} (job={job_id})")
-
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            self.logger.error(f"Cannot open video: {video_path}")
-            return []
-
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        video_fps = cap.get(cv2.CAP_PROP_FPS) or fps
-
-        # Create a temporary aggregator for this job
-        k, n = 3, 5
-        cooldown_s = 45
-        if self.camera_configs:
-            k, n = self.camera_configs[0].get("k_of_n", [3, 5])
-            cooldown_s = self.camera_configs[0].get("cooldown_s", 45)
-        job_aggregator = AlertAggregator(k=k, n=n, cooldown_s=cooldown_s)
-
-        # Create lanes for processing
-        device = self.models_cfg.get("device", "auto")
-        camera_id = f"upload_{job_id}"
-        lanes = {}
-        enabled = ["rt_detr", "yolov8_fallback", "fire_smoke_yolo", "anomalyclip"]
-        if force_anyanomaly:
-            enabled.append("anyanomaly")
-
-        for name in enabled:
-            cls = LANE_REGISTRY.get(name)
-            if cls is None:
-                continue
-            try:
-                lane = cls(name, camera_id, self.models_cfg, device)
-                lane.init()
-                lanes[name] = lane
-                if name == "anyanomaly" and self.anyanomaly_client:
-                    lane.set_client(self.anyanomaly_client)
-            except Exception as e:
-                self.logger.warning(f"Offline lane init failed ({name}): {e}")
-
-        # Ring buffer for evidence
-        ringbuffer = FrameRingBuffer(camera_id, max_seconds=20.0, fps=video_fps)
-
-        alerts = []
-        frame_idx = 0
-        sample_interval = max(1, int(video_fps / 2))  # ~2 Hz
-
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            frame_idx += 1
-            ts_utc = f"frame_{frame_idx}"
-
-            ringbuffer.add_frame(frame, ts_utc)
-
-            # Only process every N frames
-            if frame_idx % sample_interval != 0:
-                if progress_callback and total_frames > 0:
-                    progress_callback(round(frame_idx / total_frames * 100, 1))
-                continue
-
-            for lane_name, lane in lanes.items():
-                if getattr(lane, "on_demand", False):
-                    continue
-                try:
-                    obs = lane.infer(frame, ts_utc)
-                    alert = job_aggregator.process_observation(obs, ringbuffer=ringbuffer)
-                    if alert:
-                        alerts.append(alert.to_dict())
-                except Exception as e:
-                    self.logger.error(f"Offline lane {lane_name} error: {e}")
-
-            if progress_callback and total_frames > 0:
-                progress_callback(round(frame_idx / total_frames * 100, 1))
-
-        cap.release()
-        self.logger.info(f"Offline processing complete: {len(alerts)} alerts from {frame_idx} frames")
-        return alerts
 
     # ------------------------------------------------------------------
     def print_status(self):

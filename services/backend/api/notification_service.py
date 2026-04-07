@@ -8,7 +8,7 @@ This service provides:
 """
 
 import logging
-from typing import Optional
+from typing import Optional, Tuple, List, Dict
 from datetime import datetime
 
 from django.conf import settings
@@ -18,7 +18,7 @@ from django.utils import timezone
 from channels.layers import get_channel_layer
 from asgiref.sync import async_to_sync
 
-from .models import Incident, Alert, Membership, NotificationChannel
+from .models import Incident, Alert, Membership, NotificationChannel, severity_level_for_value
 
 logger = logging.getLogger(__name__)
 
@@ -28,9 +28,10 @@ class NotificationService:
     Service for sending notifications to all members of a tenant.
     
     Usage:
-        service = NotificationService()
-        service.broadcast_incident(incident)
-        service.broadcast_message(tenant_id, "System maintenance in 5 minutes")
+        from .notification_service import NotificationService
+        from django.db import transaction
+
+        transaction.on_commit(lambda: NotificationService.broadcast_incident(instance))
     """
 
     @staticmethod
@@ -72,29 +73,28 @@ class NotificationService:
         except NotificationChannel.DoesNotExist:
             channel_settings = None
 
-        # 2. Create Alert records for all members (do this first to get IDs)
-        alerts_created, alert_ids, user_alert_ids = cls._create_alerts_for_members(
-            incident=incident,
-            notification={}
-        )
-        results["alerts_created"] = alerts_created
+        # 2. Build notification payload
+        notification = cls._build_incident_notification(incident)
 
-        # 3. Build notification payload with alert IDs
-        notification = cls._build_incident_notification(
-            incident,
-            alert_ids=alert_ids,
-            user_alert_ids=user_alert_ids,
-        )
+        # 3. Create alert records (obtaining IDs for user-specific routing)
+        count, alert_ids, user_map = cls._create_alerts_for_members(incident, notification)
+        results["alerts_created"] = count
+        
+        # 4. Build the WebSocket event payload
+        event_payload = {
+            **notification,
+            "alert_ids_by_user": user_map, # Key: user_id, Value: alert_id (for consumers.py)
+        }
 
-        # 4. WebSocket broadcast to all tenant members
+        # 5. Request broadcast via channel layer
         ws_result = cls._broadcast_to_channel(
             tenant_id=tenant.id,
             notification_type="incident",
-            data=notification
+            data=event_payload
         )
         results["websocket"] = ws_result
 
-        # 5. Email notification (if configured and threshold met)
+        # 6. Email notification (if configured and threshold met)
         if channel_settings and channel_settings.email_enabled:
             if incident.severity >= channel_settings.min_severity_int():
                 email_result = cls._send_email_notification(
@@ -103,7 +103,7 @@ class NotificationService:
                 )
                 results["email"] = email_result
 
-        # 6. Push notification (FCM) - placeholder for future
+        # 7. Push notification (FCM) - placeholder for future
         if channel_settings and channel_settings.push_enabled:
             if incident.severity >= channel_settings.min_severity_int():
                 results["push"] = cls._send_push_notification(
@@ -113,7 +113,7 @@ class NotificationService:
 
         logger.info(
             f"Broadcast incident #{incident.id} to tenant {tenant.name}: "
-            f"websocket={results['websocket']}, alerts={alerts_created}"
+            f"websocket={results['websocket']}, alerts={count}"
         )
 
         return results
@@ -177,11 +177,74 @@ class NotificationService:
         Returns:
             "sent" if successful, error message otherwise
         """
+        group_name = f"tenant_notifications_{tenant_id}"
+        
+        # On Windows, async_to_sync(channel_layer.group_send) often deadlocks when run
+        # inside synchronous management commands (like subscribe_incidents) 
+        # or synchronous webhooks. We bypass it by natively publishing to the Redis backend.
+        import sys
+        if sys.platform == "win32":
+            try:
+                import redis
+                import msgpack
+                import time
+                import secrets
+                from server.redis_runtime import resolve_backend_redis_settings
+                
+                settings = resolve_backend_redis_settings()
+                if settings.url:
+                    client = redis.from_url(settings.url)
+                else:
+                    client = redis.Redis(
+                        host=settings.host,
+                        port=settings.port,
+                        db=settings.db,
+                        password=settings.password or None,
+                        socket_timeout=5
+                    )
+                
+                # channels_redis encodes groups internally with prefix "asgi" and single colon
+                prefix = "asgi"
+                group_key = f"{prefix}:group:{group_name}"
+                channels = client.zrange(group_key, 0, -1)
+                
+                if not channels:
+                    logger.debug(f"Direct push skipped: No channels in group {group_name}")
+                    return "sent"
+                    
+                for channel_bytes in channels:
+                    channel_name = channel_bytes.decode("utf-8")
+                    
+                    # Resolve Redis key for this channel (handled identical to channels_redis)
+                    non_local = channel_name
+                    if "!" in channel_name:
+                        non_local = channel_name.split("!")[0] + "!"
+                    channel_key = prefix + non_local
+                    
+                    # Build message identical to channels_redis group_send output
+                    msg = {
+                        "__asgi_channel__": [channel_name], 
+                        "type": "notification_message", 
+                        "data": data
+                    }
+                    # channels_redis prepends 12 random bytes to every msgpack payload
+                    packed = msgpack.packb(msg)
+                    payload = secrets.token_bytes(12) + packed
+                    
+                    # Channels redis pushes to a specific channel's zset
+                    client.zadd(channel_key, {payload: time.time()})
+                    client.expire(channel_key, 60)
+                    
+                logger.info(f"Direct push succeeded for group {group_name} to {len(channels)} channels via pure sync.")
+                return "sent"
+            except Exception as e:
+                logger.error(f"Failed direct synchronous Redis push for group {group_name}: {e}")
+                # Fall through to default channel_layer just in case
+                pass
+
         channel_layer = cls.get_channel_layer()
         if not channel_layer:
             return "channel_layer_unavailable"
-
-        group_name = f"tenant_notifications_{tenant_id}"
 
         try:
             async_to_sync(channel_layer.group_send)(
@@ -199,13 +262,12 @@ class NotificationService:
     @classmethod
     def _build_incident_notification(
         cls,
-        incident: Incident,
-        alert_ids: list = None,
-        user_alert_ids: Optional[dict] = None,
+        incident: Incident
     ) -> dict:
         """Build notification payload from an incident."""
         severity_labels = {1: "Low", 2: "Medium-Low", 3: "Medium", 4: "High", 5: "Critical"}
         
+        severity_level = severity_level_for_value(incident.severity)
         notification = {
             "type": "notification",
             "notification_type": "incident",
@@ -216,65 +278,61 @@ class NotificationService:
                 "type": incident.type,
                 "status": incident.status,
                 "severity": incident.severity,
+                "severity_level": severity_level,
                 "camera_id": incident.camera_id,
                 "camera_name": incident.camera.name,
+                "stream_path": getattr(incident.camera, 'stream_path', None),
                 "started_at": incident.started_at.isoformat() if incident.started_at else None,
                 "details": incident.details,
             },
+            "severity": incident.severity,
+            "severity_level": severity_level,
             "created_at": timezone.now().isoformat(),
-            "alert_ids_by_user": user_alert_ids or {},
         }
-        
-        # Include first alert ID for mark-as-read functionality
-        if alert_ids:
-            notification["alert_id"] = alert_ids[0] if alert_ids else None
         
         return notification
 
     @classmethod
-    def _create_alerts_for_members(
-        cls,
-        incident: Incident,
-        notification: dict
-    ) -> tuple[int, list, dict]:
+    def _create_alerts_for_members(cls, incident: Incident, notification: dict) -> Tuple[int, List[int], Dict[int, int]]:
         """
-        Create Alert records for all tenant members.
+        Creates Alert records for all members of the tenant.
+        Returns (count, alert_ids, user_to_alert_map).
         
-        Returns:
-            Tuple of (number of alerts created, list of created alert IDs)
+        Note: On SQLite, bulk_create with return_objects=True does not return 
+        primary keys. We use individual saves here for reliability in dev environments.
         """
-        memberships = Membership.objects.filter(
-            tenant=incident.tenant
-        ).select_related("user")
+        members = Membership.objects.filter(tenant=incident.tenant).select_related("user", "user__profile")
+        
+        alert_ids = []
+        user_to_alert_map = {}
+        
+        # We perform individual saves to ensure we get IDs back for WebSocket routing
+        # In high-volume production, this would be optimized or moved to a task queue
+        for member in members:
+            # Check preferences
+            if not member.user.profile.allows_instant_notification(incident.severity):
+                continue
 
-        alerts = []
-        membership_by_username = {}
-        for membership in memberships:
-            membership_by_username[membership.user.username] = membership.user_id
-            alerts.append(Alert(
+            alert = Alert(
                 incident=incident,
                 channel="websocket",
                 payload={
-                    "title": notification.get("title", f"🚨 {incident.get_type_display()} Detected"),
-                    "message": notification.get("message", f"Incident at {incident.camera.name}"),
+                    "title": f"🚨 {incident.get_type_display()} Detected",
+                    "message": f"{incident.camera.name}: {incident.get_type_display()} alert",
                     "data": notification.get("data", {}),
-                    "user_id": membership.user_id,
-                    "username": membership.user.username,
+                    "alert_id": None, # Will be set after save
+                    "user_id": member.user.id,
+                    "username": member.user.username
                 }
-            ))
-
-        if alerts:
-            Alert.objects.bulk_create(alerts)
-            # Get the IDs of the created alerts
-            alert_ids = [alert.id for alert in alerts]
-            user_alert_ids = {}
-            for alert in alerts:
-                username = (alert.payload or {}).get("username")
-                user_id = membership_by_username.get(username)
-                if user_id is not None:
-                    user_alert_ids[str(user_id)] = alert.id
-            return len(alerts), alert_ids, user_alert_ids
-        return 0, [], {}
+            )
+            alert.save()
+            alert.payload["alert_id"] = alert.id
+            alert.save(update_fields=["payload"])
+            
+            alert_ids.append(alert.id)
+            user_to_alert_map[member.user.id] = alert.id
+            
+        return len(alert_ids), alert_ids, user_to_alert_map
 
     @classmethod
     def _send_email_notification(

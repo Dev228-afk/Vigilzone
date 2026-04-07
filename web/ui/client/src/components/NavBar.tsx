@@ -44,6 +44,8 @@ export default function NavBar() {
   const {
     notifications,
     unreadCount,
+    isConnected,
+    isSubscribed,
     redisReachable,
     connect,
     disconnect,
@@ -126,7 +128,9 @@ export default function NavBar() {
               unreadCount={unreadCount}
               onMarkAsRead={markAsRead}
               onMarkAllAsRead={markAllAsRead}
-              isConnected={redisReachable}
+              isConnected={isConnected}
+              isSubscribed={isSubscribed}
+              transportHealthy={redisReachable}
               tenantId={tenantIdNum}
               onTestConnection={canTestNotifications ? () => testWebSocket(tenantIdNum) : undefined}
               onNavigate={(path) => setLocation(path)}

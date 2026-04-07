@@ -1,12 +1,10 @@
-/**
- * NotificationBell Component
- * 
- * A notification bell icon with dropdown showing real-time notifications.
- * Integrates with the useNotifications hook.
- */
-
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { Bell, BellRing, CheckCheck, CircleAlert, Dot, Info, Radar, ShieldAlert, Siren } from 'lucide-react';
 import { Notification } from '../hooks/useNotifications';
+import { Button } from '@/components/ui/button';
+import { Badge } from '@/components/ui/badge';
+import { ScrollArea } from '@/components/ui/scroll-area';
+import { cn } from '@/lib/utils';
 
 interface NotificationBellProps {
   notifications: Notification[];
@@ -14,9 +12,75 @@ interface NotificationBellProps {
   onMarkAsRead: (ids: number[]) => Promise<void>;
   onMarkAllAsRead: () => Promise<void>;
   isConnected: boolean;
+  isSubscribed?: boolean;
+  transportHealthy?: boolean;
   tenantId?: number | null;
   onTestConnection?: () => Promise<void>;
-  onNavigate?: (path: string) => void;  // Optional navigation callback
+  onNavigate?: (path: string) => void;
+}
+
+const severityLabelByLevel: Record<string, string> = {
+  critical: 'Critical',
+  severe: 'Severe',
+  moderate: 'Moderate',
+  low: 'Low',
+  info: 'Info',
+};
+
+function formatTime(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return 'Just now';
+  return date.toLocaleString([], {
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
+
+function getSeverityLevel(notification: Notification) {
+  return String(
+    notification.data?.severity_level ||
+      notification.severity_level ||
+      (notification.severity && notification.severity >= 5
+        ? 'critical'
+        : notification.severity && notification.severity >= 4
+          ? 'severe'
+          : notification.severity && notification.severity >= 3
+            ? 'moderate'
+            : notification.severity && notification.severity >= 2
+              ? 'low'
+              : 'info')
+  );
+}
+
+function getIncidentId(notification: Notification): number | undefined {
+  if (typeof notification.incident_id === 'number') return notification.incident_id;
+  const nested = notification.data?.incident_id;
+  return typeof nested === 'number' ? nested : undefined;
+}
+
+function getSeverityIcon(level: string) {
+  if (level === 'critical') return <Siren className="h-4 w-4" />;
+  if (level === 'severe') return <ShieldAlert className="h-4 w-4" />;
+  if (level === 'moderate') return <CircleAlert className="h-4 w-4" />;
+  if (level === 'low') return <Radar className="h-4 w-4" />;
+  return <Info className="h-4 w-4" />;
+}
+
+function severityBadgeClass(level: string) {
+  switch (level) {
+    case 'critical':
+      return 'border-red-500/30 bg-red-500/15 text-red-600 dark:text-red-300';
+    case 'severe':
+      return 'border-orange-500/30 bg-orange-500/15 text-orange-600 dark:text-orange-300';
+    case 'moderate':
+      return 'border-amber-500/30 bg-amber-500/15 text-amber-600 dark:text-amber-300';
+    case 'low':
+      return 'border-sky-500/30 bg-sky-500/15 text-sky-600 dark:text-sky-300';
+    default:
+      return 'border-border bg-secondary text-secondary-foreground';
+  }
 }
 
 export const NotificationBell: React.FC<NotificationBellProps> = ({
@@ -25,6 +89,8 @@ export const NotificationBell: React.FC<NotificationBellProps> = ({
   onMarkAsRead,
   onMarkAllAsRead,
   isConnected,
+  isSubscribed = false,
+  transportHealthy = isConnected,
   tenantId,
   onTestConnection,
   onNavigate,
@@ -32,7 +98,6 @@ export const NotificationBell: React.FC<NotificationBellProps> = ({
   const [isOpen, setIsOpen] = useState(false);
   const dropdownRef = useRef<HTMLDivElement>(null);
 
-  // Close dropdown when clicking outside
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
       if (dropdownRef.current && !dropdownRef.current.contains(event.target as Node)) {
@@ -46,74 +111,30 @@ export const NotificationBell: React.FC<NotificationBellProps> = ({
     }
   }, [isOpen]);
 
-  const getSeverityColor = (severity?: number) => {
-    if (!severity) return 'text-gray-500';
-    if (severity >= 4) return 'text-red-500';
-    if (severity >= 3) return 'text-orange-500';
-    return 'text-yellow-500';
-  };
+  const visibleNotifications = useMemo(() => notifications, [notifications]);
+  const connectionLabel = transportHealthy
+    ? isSubscribed
+      ? 'Realtime live'
+      : isConnected
+        ? 'Connected (no sub)'
+        : 'Redis Reachable'
+    : isConnected
+      ? 'Socket connected'
+      : 'Offline';
 
-  const getSeverityBadge = (severity?: number) => {
-    if (!severity) return null;
-    const labels = { 1: 'Low', 2: 'Med-Low', 3: 'Medium', 4: 'High', 5: 'Critical' };
-    const colors = {
-      1: 'bg-gray-100 text-gray-700',
-      2: 'bg-blue-100 text-blue-700',
-      3: 'bg-yellow-100 text-yellow-700',
-      4: 'bg-orange-100 text-orange-700',
-      5: 'bg-red-100 text-red-700',
-    };
-    return (
-      <span className={`text-xs px-1.5 py-0.5 rounded ${colors[severity as keyof typeof colors]}`}>
-        {labels[severity as keyof typeof labels]}
-      </span>
-    );
-  };
-
-  const formatTime = (dateStr: string) => {
-    const date = new Date(dateStr);
-    const now = new Date();
-    const diffMs = now.getTime() - date.getTime();
-    const diffMins = Math.floor(diffMs / 60000);
-    const diffHours = Math.floor(diffMs / 3600000);
-    const diffDays = Math.floor(diffMs / 86400000);
-
-    if (diffMins < 1) return 'Just now';
-    if (diffMins < 60) return `${diffMins}m ago`;
-    if (diffHours < 24) return `${diffHours}h ago`;
-    if (diffDays < 7) return `${diffDays}d ago`;
-    return date.toLocaleDateString();
-  };
-
-  // Helper to get incident_id from notification (could be at top level or in data)
-  const getIncidentId = (notification: Notification): number | undefined => {
-    return notification.incident_id || notification.data?.incident_id;
-  };
-
-  const handleNotificationClick = (notification: Notification) => {
-    // Close the dropdown
+  const handleNotificationClick = async (notification: Notification) => {
     setIsOpen(false);
-    
-    // Mark as read using the alert_id from the notification (backend-provided Alert ID)
-    if (notification.alert_id) {
-      console.log('[NotificationBell] Marking as read:', notification.alert_id);
-      onMarkAsRead([notification.alert_id]);
-    } else {
-      console.log('[NotificationBell] No alert_id found on notification:', notification);
+
+    if (notification.alert_id && !notification.is_read) {
+      await onMarkAsRead([notification.alert_id]);
     }
-    
-    // Navigate to incident detail page using the provided callback or fallback to history
+
     const incidentId = getIncidentId(notification);
-    console.log('[NotificationBell] Incident ID:', incidentId);
-    console.log('[NotificationBell] Notification object:', notification);
-    
     if (incidentId) {
       const path = `/incidents/${incidentId}`;
-      console.log('[NotificationBell] Navigating to:', path);
       if (onNavigate) {
         onNavigate(path);
       } else {
-        // Fallback to history.pushState
         window.history.pushState({}, '', path);
         window.dispatchEvent(new PopStateEvent('popstate'));
       }
@@ -122,168 +143,132 @@ export const NotificationBell: React.FC<NotificationBellProps> = ({
 
   return (
     <div className="relative" ref={dropdownRef}>
-      {/* Bell Button */}
-      <button
-        onClick={() => setIsOpen(!isOpen)}
-        className="relative p-2 rounded-full hover:bg-gray-100 transition-colors"
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon"
+        className="relative rounded-full border border-transparent hover:border-border hover:bg-accent"
         aria-label="Notifications"
+        onClick={() => setIsOpen((prev) => !prev)}
       >
-        <svg
-          className="w-6 h-6 text-gray-600"
-          fill="none"
-          stroke="currentColor"
-          viewBox="0 0 24 24"
-        >
-          <path
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            strokeWidth={2}
-            d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9"
-          />
-        </svg>
-
-        {/* Unread Badge */}
+        {unreadCount > 0 ? <BellRing className="h-5 w-5" /> : <Bell className="h-5 w-5" />}
         {unreadCount > 0 && (
-          <span className="absolute -top-1 -right-1 flex items-center justify-center w-5 h-5 text-xs font-bold text-white bg-red-500 rounded-full">
+          <span className="absolute -right-1 -top-1 flex h-5 min-w-5 items-center justify-center rounded-full bg-destructive px-1 text-[10px] font-semibold text-destructive-foreground shadow-sm">
             {unreadCount > 9 ? '9+' : unreadCount}
           </span>
         )}
-
-        {/* Connection Status Indicator */}
         <span
-          className={`absolute bottom-0 right-0 w-2 h-2 rounded-full border border-white ${
-            isConnected ? 'bg-green-500' : 'bg-red-500'
-          }`}
-          title={isConnected ? 'Connected (Redis reachable)' : 'Disconnected (Redis unreachable)'}
+          className={cn(
+            'absolute bottom-1 right-1 h-2.5 w-2.5 rounded-full border border-background',
+            isSubscribed ? 'bg-emerald-500' 
+              : isConnected ? 'bg-amber-500' 
+              : transportHealthy ? 'bg-sky-500' 
+              : 'bg-muted-foreground/60'
+          )}
+          title={connectionLabel}
         />
-      </button>
+      </Button>
 
-      {/* Dropdown */}
       {isOpen && (
-        <div className="absolute right-0 mt-2 w-80 bg-white rounded-lg shadow-xl border border-gray-200 z-50">
-          {/* Header */}
-          <div className="flex items-center justify-between px-4 py-3 border-b border-gray-100">
-            <div className="flex items-center gap-2">
-              <h3 className="font-semibold text-gray-800">Notifications</h3>
-              {unreadCount > 0 && (
-                <span className="text-xs bg-red-100 text-red-700 px-2 py-0.5 rounded-full">
-                  {unreadCount} new
-                </span>
-              )}
-            </div>
-            <div className="flex items-center gap-2">
-              {unreadCount > 0 && (
-                <button
-                  onClick={onMarkAllAsRead}
-                  className="text-xs text-blue-600 hover:text-blue-700"
-                >
-                  Mark all read
-                </button>
-              )}
-              {onTestConnection && (
-                <button
-                  onClick={onTestConnection}
-                  className="text-xs text-gray-500 hover:text-gray-700"
-                  title="Test notification"
-                >
-                  Test
-                </button>
-              )}
-            </div>
-          </div>
-
-          {/* Notification List */}
-          <div className="max-h-96 overflow-y-auto">
-            {notifications.length === 0 ? (
-              <div className="px-4 py-8 text-center text-gray-500">
-                <svg
-                  className="w-12 h-12 mx-auto text-gray-300 mb-2"
-                  fill="none"
-                  stroke="currentColor"
-                  viewBox="0 0 24 24"
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth={1.5}
-                    d="M20 13V6a2 2 0 00-2-2H6a2 2 0 00-2 2v7m16 0v5a2 2 0 01-2 2H6a2 2 0 01-2-2v-5m16 0h-2.586a1 1 0 00-.707.293l-2.414 2.414a1 1 0 01-.707.293h-3.172a1 1 0 01-.707-.293l-2.414-2.414A1 1 0 006.586 13H4"
-                  />
-                </svg>
-                <p className="text-sm">No notifications yet</p>
-                <p className="text-xs text-gray-400 mt-1">
-                  You'll see alerts here when incidents are detected
-                </p>
-                <p className="text-xs text-gray-400 mt-1">
-                  Scope: Community {tenantId ? `#${tenantId}` : "(none selected)"}
-                </p>
-                <p className="text-xs text-gray-400 mt-1">
-                  Transport: {isConnected ? "reachable" : "unreachable"}
+        <div className="absolute right-0 z-50 mt-3 w-[24rem] max-w-[calc(100vw-2rem)] overflow-hidden rounded-2xl border border-border bg-popover text-popover-foreground shadow-2xl">
+          <div className="border-b border-border/80 bg-gradient-to-b from-background to-popover px-4 py-3">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <div className="flex items-center gap-2">
+                  <h3 className="text-sm font-semibold">Incident notifications</h3>
+                  <Badge variant="outline" className="gap-1 border-border bg-background/60 text-[11px] text-muted-foreground">
+                    <Dot className="h-3 w-3" />
+                    {connectionLabel}
+                  </Badge>
+                </div>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Community {tenantId ? `#${tenantId}` : '(none selected)'}
                 </p>
               </div>
-            ) : (
-              <ul className="divide-y divide-gray-100">
-                {notifications.slice(0, 20).map((notification) => (
-                  <li
-                    key={notification.id}
-                    className="px-4 py-3 hover:bg-gray-50 cursor-pointer transition-colors"
-                    onClick={() => handleNotificationClick(notification)}
-                  >
-                    <div className="flex items-start gap-3">
-                      {/* Icon */}
-                      <div className={`flex-shrink-0 mt-0.5 ${getSeverityColor(notification.severity)}`}>
-                        {notification.notification_type === 'incident' ? (
-                          <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
-                            <path
-                              fillRule="evenodd"
-                              d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z"
-                              clipRule="evenodd"
-                            />
-                          </svg>
-                        ) : (
-                          <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
-                            <path
-                              fillRule="evenodd"
-                              d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z"
-                              clipRule="evenodd"
-                            />
-                          </svg>
-                        )}
-                      </div>
-
-                      {/* Content */}
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center justify-between gap-2">
-                          <p className="text-sm font-medium text-gray-900 truncate">
-                            {notification.title}
-                          </p>
-                          {getSeverityBadge(notification.severity)}
-                        </div>
-                        <p className="text-sm text-gray-500 mt-0.5 line-clamp-2">
-                          {notification.message}
-                        </p>
-                        {notification.camera_name && (
-                          <p className="text-xs text-gray-400 mt-1">
-                            📹 {notification.camera_name}
-                          </p>
-                        )}
-                        <p className="text-xs text-gray-400 mt-1">
-                          {formatTime(notification.created_at)}
-                        </p>
-                      </div>
-                    </div>
-                  </li>
-                ))}
-              </ul>
-            )}
+              <div className="flex items-center gap-1">
+                {unreadCount > 0 && (
+                  <Button variant="ghost" size="sm" className="h-8 px-2 text-xs" onClick={onMarkAllAsRead}>
+                    <CheckCheck className="mr-1 h-3.5 w-3.5" />
+                    Mark all
+                  </Button>
+                )}
+                {onTestConnection && (
+                  <Button variant="ghost" size="sm" className="h-8 px-2 text-xs" onClick={onTestConnection}>
+                    Test
+                  </Button>
+                )}
+              </div>
+            </div>
           </div>
 
-          {/* Footer */}
-          {notifications.length > 20 && (
-            <div className="px-4 py-2 border-t border-gray-100 text-center">
-              <button className="text-sm text-blue-600 hover:text-blue-700">
-                View all notifications
-              </button>
+          {visibleNotifications.length === 0 ? (
+            <div className="px-5 py-10 text-center">
+              <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-full border border-dashed border-border bg-background/70">
+                <Bell className="h-5 w-5 text-muted-foreground" />
+              </div>
+              <p className="text-sm font-medium">No incident notifications yet</p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                When the AI service reports an incident for this community, it will appear here instantly.
+              </p>
             </div>
+          ) : (
+            <>
+              <ScrollArea type="always" className="h-[28rem] max-h-[70vh]">
+              <ul className="divide-y divide-border/70">
+                {visibleNotifications.map((notification) => {
+                  const level = getSeverityLevel(notification);
+                  return (
+                    <li
+                      key={notification.id}
+                      className={cn(
+                        'cursor-pointer px-4 py-3 transition-colors hover:bg-accent/70',
+                        !notification.is_read && 'bg-primary/5'
+                      )}
+                      onClick={() => void handleNotificationClick(notification)}
+                    >
+                      <div className="flex items-start gap-3">
+                        <div className={cn('mt-0.5 rounded-full border p-2', severityBadgeClass(level))}>
+                          {getSeverityIcon(level)}
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center justify-between gap-2">
+                            <p className="truncate text-sm font-medium">{notification.title}</p>
+                            <Badge variant="outline" className={cn('shrink-0 text-[10px] uppercase tracking-wide', severityBadgeClass(level))}>
+                              {severityLabelByLevel[level] ?? level}
+                            </Badge>
+                          </div>
+                          <p className="mt-1 line-clamp-2 text-sm text-muted-foreground">{notification.message}</p>
+                          <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+                            {notification.camera_name && <span>Camera: {notification.camera_name}</span>}
+                            <span>{formatTime(notification.created_at)}</span>
+                            {!notification.is_read && <span className="font-medium text-primary">Unread</span>}
+                          </div>
+                        </div>
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
+              </ScrollArea>
+              <div className="border-t border-border/70 bg-background/50 px-4 py-3">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  className="w-full justify-center text-sm"
+                  onClick={() => {
+                    setIsOpen(false);
+                    if (onNavigate) {
+                      onNavigate('/incidents');
+                    } else {
+                      window.history.pushState({}, '', '/incidents');
+                      window.dispatchEvent(new PopStateEvent('popstate'));
+                    }
+                  }}
+                >
+                  View all incidents
+                </Button>
+              </div>
+            </>
           )}
         </div>
       )}

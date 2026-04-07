@@ -71,7 +71,7 @@ def proxy_request(
 
     timeout = (_CONNECT_TIMEOUT, _STREAM_TIMEOUT) if stream else (_CONNECT_TIMEOUT, _READ_TIMEOUT)
 
-    try:
+    def _do_request():
         # Handle multipart uploads
         content_type = headers.get("content-type", "")
         if "multipart/form-data" in content_type:
@@ -83,7 +83,7 @@ def proxy_request(
             data = request.POST.dict()
             # Don't forward content-type for multipart — let requests set it
             headers.pop("content-type", None)
-            resp = http_client.request(
+            return http_client.request(
                 method,
                 url,
                 params=params,
@@ -94,7 +94,7 @@ def proxy_request(
                 timeout=timeout,
             )
         else:
-            resp = http_client.request(
+            return http_client.request(
                 method,
                 url,
                 params=params,
@@ -103,6 +103,14 @@ def proxy_request(
                 stream=stream,
                 timeout=timeout,
             )
+
+    try:
+        try:
+            resp = _do_request()
+        except http_client.ConnectionError:
+            # Simple 1-re-try to survive brief service restarts
+            logger.warning("AI proxy connection failed, retrying once: %s", url)
+            resp = _do_request()
 
         if stream:
             django_resp = StreamingHttpResponse(
@@ -132,15 +140,15 @@ def proxy_request(
             {"error": "AI service timeout"},
             status=504,
         )
-    except http_client.ConnectionError:
-        logger.error("AI proxy connection error: %s %s", method, url)
+    except http_client.ConnectionError as e:
+        logger.error("AI proxy connection error: %s %s :: %s", method, url, e)
         return JsonResponse(
-            {"error": "AI service unavailable"},
+            {"error": "AI service unavailable", "details": str(e)},
             status=502,
         )
-    except Exception:
-        logger.exception("AI proxy unexpected error: %s %s", method, url)
+    except Exception as e:
+        logger.exception("AI proxy unexpected error: %s %s :: %s", method, url, e)
         return JsonResponse(
-            {"error": "Internal proxy error"},
+            {"error": "Internal proxy error", "details": str(e)},
             status=500,
         )
