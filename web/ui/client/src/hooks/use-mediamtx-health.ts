@@ -3,44 +3,86 @@ import { useState, useEffect } from "react";
 interface UseMediamtxHealthResult {
   reachable: boolean;
   checked: boolean;
+  activePaths: Set<string>;
 }
 
 /**
- * Hook to check if MediaMTX is reachable.
- * Returns whether the MediaMTX server can be reached.
+ * Check if MediaMTX is reachable by hitting its configured base URL.
+ * Also retrieves the list of active paths via proxy to ensure we don't load 
+ * an iframe for a stream that is not publishing (prevents "stream not found" error).
  */
 export function useMediamtxHealth(): UseMediamtxHealthResult {
   const [reachable, setReachable] = useState(false);
   const [checked, setChecked] = useState(false);
+  const [activePaths, setActivePaths] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     let cancelled = false;
 
+    const webrtcEnabled = String(import.meta.env.VITE_ENABLE_WEBRTC ?? "false").toLowerCase() === "true";
+    const apiHealthcheckEnabled = String(import.meta.env.VITE_ENABLE_MEDIAMTX_API_HEALTHCHECK ?? "true").toLowerCase() === "true";
+    const baseUrl = String(import.meta.env.VITE_WEBRTC_VIEWER_BASE_URL ?? "").trim();
+
+    if (!webrtcEnabled || !baseUrl) {
+      if (!cancelled) {
+        setReachable(false);
+        setChecked(true);
+      }
+      return;
+    }
+
     (async () => {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 3000);
+
       try {
-        // Try to reach the MediaMTX API (typically on port 8889)
-        // or check for a known stream endpoint
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 3000);
+        let pathsReady = false;
 
-        const response = await fetch("/streams/", {
-          method: "HEAD",
-          signal: controller.signal,
-        });
+        // Optionally fetch active paths via Vite proxy to MediaMTX API
+        if (apiHealthcheckEnabled) {
+          try {
+            const pathsRes = await fetch("/mediamtx_api/v3/paths/list", {
+              signal: controller.signal,
+            });
 
-        clearTimeout(timeoutId);
+            if (!cancelled && pathsRes.ok) {
+              const data = await pathsRes.json();
+              const paths = new Set<string>();
+              if (data && data.items) {
+                data.items.forEach((item: any) => {
+                  if (item.name && item.ready === true) {
+                    paths.add(item.name);
+                  }
+                });
+              }
+              setActivePaths(paths);
+              setReachable(true);
+              pathsReady = true;
+            }
+          } catch (apiErr) {
+            console.debug("MediaMTX API health check failed, falling back to reachability", apiErr);
+          }
+        }
 
         if (cancelled) return;
 
-        // If we get any response (even 404), the server is reachable
-        // MediaMTX returns 404 for /streams/ but that means it's up
-        setReachable(response.ok || response.status === 404);
-      } catch {
+        // Fallback or lightweight check if API check is disabled or failed
+        if (!pathsReady) {
+          const fallbackRes = await fetch(`${baseUrl.replace(/\/$/, "")}/`, {
+            method: "HEAD",
+            mode: "no-cors",
+            signal: controller.signal,
+          });
+          setReachable(true);
+        }
+      } catch (err) {
         if (!cancelled) {
-          // If fetch fails, MediaMTX might not be reachable
+          // Even if both fail, don't crash; just mark as unreachable
           setReachable(false);
+          setActivePaths(new Set());
         }
       } finally {
+        clearTimeout(timeoutId);
         if (!cancelled) {
           setChecked(true);
         }
@@ -52,5 +94,5 @@ export function useMediamtxHealth(): UseMediamtxHealthResult {
     };
   }, []);
 
-  return { reachable, checked };
+  return { reachable, checked, activePaths };
 }

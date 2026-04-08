@@ -3,18 +3,19 @@ Base interface for detection lanes
 """
 from abc import ABC, abstractmethod
 import numpy as np
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional
 from ..common.types import Observation
 
 
 class BaseLane(ABC):
     """Abstract base class for detection lanes"""
     
-    def __init__(self, lane_name: str, camera_id: str, models_cfg: Dict[str, Any], device: str):
+    def __init__(self, lane_name: str, camera_id: str, models_cfg: Dict[str, Any], device: str, zones: Optional[List[Dict[str, Any]]] = None):
         self.lane_name = lane_name
         self.camera_id = camera_id
         self.models_cfg = models_cfg
         self.device = device
+        self.zones = zones or []
         self._initialized = False
     
     @abstractmethod

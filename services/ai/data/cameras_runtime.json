@@ -53,7 +53,7 @@
   },
   "street": {
     "camera_id": "street",
-    "rtsp_url": "http://webcam.rhein-taunus-krematorium.de/mjpg/video.mjpg",
+    "rtsp_url": "rtsp://127.0.0.1:8554/street",
     "ingest_backend": "opencv",
     "enabled_lanes": [
       "rt_detr",
@@ -62,11 +62,11 @@
       "person_zone"
     ],
     "sample_hz": 2.0,
-    "registered_at": 1774576339.8422995
+    "registered_at": 1775520639.0415547
   },
   "backyard": {
     "camera_id": "backyard",
-    "rtsp_url": "http://47.51.131.147/-wvhttp-01-/GetOneShot?image_size=1280x720&frame_count=1000000000",
+    "rtsp_url": "rtsp://127.0.0.1:8554/backyard",
     "ingest_backend": "opencv",
     "enabled_lanes": [
       "rt_detr",
@@ -75,11 +75,11 @@
       "person_zone"
     ],
     "sample_hz": 2.0,
-    "registered_at": 1774576343.4351065
+    "registered_at": 1775360484.7809255
   },
   "main-door": {
     "camera_id": "main-door",
-    "rtsp_url": "http://195.196.36.242/mjpg/video.mjpg",
+    "rtsp_url": "rtsp://127.0.0.1:8554/main-door",
     "ingest_backend": "opencv",
     "enabled_lanes": [
       "rt_detr",
@@ -88,11 +88,11 @@
       "person_zone"
     ],
     "sample_hz": 2.0,
-    "registered_at": 1774572122.9175699
+    "registered_at": 1775602996.682986
   },
   "entrance": {
     "camera_id": "entrance",
-    "rtsp_url": "http://honjin1.miemasu.net/nphMotionJpeg?Resolution=640x480&Quality=Standard",
+    "rtsp_url": "rtsp://127.0.0.1:8554/entrance",
     "ingest_backend": "opencv",
     "enabled_lanes": [
       "rt_detr",
@@ -101,6 +101,11 @@
       "person_zone"
     ],
     "sample_hz": 2.0,
-    "registered_at": 1774576084.3160162
+    "registered_at": 1775522863.5654702
+  },
+  "cam_live": {
+    "camera_id": "cam_live",
+    "tenant_id": 8,
+    "source_type": "webcam"
   }
 }

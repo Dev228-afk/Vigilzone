@@ -8,11 +8,19 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger, DialogFooter } from "@/components/ui/dialog";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Plus, Edit, Trash2, Wifi, WifiOff, Share2, RefreshCw } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import { api } from "@/lib/api";
 import { queryClient } from "@/lib/queryClient";
 import { useAuth } from "@/auth/AuthProvider";
+
+const AI_LANES = [
+  { id: "rt_detr", label: "General Object/Person Detection" },
+  { id: "person_zone", label: "Zone Line Crossing / Intrusion" },
+  { id: "fire_smoke_yolo", label: "Fire & Smoke Detection" },
+  { id: "yolov8_fallback", label: "Lightweight Fallback (YOLOv8)" },
+];
 
 interface Camera {
   id: number | string;
@@ -22,6 +30,7 @@ interface Camera {
   rtsp_url?: string;
   ai_camera_id: string;
   stream_path?: string;
+  enabled_lanes?: string[];
   created_at: string;
   tenant?: number;
 }
@@ -37,6 +46,7 @@ export default function Cameras() {
     rtsp_url: "",
     ai_camera_id: "",
     stream_path: "",
+    enabled_lanes: ["rt_detr", "person_zone"],
   });
 
   const [editCamera, setEditCamera] = useState<Camera | null>(null);
@@ -47,6 +57,7 @@ export default function Cameras() {
     ai_camera_id: "",
     stream_path: "",
     status: "active",
+    enabled_lanes: ["rt_detr", "person_zone"],
   });
 
   const camerasQ = useQuery({
@@ -66,11 +77,12 @@ export default function Cameras() {
         rtsp_url: cam.rtsp_url,
         ai_camera_id: cam.ai_camera_id,
         stream_path: cam.stream_path,
+        enabled_lanes: cam.enabled_lanes,
         status: "active",
       });
       if (cam.rtsp_url && data?.id) {
         try {
-          await api.post(`/cameras/${data.id}/sync_to_ai/`, { rtsp_url: cam.rtsp_url });
+          await api.post(`/cameras/${data.id}/sync_to_ai/`);
         } catch {
           // Camera created but AI sync failed; user can retry manually.
         }
@@ -80,7 +92,7 @@ export default function Cameras() {
     onSuccess: () => {
       toast({ title: "Camera added" });
       queryClient.invalidateQueries({ queryKey: ["cameras"] });
-      setNewCamera({ name: "", site: "", rtsp_url: "", ai_camera_id: "", stream_path: "" });
+      setNewCamera({ name: "", site: "", rtsp_url: "", ai_camera_id: "", stream_path: "", enabled_lanes: ["rt_detr", "person_zone"] });
       setIsDialogOpen(false);
     },
     onError: () => {
@@ -130,6 +142,8 @@ export default function Cameras() {
     },
   });
 
+
+
   const openEditModal = (cam: Camera) => {
     setEditCamera(cam);
     setEditForm({
@@ -139,6 +153,7 @@ export default function Cameras() {
       ai_camera_id: cam.ai_camera_id ?? "",
       stream_path: cam.stream_path ?? "",
       status: cam.status ?? "active",
+      enabled_lanes: cam.enabled_lanes ?? ["rt_detr", "person_zone"],
     });
   };
 
@@ -184,13 +199,14 @@ export default function Cameras() {
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold">Camera Management</h1>
         {canManage && (
-          <Dialog open={isDialogOpen} onOpenChange={setIsDialogOpen}>
-            <DialogTrigger asChild>
-              <Button data-testid="button-add-camera">
-                <Plus className="w-4 h-4 mr-2" />
-                Add Camera
-              </Button>
-            </DialogTrigger>
+          <div className="flex items-center gap-2">
+            <Dialog open={isDialogOpen} onOpenChange={setIsDialogOpen}>
+              <DialogTrigger asChild>
+                <Button data-testid="button-add-camera">
+                  <Plus className="w-4 h-4 mr-2" />
+                  Add Camera
+                </Button>
+              </DialogTrigger>
             <DialogContent>
             <DialogHeader>
               <DialogTitle>Add New Camera</DialogTitle>
@@ -216,6 +232,26 @@ export default function Cameras() {
                 <Label htmlFor="stream-path">Stream Path (optional)</Label>
                 <Input id="stream-path" value={newCamera.stream_path} onChange={(e) => setNewCamera({ ...newCamera, stream_path: e.target.value })} />
               </div>
+              <div className="space-y-2">
+                <Label>AI Detection Lanes</Label>
+                <div className="flex flex-col gap-2 border rounded-md p-3 bg-muted/20">
+                  {AI_LANES.map(lane => (
+                    <div key={lane.id} className="flex items-center space-x-2">
+                      <Checkbox 
+                        id={`new-lane-${lane.id}`} 
+                        checked={newCamera.enabled_lanes.includes(lane.id)}
+                        onCheckedChange={(checked) => {
+                          const lanes = checked 
+                            ? [...newCamera.enabled_lanes, lane.id]
+                            : newCamera.enabled_lanes.filter(l => l !== lane.id);
+                          setNewCamera({ ...newCamera, enabled_lanes: lanes });
+                        }}
+                      />
+                      <label htmlFor={`new-lane-${lane.id}`} className="text-sm cursor-pointer select-none">{lane.label}</label>
+                    </div>
+                  ))}
+                </div>
+              </div>
             </div>
             <DialogFooter>
               <Button variant="outline" onClick={handleTestConnection} data-testid="button-test-connection">Test Connection</Button>
@@ -225,6 +261,7 @@ export default function Cameras() {
             </DialogFooter>
             </DialogContent>
           </Dialog>
+          </div>
         )}
       </div>
       {!canManage && (
@@ -339,6 +376,26 @@ export default function Cameras() {
                   <SelectItem value="inactive">Inactive</SelectItem>
                 </SelectContent>
               </Select>
+            </div>
+            <div className="space-y-2">
+              <Label>AI Detection Lanes</Label>
+              <div className="flex flex-col gap-2 border rounded-md p-3 bg-muted/20">
+                {AI_LANES.map(lane => (
+                  <div key={lane.id} className="flex items-center space-x-2">
+                    <Checkbox 
+                      id={`edit-lane-${lane.id}`} 
+                      checked={editForm.enabled_lanes.includes(lane.id)}
+                      onCheckedChange={(checked) => {
+                        const lanes = checked 
+                          ? [...editForm.enabled_lanes, lane.id]
+                          : editForm.enabled_lanes.filter(l => l !== lane.id);
+                        setEditForm({ ...editForm, enabled_lanes: lanes });
+                      }}
+                    />
+                    <label htmlFor={`edit-lane-${lane.id}`} className="text-sm cursor-pointer select-none">{lane.label}</label>
+                  </div>
+                ))}
+              </div>
             </div>
           </div>
           <DialogFooter>

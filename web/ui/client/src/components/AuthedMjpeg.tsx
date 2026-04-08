@@ -4,6 +4,10 @@ import { api } from "@/lib/api";
 interface AuthedMjpegProps extends React.ImgHTMLAttributes<HTMLImageElement> {
   /** Camera ID (Django pk) */
   cameraId: number;
+  /** Callback when streaming starts (token fetched, src set) */
+  onStarted?: () => void;
+  /** Callback when streaming fails after retries exhausted */
+  onStreamError?: () => void;
   /** Rendered while loading or on error */
   fallback?: React.ReactNode;
 }
@@ -18,6 +22,8 @@ interface AuthedMjpegProps extends React.ImgHTMLAttributes<HTMLImageElement> {
  */
 export default function AuthedMjpeg({
   cameraId,
+  onStarted,
+  onStreamError,
   fallback,
   alt,
   ...imgProps
@@ -28,6 +34,13 @@ export default function AuthedMjpeg({
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const refreshRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const versionRef = useRef(0);
+  const retryCountRef = useRef(0);
+  const maxRetries = 3;
+  // Store callbacks in refs to avoid dep issues
+  const onStartedRef = useRef(onStarted);
+  onStartedRef.current = onStarted;
+  const onStreamErrorRef = useRef(onStreamError);
+  onStreamErrorRef.current = onStreamError;
 
   const clearTimers = () => {
     if (timerRef.current) {
@@ -73,8 +86,13 @@ export default function AuthedMjpeg({
         versionRef.current += 1;
         setSrc(`/api/streams/${cameraId}/mjpeg/?token=${encodeURIComponent(token)}&v=${versionRef.current}`);
         setError(false);
+        retryCountRef.current = 0;
+        onStartedRef.current?.();
       } catch {
-        if (!cancelled) setError(true);
+        if (!cancelled) {
+          setError(true);
+          onStreamErrorRef.current?.();
+        }
       }
     }
 
@@ -91,6 +109,13 @@ export default function AuthedMjpeg({
   }, [cameraId, retryTick]);
 
   const handleImgError = () => {
+    retryCountRef.current += 1;
+    if (retryCountRef.current >= maxRetries) {
+      setError(true);
+      clearTimers();
+      onStreamErrorRef.current?.();
+      return;
+    }
     setError(true);
     // Back off briefly for warm-up scenarios, then request a new token.
     clearTimers();

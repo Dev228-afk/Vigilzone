@@ -27,8 +27,8 @@ class AnyAnomalyLane(BaseLane):
     """
 
     def __init__(self, lane_name: str, camera_id: str,
-                 models_cfg: Dict[str, Any], device: str):
-        super().__init__(lane_name, camera_id, models_cfg, device)
+                 models_cfg: Dict[str, Any], device: str, zones: Optional[List[Dict[str, Any]]] = None):
+        super().__init__(lane_name, camera_id, models_cfg, device, zones)
         self.logger = setup_logger(f"AnyAnomaly-{camera_id}")
         self._client = None  # Set externally by orchestrator
         self._frame_window: deque = deque(maxlen=64)  # ~4s @ 16 fps
@@ -162,10 +162,17 @@ class AnyAnomalyLane(BaseLane):
         if not frames:
             return
 
+        # Build zone-aware prompt (Hot Spots)
+        zone_prompt = ""
+        if self.zones:
+            zone_names = [z.get("name", "unnamed") for z in self.zones]
+            zone_prompt = f"Focus on these areas: {', '.join(zone_names)}. "
+
         job_id = self._client.request(
             camera_id=self.camera_id,
             ts_utc=ts_utc,
             frames_bgr=frames,
+            prompt_text=f"{zone_prompt}{self._arm_reason}".strip(),
         )
         if job_id:
             self._pending_job_id = job_id

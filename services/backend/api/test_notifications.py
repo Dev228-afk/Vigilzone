@@ -8,6 +8,8 @@ Tests cover:
 - WebSocket consumer authentication and group joining
 """
 
+import json
+import os
 from django.test import TestCase, override_settings
 from django.urls import reverse
 from rest_framework.test import APITestCase, APIClient
@@ -21,6 +23,7 @@ from api.models import (
     Tenant, Membership, Camera, Incident, Alert, 
 )
 from api.notification_service import NotificationService, dispatch_notifications
+from ai_integration.incident_ingest import process_alert_event
 
 
 @override_settings(
@@ -312,14 +315,84 @@ class NotificationAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertGreaterEqual(response.data['unread_count'], 1)
 
+    def test_unread_count_does_not_backfill_alerts(self):
+        """Unread count should be read-only and must not create alert rows."""
+        incident_without_alert = Incident.objects.create(
+            tenant=self.tenant,
+            camera=self.camera,
+            type='fire',
+            status='open',
+            severity=4,
+            started_at=timezone.now(),
+        )
+
+        Alert.objects.filter(incident=incident_without_alert).delete()
+        before_count = Alert.objects.count()
+
+        response = self.client.get('/api/notifications/unread-count/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(Alert.objects.count(), before_count)
+        self.assertFalse(Alert.objects.filter(incident=incident_without_alert).exists())
+
     def test_transport_status_endpoint(self):
         """Test GET /api/notifications/transport-status/ returns health payload."""
-        response = self.client.get('/api/notifications/transport-status/')
+        subscriber_payload = {
+            'phase': 'waiting',
+            'stream': 'vigilzone.ai.incidents',
+            'consumer_group': 'vigilzone.ai.incidents.group',
+            'last_event_id': 'evt-123',
+            'last_stream_entry_id': '1744000000000-0',
+        }
+
+        with patch.dict(os.environ, {
+            'REDIS_URL': 'redis://default:redispw@localhost:32768/0',
+            'AI_INCIDENT_CHANNEL': 'vigilzone.ai.incidents',
+        }, clear=False):
+            with patch('api.views.create_redis_client') as mock_create_client:
+                mock_client = MagicMock()
+                mock_client.get.return_value = json.dumps(subscriber_payload)
+                mock_create_client.return_value = mock_client
+
+                response = self.client.get('/api/notifications/transport-status/')
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertIn('uses_redis', response.data)
         self.assertIn('redis_reachable', response.data)
         self.assertIn('channel_backend', response.data)
+        self.assertEqual(response.data['incident_channel'], 'vigilzone.ai.incidents')
+        self.assertEqual(response.data['redis']['connection_display'], 'redis://default:***@localhost:32768/0')
+        self.assertEqual(response.data['subscriber']['last_event_id'], 'evt-123')
+
+    def test_test_incident_endpoint_enqueues_synthetic_incident(self):
+        """Test POST /api/notifications/test-incident/ appends a synthetic stream event."""
+        with patch.dict(os.environ, {
+            'REDIS_URL': 'redis://default:redispw@localhost:32768/0',
+            'AI_INCIDENT_CHANNEL': 'vigilzone.ai.incidents',
+        }, clear=False):
+            with patch('api.views.create_redis_client') as mock_create_client:
+                mock_client = MagicMock()
+                mock_client.xadd.return_value = '1744000000000-0'
+                mock_client.xlen.return_value = 3
+                mock_client.get.return_value = None
+                mock_create_client.return_value = mock_client
+
+                response = self.client.post(
+                    '/api/notifications/test-incident/',
+                    {'camera_id': self.camera.id, 'type': 'fire', 'severity': 5},
+                    format='json',
+                )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data['success'])
+        self.assertEqual(response.data['incident_channel'], 'vigilzone.ai.incidents')
+        self.assertEqual(response.data['stream_entry_id'], '1744000000000-0')
+        self.assertEqual(response.data['stream_length'], 3)
+        self.assertTrue(mock_client.xadd.called)
+        queued_payload = json.loads(mock_client.xadd.call_args[0][1]['payload'])
+        self.assertEqual(queued_payload['event'], 'alert.created')
+        self.assertEqual(queued_payload['data']['type'], 'fire')
+        self.assertEqual(queued_payload['data']['camera_id'], self.camera.ai_camera_id or self.camera.stream_path or self.camera.name)
     
     @patch('api.notification_service.get_channel_layer')
     def test_broadcast_requires_title_and_message(self, mock_get_layer):
@@ -483,3 +556,121 @@ class NotificationServiceChannelTests(TestCase):
         self.assertEqual(notification['data']['incident_id'], incident.id)
         self.assertEqual(notification['data']['severity'], 4)
         self.assertEqual(notification['data']['camera_name'], 'Test Cam')
+
+
+class SyncedAiIncidentNotificationTests(TestCase):
+    """Regression tests for AI-synced camera live notifications."""
+
+    def setUp(self):
+        self.tenant = Tenant.objects.create(name='Synced AI Tenant')
+        self.user = User.objects.create_user(
+            username='synced-user',
+            email='synced@test.com',
+            password='password123',
+        )
+        Membership.objects.create(
+            user=self.user,
+            tenant=self.tenant,
+            role='owner',
+        )
+        self.camera = Camera.objects.create(
+            tenant=self.tenant,
+            name='Warehouse Entrance',
+            ai_camera_id='cam_synced_01',
+            stream_path='cam_synced_01',
+            source_type=Camera.SourceType.REGISTERED,
+            status=Camera.Status.ACTIVE,
+        )
+
+    @patch('api.notification_service.get_channel_layer')
+    @patch('api.notification_service.NotificationService.broadcast_incident')
+    def test_registered_camera_create_event_dispatches_live_notification(self, mock_broadcast, mock_get_layer):
+        """Synced-AI camera incidents should notify without requiring a page refresh."""
+        mock_get_layer.return_value = MagicMock()
+        mock_broadcast.return_value = {'websocket': 'sent', 'alerts_created': 1}
+
+        payload = {
+            'id': 'evt-synced-create-1',
+            'camera_id': 'cam_synced_01',
+            'type': 'fire',
+            'severity': 'high',
+            'timestamp': timezone.now().isoformat(),
+        }
+
+        with self.captureOnCommitCallbacks(execute=True):
+            result = process_alert_event(payload, source='redis', event_id='evt-synced-create-1')
+
+        self.assertEqual(result.status, 'created')
+        self.assertEqual(Incident.objects.filter(camera=self.camera).count(), 1)
+        self.assertEqual(mock_broadcast.call_count, 1)
+        self.assertEqual(mock_broadcast.call_args[0][0].camera_id, self.camera.id)
+
+    @patch('api.notification_service.get_channel_layer')
+    @patch('api.notification_service.NotificationService.broadcast_incident')
+    def test_registered_camera_update_event_dispatches_live_notification(self, mock_broadcast, mock_get_layer):
+        """Repeated synced-AI alerts that update an open incident should still notify live."""
+        mock_get_layer.return_value = MagicMock()
+        mock_broadcast.return_value = {'websocket': 'sent', 'alerts_created': 1}
+
+        existing = Incident.objects.create(
+            tenant=self.tenant,
+            camera=self.camera,
+            type='fire',
+            status='open',
+            severity=3,
+            started_at=timezone.now(),
+        )
+        mock_broadcast.reset_mock()
+
+        payload = {
+            'id': 'evt-synced-update-1',
+            'camera_id': 'cam_synced_01',
+            'type': 'fire',
+            'severity': 'critical',
+            'timestamp': timezone.now().isoformat(),
+        }
+
+        with self.captureOnCommitCallbacks(execute=True):
+            result = process_alert_event(payload, source='redis', event_id='evt-synced-update-1')
+
+        self.assertEqual(result.status, 'updated')
+        existing.refresh_from_db()
+        self.assertEqual(existing.severity, 5)
+        self.assertEqual(mock_broadcast.call_count, 1)
+        self.assertEqual(mock_broadcast.call_args[0][0].pk, existing.pk)
+
+    @patch('api.notification_service.get_channel_layer')
+    @patch('api.notification_service.NotificationService.broadcast_incident')
+    def test_live_webcam_event_uses_tenant_hint_and_dispatches_notification(self, mock_broadcast, mock_get_layer):
+        """cam_live alerts should resolve to the tenant's webcam camera and notify immediately."""
+        mock_get_layer.return_value = MagicMock()
+        mock_broadcast.return_value = {'websocket': 'sent', 'alerts_created': 1}
+
+        webcam_camera = Camera.objects.create(
+            tenant=self.tenant,
+            name='Live Webcam',
+            ai_camera_id='cam_live',
+            stream_path='cam_live',
+            source_type=Camera.SourceType.WEBCAM,
+            status=Camera.Status.ACTIVE,
+        )
+
+        payload = {
+            'id': 'evt-live-webcam-1',
+            'camera_id': 'cam_live',
+            'tenant_id': self.tenant.id,
+            'source_type': 'live_camera',
+            'type': 'intrusion',
+            'severity': 'high',
+            'timestamp': timezone.now().isoformat(),
+        }
+
+        with self.captureOnCommitCallbacks(execute=True):
+            result = process_alert_event(payload, source='redis', event_id='evt-live-webcam-1')
+
+        self.assertEqual(result.status, 'created')
+        incident = Incident.objects.get(pk=result.incident_id)
+        self.assertEqual(incident.tenant_id, self.tenant.id)
+        self.assertEqual(incident.camera_id, webcam_camera.id)
+        self.assertEqual(mock_broadcast.call_count, 1)
+        self.assertEqual(mock_broadcast.call_args[0][0].pk, incident.pk)

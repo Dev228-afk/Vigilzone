@@ -27,6 +27,7 @@ export default defineConfig({
     },
   },
   root: path.resolve(import.meta.dirname, "client"),
+  envDir: path.resolve(import.meta.dirname),
   build: {
     outDir: path.resolve(import.meta.dirname, "dist/public"),
     emptyOutDir: true,
@@ -40,6 +41,16 @@ export default defineConfig({
       "/api": {
         target: process.env.VITE_PROXY_TARGET || "http://127.0.0.1:8000",
         changeOrigin: true,
+      },
+      "/ws": {
+        target: process.env.VITE_PROXY_TARGET || "http://127.0.0.1:8000",
+        changeOrigin: true,
+        ws: true,
+      },
+      "/mediamtx_api": {
+        target: process.env.VITE_MEDIAMTX_API_TARGET || "http://127.0.0.1:9997",
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/mediamtx_api/, '')
       },
     },
   },

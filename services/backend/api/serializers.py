@@ -3,6 +3,7 @@ from django.utils.text import slugify
 from .models import (
     Tenant, Membership, Camera, CameraZone, Incident, Detection,
     Alert, AuditLog, Profile, Invitation, KnownEntity, NotificationChannel,
+    normalize_instant_notification_levels,
 )
 from django.contrib.auth.models import User
 
@@ -57,6 +58,7 @@ class CameraSafeSerializer(serializers.ModelSerializer):
             "source_type",
             "ai_camera_id", "stream_path",
             "min_confidence", "min_bbox_area", "k_of_n_k", "k_of_n_n", "cooldown_s",
+            "enabled_lanes",
             "created_at", "updated_at", "tenant",
         ]
         read_only_fields = ["created_at", "updated_at", "tenant"]
@@ -94,7 +96,7 @@ class CameraWriteSerializer(serializers.ModelSerializer):
         fields = [
             "id", "name", "site", "rtsp_url", "ai_camera_id", "stream_path", "status",
             "camera_type", "source_type", "min_confidence", "min_bbox_area",
-            "k_of_n_k", "k_of_n_n", "cooldown_s",
+            "k_of_n_k", "k_of_n_n", "cooldown_s", "enabled_lanes",
             "created_at", "updated_at", "tenant",
             # legacy aliases
             "location", "streamUrl",
@@ -190,10 +192,14 @@ class ProfileSerializer(serializers.ModelSerializer):
         fields = [
             "id", "user", "username", "email", "bio",
             "notify_email", "notify_push", "notify_sms",
+            "instant_notification_levels",
             "alert_sensitivity", "data_retention_days", "audio_detection",
             "blur_faces", "consent_required",
         ]
         read_only_fields = ["id", "user", "username", "email"]
+
+    def validate_instant_notification_levels(self, value):
+        return normalize_instant_notification_levels(value)
 
 class KnownEntitySerializer(serializers.ModelSerializer):
     camera_ids = serializers.PrimaryKeyRelatedField(

@@ -169,10 +169,16 @@ class NotificationConsumer(AsyncWebsocketConsumer):
         """
         data = dict(event["data"])
         per_user_ids = data.pop("alert_ids_by_user", None)
-        if isinstance(per_user_ids, dict) and self.user:
+        
+        # If per_user_ids exists AND is a dict, this is a filtered incident notification
+        # Only send to users who have an alert_id for this incident
+        if isinstance(per_user_ids, dict):
             alert_id = per_user_ids.get(str(self.user.id)) or per_user_ids.get(self.user.id)
-            if alert_id:
-                data["alert_id"] = alert_id
+            if not alert_id:
+                # User is not in the per-user mapping (opted out or not eligible)
+                return
+            data["alert_id"] = alert_id
+        
         # Send notification to WebSocket
         await self.send(text_data=json.dumps(data))
 

@@ -3,7 +3,7 @@ version: "3.9"
 services:
   # ── Redis for Django Channels ────────────────────────────────
   redis:
-    image: redis:7-alpine
+    image: redis-FqgF
     ports:
       - "6379:6379"
     volumes:
@@ -28,8 +28,12 @@ services:
       - AI_WEBHOOK_SECRET=${AI_WEBHOOK_SECRET:-vigilzone-webhook-secret}
       - AI_WEBHOOK_TOKEN=${AI_WEBHOOK_TOKEN:-}
       - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-http://backend:8000}
+      - CHANNEL_LAYER_BACKEND=${CHANNEL_LAYER_BACKEND:-redis}
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
       - REDIS_HOST=redis
       - REDIS_PORT=6379
+      - AI_INCIDENT_CHANNEL=${AI_INCIDENT_CHANNEL:-vigilzone.ai.incidents}
+      - MEDIAMTX_RTSP_BASE=${MEDIAMTX_RTSP_BASE:-rtsp://mediamtx:8554}
     volumes:
       - backend-db:/app/db
     depends_on:
@@ -84,11 +88,40 @@ services:
       - ai-data:/app/data
     environment:
       - PYTHONUNBUFFERED=1
+      - AI_USE_REDIS_PUBLISH=${AI_USE_REDIS_PUBLISH:-1}
+      - AI_REDIS_URL=${AI_REDIS_URL:-redis://redis:6379/0}
+      - AI_REDIS_HOST=redis
+      - AI_REDIS_PORT=6379
+      - AI_INCIDENT_CHANNEL=${AI_INCIDENT_CHANNEL:-vigilzone.ai.incidents}
     depends_on:
       - mediamtx
+      - redis
     networks:
       - vigilzone
     restart: unless-stopped
+
+  # ── Backend Redis incident subscriber ───────────────────────
+  incident_subscriber:
+    build:
+      context: ./services/backend
+      dockerfile: Dockerfile
+    environment:
+      - DJANGO_DEBUG=${DJANGO_DEBUG:-1}
+      - SECRET_KEY=${SECRET_KEY:-django-insecure-dev-only-change-me}
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - AI_INCIDENT_CHANNEL=${AI_INCIDENT_CHANNEL:-vigilzone.ai.incidents}
+      - AI_BASE_INTERNAL=${AI_BASE_INTERNAL:-http://ai:8080}
+    volumes:
+      - backend-db:/app/db
+    depends_on:
+      - redis
+      - backend
+    networks:
+      - vigilzone
+    restart: unless-stopped
+    command: ["python", "manage.py", "subscribe_incidents"]
 
   # ── Nginx reverse proxy + UI static files ───────────────────
   nginx:

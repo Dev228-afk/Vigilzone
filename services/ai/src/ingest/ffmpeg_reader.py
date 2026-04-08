@@ -5,6 +5,7 @@ import cv2
 import subprocess
 import threading
 import time
+import os
 import numpy as np
 from typing import Tuple, Optional
 from .base import IngestBackend
@@ -21,6 +22,11 @@ class FFmpegReader(IngestBackend):
     def __init__(self, camera_id: str, source: str, reconnect_delay: float = 5.0, 
                  width: int = 640, height: int = 480):
         super().__init__(camera_id, source)
+        
+        # FORCE underlying OpenCV FFmpeg wrappers to drop dead connections
+        # 5000000 microseconds = 5 seconds
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|stimeout;5000000"
+
         self.reconnect_delay = reconnect_delay
         self.width = width
         self.height = height

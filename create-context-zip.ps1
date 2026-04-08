@@ -6,10 +6,11 @@ $ErrorActionPreference = "Stop"
 $root = "c:\Users\devan\OneDrive\Desktop\yolov12-cls\vigilzone-monolith"
 $zipOut = "c:\Users\devan\OneDrive\Desktop\yolov12-cls\vigilzone-context.zip"
 $tempDir = "$env:TEMP\vigilzone-context"
-$targetZipMaxMB = 65
+$targetZipMaxMB = 50
 $targetZipMaxBytes = $targetZipMaxMB * 1MB
 # Keep staging budget conservative because text compresses, binaries do not.
-$stagingSoftBudgetBytes = 190MB
+$stagingSoftBudgetBytes = 140MB
+$maxLowPriorityFileBytes = 2MB
 
 # Clean up
 if (Test-Path $tempDir) { Remove-Item $tempDir -Recurse -Force }
@@ -19,7 +20,7 @@ New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
 $excludeDirTokens = @(
     "\node_modules\", "\.venv\", "\venv\", "\__pycache__\", "\.git\", "\dist\", "\build\"
 )
-$excludeFilePatterns = @('*.log', '*.tmp', '*.bak', '*.cache')
+$excludeFilePatterns = @( '*.tmp', '*.bak', '*.cache')
 
 # Binary/model/archive extensions excluded by default.
 $excludeExt = @(
@@ -33,6 +34,24 @@ $preferredTextExt = @(
     '.py','.pyi','.js','.jsx','.ts','.tsx','.json','.yaml','.yml','.toml','.ini','.cfg','.conf','.md','.txt',
     '.sh','.ps1','.bat','.cmd','.dockerfile','.env','.gitignore','.gitattributes','.sql','.csv','.xml','.html',
     '.css','.scss','.sass','.less','.java','.go','.rs','.c','.cc','.cpp','.h','.hpp','.cs','.rb','.php','.swift'
+)
+
+# Strongly preserve config/entrypoint/debug-critical files.
+$requiredFileNameRegex = @(
+    '^readme(\..+)?$', '^license(\..+)?$', '^dockerfile(\..+)?$', '^docker-compose(\..+)?\.ya?ml$',
+    '^compose(\..+)?\.ya?ml$', '^pyproject\.toml$', '^requirements.*\.txt$', '^package\.json$',
+    '^package-lock\.json$', '^yarn\.lock$', '^pnpm-lock\.yaml$', '^tsconfig(\..+)?\.json$',
+    '^vite\.config\..+$', '^mkdocs\.ya?ml$', '^manage\.py$', '^\.env(\..+)?$', '^\.gitignore$',
+    '^\.gitattributes$', '^\.editorconfig$', '^pytest\.ini$', '^tox\.ini$'
+)
+
+$requiredPathRegex = @(
+    '(?i)^services/backend/server/(settings|urls|asgi|wsgi)\.py$',
+    '(?i)^services/backend/ai_integration/.+',
+    '(?i)^services/backend/api/.+',
+    '(?i)^services/ai/src/.+',
+    '(?i)^web/ui/.+',
+    '(?i)^docker/.+'
 )
 
 # Optional files can be trimmed only if the zip still exceeds max size.
@@ -69,6 +88,25 @@ function Test-IsLikelyTextFile {
     finally {
         if ($stream) { $stream.Dispose() }
     }
+}
+
+function Test-IsRequiredContextFile {
+    param(
+        [string]$RelPath
+    )
+
+    $normalized = ($RelPath -replace '\\', '/').TrimStart('/')
+    $name = [System.IO.Path]::GetFileName($normalized).ToLowerInvariant()
+
+    foreach ($rx in $requiredFileNameRegex) {
+        if ($name -match $rx) { return $true }
+    }
+
+    foreach ($rx in $requiredPathRegex) {
+        if ($normalized -match $rx) { return $true }
+    }
+
+    return $false
 }
 
 function New-ContextZip {
@@ -134,6 +172,7 @@ $allFiles = Get-ChildItem -Path $root -Recurse -File -Force -ErrorAction Silentl
 $selected = @()
 $optionalCandidates = @()
 $skippedBinary = 0
+$skippedLargeLowPriority = 0
 
 foreach ($f in $allFiles) {
     if (-not (Test-IsLikelyTextFile -File $f)) {
@@ -156,9 +195,17 @@ foreach ($f in $allFiles) {
         File = $f
         RelPath = $relPath
         IsOptional = $isOptional
+        IsRequired = (Test-IsRequiredContextFile -RelPath $relPath)
     }
+
+    # Keep required context even when larger; trim very large non-required files.
+    if ((-not $entry.IsRequired) -and $f.Length -gt $maxLowPriorityFileBytes) {
+        $skippedLargeLowPriority++
+        continue
+    }
+
     $selected += $entry
-    if ($isOptional) { $optionalCandidates += $entry }
+    if ($isOptional -and -not $entry.IsRequired) { $optionalCandidates += $entry }
 }
 
 $selectedTotalBytes = (($selected | ForEach-Object { $_.File.Length }) | Measure-Object -Sum).Sum
@@ -200,7 +247,7 @@ if (Test-Path $legacyInst) {
     $copied++
 }
 
-Write-Host "`nFiles copied: $copied, skipped: $skipped, skipped-binary: $skippedBinary" -ForegroundColor Cyan
+Write-Host "`nFiles copied: $copied, skipped: $skipped, skipped-binary: $skippedBinary, skipped-large-low-priority: $skippedLargeLowPriority" -ForegroundColor Cyan
 
 # Create zip and enforce size budget by trimming optional files only.
 $size = New-ContextZip
@@ -219,6 +266,10 @@ if ($size -gt $targetZipMaxBytes) {
                 if ($p.Contains($tok)) { return $true }
             }
             return $false
+        } |
+        Where-Object {
+            $rel = $_.FullName.Substring($tempDir.Length).TrimStart('\\','/')
+            -not (Test-IsRequiredContextFile -RelPath $rel)
         } |
         Sort-Object Length -Descending
 

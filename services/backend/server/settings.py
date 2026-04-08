@@ -13,22 +13,31 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 from pathlib import Path
 from dotenv import load_dotenv
 import os
+import dj_database_url
 
 from corsheaders.defaults import default_headers
+from server.redis_runtime import resolve_backend_redis_settings
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
-
-load_dotenv(BASE_DIR / ".env")
-
+load_dotenv(BASE_DIR / ".env", override=True)
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
 
-# SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = "django-insecure-k8i=d5g*d87y&1%@tgd12)qqz@fz@ti2mqkc)3o8@y)tzeljor"
+from django.core.exceptions import ImproperlyConfigured
 
-# SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = bool(int(os.getenv("DJANGO_DEBUG", "1")))
+DEBUG = bool(int(os.getenv("DJANGO_DEBUG", "0"))) # Default to 0 (False) for safety
+
+# SECURITY WARNING: keep the secret key used in production secret!
+SECRET_KEY = os.getenv("DJANGO_SECRET_KEY")
+
+if not SECRET_KEY:
+    if DEBUG:
+        # Fallback ONLY permitted in local development
+        SECRET_KEY = "django-insecure-local-dev-key-do-not-use-in-prod"
+    else:
+        raise ImproperlyConfigured("DJANGO_SECRET_KEY environment variable is missing. Refusing to start in production.")
+
 ALLOWED_HOSTS = os.getenv("ALLOWED_HOSTS", "localhost,127.0.0.1,backend,nginx").split(",")
 
 # Application definition
@@ -49,9 +58,9 @@ INSTALLED_APPS = [
 ]
 
 # Django Channels configuration
-# Local dev (Windows/non-Docker) often has no redis DNS entry. Use in-memory
-# channel layer unless Redis is explicitly requested.
-_channel_backend = os.getenv("CHANNEL_LAYER_BACKEND", "").strip().lower()
+# Auto uses Redis whenever a Redis target is configured.
+_channel_backend = os.getenv("CHANNEL_LAYER_BACKEND", "auto").strip().lower()
+_redis_settings = resolve_backend_redis_settings()
 if _channel_backend == "inmemory":
     CHANNEL_LAYERS = {
         "default": {
@@ -59,17 +68,14 @@ if _channel_backend == "inmemory":
         }
     }
 else:
-    redis_host = os.getenv("REDIS_HOST", "").strip()
-    use_redis = _channel_backend == "redis" or bool(redis_host) or not DEBUG
+    use_redis = _channel_backend == "redis" or _redis_settings.configured or not DEBUG
 
     if use_redis:
         CHANNEL_LAYERS = {
             "default": {
                 "BACKEND": "channels_redis.core.RedisChannelLayer",
                 "CONFIG": {
-                    "hosts": [
-                        (redis_host or "127.0.0.1", int(os.getenv("REDIS_PORT", "6379")))
-                    ],
+                    "hosts": [_redis_settings.channels_host],
                 },
             },
         }
@@ -116,16 +122,25 @@ ASGI_APPLICATION = "server.asgi.application"
 # Database
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
 
-DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.sqlite3",
-        "NAME": BASE_DIR / "db.sqlite3",
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if DATABASE_URL:
+    # CLOUD MODE: Connect to PostgreSQL (or whatever the URL specifies)
+    DATABASES = {
+        "default": dj_database_url.parse(
+            DATABASE_URL, 
+            conn_max_age=600,  # Vital for cloud: pools connections to reduce latency
+            conn_health_checks=True,
+        )
     }
-}
-# # Connect to MongoDB
-# MONGO_URI = os.getenv("MONGO_URI")
-# MONGO_DB = os.getenv("MONGO_DB", "myapp")
-# connect(alias="default", host=MONGO_URI, db=MONGO_DB)
+else:
+    # LOCAL DEV MODE: Fallback to SQLite so local development works seamlessly
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.sqlite3",
+            "NAME": BASE_DIR / "db.sqlite3",
+        }
+    }
 
 
 # DRF base config 
@@ -236,3 +251,6 @@ OPENCV_FFMPEG_CAPTURE_OPTIONS = os.getenv(
     "OPENCV_FFMPEG_CAPTURE_OPTIONS",
     "rtsp_transport;tcp|stimeout;3000000",
 )
+
+
+

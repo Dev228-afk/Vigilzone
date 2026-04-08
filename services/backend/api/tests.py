@@ -694,3 +694,155 @@ class StreamEndpointTests(APITestCase):
         response = self.client.get('/api/streams/health/')
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertIn('1', response.data)
+
+
+@override_settings(
+    REST_FRAMEWORK={
+        'DEFAULT_AUTHENTICATION_CLASSES': [
+            'rest_framework_simplejwt.authentication.JWTAuthentication',
+        ],
+        'DEFAULT_PERMISSION_CLASSES': [
+            'rest_framework.permissions.IsAuthenticated',
+        ],
+    },
+)
+class AiControlPlaneTests(APITestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.user = User.objects.create_user(username='aiuser', email='ai@test.com', password='password123')
+        self.viewer = User.objects.create_user(username='viewer', email='viewer@test.com', password='password123')
+        self.tenant = Tenant.objects.create(name='AI Tenant')
+        Membership.objects.create(user=self.user, tenant=self.tenant, role='owner')
+        Membership.objects.create(user=self.viewer, tenant=self.tenant, role='viewer')
+        self.camera = Camera.objects.create(
+            tenant=self.tenant,
+            name='Hallway Cam',
+            site='Hallway',
+            rtsp_url='rtsp://camera.local/stream',
+            ai_camera_id='cam_hallway',
+            stream_path='cam_hallway',
+            status='inactive',
+        )
+
+        response = self.client.post('/api/auth/token/', {'username': 'aiuser', 'password': 'password123'}, format='json')
+        self.token = response.data['access']
+        self.client.credentials(
+            HTTP_AUTHORIZATION=f'Bearer {self.token}',
+            HTTP_X_TENANT_ID=str(self.tenant.id),
+        )
+
+    @patch('ai_integration.views._ensure_mediamtx_path', return_value=('cam_hallway', 'native', 'rtsp://camera.local/stream'))
+    @patch('requests.get')
+    @patch('requests.post')
+    def test_ai_start_uses_tenant_scoped_camera_and_updates_status(self, mock_post, mock_get, _mock_ensure):
+        register_resp = MagicMock(status_code=201, text='ok')
+        register_resp.json.return_value = {'camera_id': 'cam_hallway', 'hot_loaded': True}
+
+        runtime_resp = MagicMock(status_code=200, text='ok')
+        runtime_resp.json.return_value = {'running': True}
+
+        status_resp = MagicMock()
+        status_resp.ok = True
+        status_resp.json.return_value = {'running': True}
+
+        mock_post.side_effect = [register_resp, runtime_resp]
+        mock_get.return_value = status_resp
+
+        response = self.client.post('/api/ai/start/', {'camera_id': self.camera.id}, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['status'], 'started')
+        self.assertTrue(response.data['running'])
+        self.assertEqual(response.data['camera_db_id'], self.camera.id)
+
+        self.camera.refresh_from_db()
+        self.assertEqual(self.camera.status, 'active')
+
+    @patch('requests.get')
+    @patch('requests.post')
+    def test_ai_stop_turns_runtime_off(self, mock_post, mock_get):
+        runtime_resp = MagicMock(status_code=200, text='ok')
+        runtime_resp.json.return_value = {'running': False}
+
+        status_resp = MagicMock()
+        status_resp.ok = True
+        status_resp.json.return_value = {'running': False}
+
+        mock_post.return_value = runtime_resp
+        mock_get.return_value = status_resp
+
+        response = self.client.post('/api/ai/stop/', {'camera_id': 'cam_hallway'}, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['status'], 'stopped')
+        self.assertFalse(response.data['running'])
+
+        self.camera.refresh_from_db()
+        self.assertEqual(self.camera.status, 'inactive')
+
+    @patch('requests.get')
+    @patch('requests.post')
+    def test_ai_webcam_state_claims_cam_live_for_tenant_and_sends_metadata(self, mock_post, mock_get):
+        runtime_resp = MagicMock(status_code=200, text='ok')
+        runtime_resp.headers = {'content-type': 'application/json'}
+        runtime_resp.json.return_value = {
+            'camera_id': 'cam_live',
+            'running': True,
+            'changed': True,
+            'metadata_applied': {'tenant_id': self.tenant.id, 'source_type': 'webcam'},
+        }
+
+        status_resp = MagicMock()
+        status_resp.ok = True
+        status_resp.json.return_value = {'running': True}
+
+        mock_post.return_value = runtime_resp
+        mock_get.return_value = status_resp
+
+        response = self.client.post('/api/ai/webcam-state/', {'enabled': True}, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data['applied'])
+        self.assertEqual(response.data['camera_id'], 'cam_live')
+
+        webcam_camera = Camera.objects.get(pk=response.data['camera_db_id'])
+        self.assertEqual(webcam_camera.tenant_id, self.tenant.id)
+        self.assertEqual(webcam_camera.ai_camera_id, 'cam_live')
+        self.assertEqual(webcam_camera.stream_path, 'cam_live')
+        self.assertEqual(webcam_camera.source_type, Camera.SourceType.WEBCAM)
+        self.assertEqual(webcam_camera.status, Camera.Status.ACTIVE)
+
+        mock_post.assert_called_once()
+        self.assertEqual(
+            mock_post.call_args.kwargs['json'],
+            {
+                'enabled': True,
+                'tenant_id': self.tenant.id,
+                'camera_id': 'cam_live',
+                'source_type': 'webcam',
+            },
+        )
+
+    def test_ai_start_rejects_viewer_role(self):
+        viewer_client = APIClient()
+        token_response = viewer_client.post('/api/auth/token/', {'username': 'viewer', 'password': 'password123'}, format='json')
+        viewer_client.credentials(
+            HTTP_AUTHORIZATION=f"Bearer {token_response.data['access']}",
+            HTTP_X_TENANT_ID=str(self.tenant.id),
+        )
+
+        response = viewer_client.post('/api/ai/start/', {'camera_id': self.camera.id}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_ai_start_rejects_camera_outside_tenant(self):
+        other_tenant = Tenant.objects.create(name='Other Tenant')
+        other_camera = Camera.objects.create(
+            tenant=other_tenant,
+            name='Other Cam',
+            rtsp_url='rtsp://other.example/stream',
+            ai_camera_id='other_cam',
+            stream_path='other_cam',
+        )
+
+        response = self.client.post('/api/ai/start/', {'camera_id': other_camera.id}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)

@@ -4,6 +4,38 @@ import uuid
 
 User = get_user_model()
 
+
+def default_instant_notification_levels():
+    return ["critical", "severe", "moderate"]
+
+
+def severity_level_for_value(severity: int) -> str:
+    try:
+        sev = int(severity)
+    except (TypeError, ValueError):
+        sev = 3
+    if sev >= 5:
+        return "critical"
+    if sev >= 4:
+        return "severe"
+    if sev >= 3:
+        return "moderate"
+    if sev >= 2:
+        return "low"
+    return "info"
+
+
+def normalize_instant_notification_levels(raw_levels) -> list[str]:
+    allowed = ["critical", "severe", "moderate", "low", "info"]
+    if not isinstance(raw_levels, list):
+        return default_instant_notification_levels()
+    normalized = []
+    for value in raw_levels:
+        text = str(value).strip().lower()
+        if text in allowed and text not in normalized:
+            normalized.append(text)
+    return normalized or default_instant_notification_levels()
+
 class Profile(models.Model):
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name="profile")
     bio = models.TextField(blank=True)
@@ -11,12 +43,21 @@ class Profile(models.Model):
     notify_email = models.BooleanField(default=True)
     notify_push = models.BooleanField(default=True)
     notify_sms = models.BooleanField(default=False)
+    instant_notification_levels = models.JSONField(default=default_instant_notification_levels, blank=True)
     # System preferences
     alert_sensitivity = models.CharField(max_length=16, default="medium")  # low|medium|high
     data_retention_days = models.IntegerField(default=60)
     audio_detection = models.BooleanField(default=True)
     blur_faces = models.BooleanField(default=True)
     consent_required = models.BooleanField(default=True)
+
+    def save(self, *args, **kwargs):
+        self.instant_notification_levels = normalize_instant_notification_levels(self.instant_notification_levels)
+        super().save(*args, **kwargs)
+
+    def allows_instant_notification(self, severity: int) -> bool:
+        allowed_levels = set(normalize_instant_notification_levels(self.instant_notification_levels))
+        return severity_level_for_value(severity) in allowed_levels
 
     def __str__(self):
         return f"Profile for {self.user.username}"
@@ -88,6 +129,17 @@ class Camera(TimeStamped):
     k_of_n_k = models.IntegerField(default=3, help_text="K-of-N persistence: require K")
     k_of_n_n = models.IntegerField(default=5, help_text="K-of-N persistence: out of N")
     cooldown_s = models.IntegerField(default=45, help_text="Alert cooldown seconds")
+
+    def _default_lanes():
+        return ["rt_detr", "person_zone"]
+
+    enabled_lanes = models.JSONField(
+        default=_default_lanes,
+        blank=True,
+        help_text="Active detection lanes (e.g. ['rt_detr', 'person_zone', 'fire_smoke_yolo'])"
+    )
+    source_kind = models.CharField(max_length=50, blank=True, default="", help_text="Derived or explicit source kind (e.g., rtsp, mjpeg, hls)")
+    source_fingerprint = models.CharField(max_length=256, blank=True, default="", help_text="Optional TLS fingerprint for HTTPS IP cameras")
 
     def save(self, *args, **kwargs):
         """Auto-derive stream_path if empty for consistent camera mapping."""
@@ -294,3 +346,37 @@ class TenantRuntimeSetting(TimeStamped):
 
     def __str__(self):
         return f"Runtime settings for {self.tenant.name}"
+
+
+class IncidentEventReceipt(models.Model):
+    """
+    Idempotency ledger for processed AI incident events.
+
+    Prevents duplicate Incident/Detection/notification creation when
+    the same logical event arrives through both Redis Pub/Sub and webhook.
+
+    The event_id is the stable identifier from the AI alert payload
+    (e.g., alert session ID or unique alert ID).
+    """
+    class Source(models.TextChoices):
+        REDIS = "redis", "Redis"
+        WEBHOOK = "webhook", "Webhook"
+
+    event_id = models.CharField(max_length=255, unique=True, db_index=True)
+    source = models.CharField(max_length=16, choices=Source.choices)
+    processed_at = models.DateTimeField(auto_now_add=True)
+    incident = models.ForeignKey(
+        Incident,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="event_receipts",
+    )
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["event_id"]),
+        ]
+
+    def __str__(self):
+        return f"Receipt {self.event_id} via {self.source}"

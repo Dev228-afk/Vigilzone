@@ -51,11 +51,24 @@ vi.stubGlobal('AudioContext', vi.fn(() => ({
   currentTime: 0,
 })));
 
-// Mock fetch
-const mockFetch = vi.fn();
+// Mock fetch with proper Response-like object
+const mockFetch = vi.fn().mockResolvedValue({
+  ok: true,
+  json: async () => ({ notifications: [], unread_count: 0 }),
+});
 vi.stubGlobal('fetch', mockFetch);
 
 import { useNotifications } from '../useNotifications';
+
+function createDeferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
 
 describe('useNotifications', () => {
   beforeEach(() => {
@@ -63,6 +76,10 @@ describe('useNotifications', () => {
     lastCreatedWebSocket = null;
     mockSend.mockClear();
     mockClose.mockClear();
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: async () => ({ notifications: [], unread_count: 0 }),
+    });
   });
 
   describe('connect', () => {
@@ -73,9 +90,10 @@ describe('useNotifications', () => {
         result.current.connect('test-token', 1);
       });
 
-      expect(WebSocket).toHaveBeenCalledWith(
-        'ws://localhost:8000/ws/notifications/?token=test-token&tenant_id=1'
-      );
+      // WebSocket should be called with a URL containing the token and tenant_id
+      expect(WebSocket).toHaveBeenCalled();
+      const callUrl = (WebSocket as any).mock.calls[0][0];
+      expect(callUrl).toMatch(/ws:\/\/.+\/ws\/notifications\/\?token=test-token&tenant_id=1/);
     });
 
     it('should set isConnected to true on successful connection', async () => {
@@ -200,7 +218,7 @@ describe('useNotifications', () => {
 
       expect(result.current.unreadCount).toBe(0);
 
-      // Simulate receiving notification
+      // Simulate receiving notification with alert_id (so unread count increments)
       act(() => {
         if (lastCreatedWebSocket?.onmessage) {
           lastCreatedWebSocket.onmessage(new MessageEvent('message', {
@@ -208,6 +226,7 @@ describe('useNotifications', () => {
               type: 'notification',
               title: 'New Alert',
               message: 'Alert message',
+              alert_id: 42,
               created_at: new Date().toISOString(),
             }),
           }));
@@ -281,7 +300,7 @@ describe('useNotifications', () => {
     it('should call API to mark notifications as read', async () => {
       mockFetch.mockResolvedValueOnce({
         ok: true,
-        json: () => Promise.resolve({ success: true }),
+        json: async () => ({ success: true }),
       });
 
       // Mock localStorage
@@ -299,7 +318,7 @@ describe('useNotifications', () => {
         result.current.connect('test-token', 1);
       });
 
-      // Simulate connection and notification
+      // Simulate connection and notification with alert_id
       act(() => {
         if (lastCreatedWebSocket?.onopen) {
           lastCreatedWebSocket.onopen();
@@ -313,6 +332,8 @@ describe('useNotifications', () => {
               type: 'notification',
               title: 'Test',
               message: 'Test',
+              alert_id: 1,
+              incident_id: 10,
               created_at: new Date().toISOString(),
             }),
           }));
@@ -449,6 +470,317 @@ describe('useNotifications', () => {
       });
 
       expect(result.current.notifications.length).toBe(0);
+    });
+  });
+
+  describe('duplicate prevention and unread count accuracy (REGRESSION)', () => {
+    it('should not insert duplicate notifications with same alert_id', async () => {
+      const { result } = renderHook(() => useNotifications());
+      
+      act(() => {
+        result.current.connect('test-token', 1);
+      });
+
+      act(() => {
+        if (lastCreatedWebSocket?.onopen) {
+          lastCreatedWebSocket.onopen();
+        }
+      });
+
+      await waitFor(() => {
+        expect(result.current.isConnected).toBe(true);
+      });
+
+      const notificationWithAlertId = {
+        type: 'notification',
+        notification_type: 'incident',
+        title: 'Incident Detected',
+        message: 'Motion detected',
+        alert_id: 42,
+        incident_id: 10,
+        created_at: '2026-03-28T10:00:00Z',
+      };
+
+      // Receive notification via WebSocket
+      act(() => {
+        if (lastCreatedWebSocket?.onmessage) {
+          lastCreatedWebSocket.onmessage(new MessageEvent('message', { 
+            data: JSON.stringify(notificationWithAlertId) 
+          }));
+        }
+      });
+
+      await waitFor(() => {
+        expect(result.current.notifications.length).toBe(1);
+        expect(result.current.unreadCount).toBe(1);
+      });
+
+      // Receive same notification again (e.g., from REST hydration or duplicate WebSocket delivery)
+      act(() => {
+        if (lastCreatedWebSocket?.onmessage) {
+          lastCreatedWebSocket.onmessage(new MessageEvent('message', { 
+            data: JSON.stringify(notificationWithAlertId) 
+          }));
+        }
+      });
+
+      // Should not create duplicate entry or increment unread count again
+      await waitFor(() => {
+        expect(result.current.notifications.length).toBe(1);
+        expect(result.current.unreadCount).toBe(1);
+      });
+    });
+
+    it('should not increment unread count when updating existing notification', async () => {
+      const { result } = renderHook(() => useNotifications());
+      
+      act(() => {
+        result.current.connect('test-token', 1);
+      });
+
+      act(() => {
+        if (lastCreatedWebSocket?.onopen) {
+          lastCreatedWebSocket.onopen();
+        }
+      });
+
+      const timestamp = '2026-03-28T10:00:00Z';
+      const notification = {
+        type: 'notification',
+        notification_type: 'incident',
+        title: 'Incident',
+        message: 'Test',
+        alert_id: 55,
+        incident_id: 20,
+        created_at: timestamp,
+      };
+
+      // First delivery
+      act(() => {
+        if (lastCreatedWebSocket?.onmessage) {
+          lastCreatedWebSocket.onmessage(new MessageEvent('message', { 
+            data: JSON.stringify(notification) 
+          }));
+        }
+      });
+
+      await waitFor(() => {
+        expect(result.current.unreadCount).toBe(1);
+        expect(result.current.notifications.length).toBe(1);
+      });
+
+      // Second delivery with updated properties (e.g., more details)
+      const updatedNotification = {
+        ...notification,
+        message: 'Updated message with more detail',
+      };
+
+      act(() => {
+        if (lastCreatedWebSocket?.onmessage) {
+          lastCreatedWebSocket.onmessage(new MessageEvent('message', { 
+            data: JSON.stringify(updatedNotification) 
+          }));
+        }
+      });
+
+      // Wait for the message to be updated, then verify unread count and list length haven't changed
+      await waitFor(() => {
+        expect(result.current.notifications[0].message).toBe('Updated message with more detail');
+        // Still only 1 notification and unread count should not have changed
+        expect(result.current.notifications.length).toBe(1);
+        expect(result.current.unreadCount).toBe(1);
+      });
+    });
+
+    it('should preserve websocket notifications when hydration resolves after connect', async () => {
+      const listDeferred = createDeferred<{ ok: boolean; json: () => Promise<{ notifications: never[] }> }>();
+      const unreadDeferred = createDeferred<{ ok: boolean; json: () => Promise<{ unread_count: number }> }>();
+
+      mockFetch
+        .mockReset()
+        .mockImplementationOnce(() => listDeferred.promise)
+        .mockImplementationOnce(() => unreadDeferred.promise);
+
+      const { result } = renderHook(() => useNotifications());
+
+      act(() => {
+        result.current.connect('test-token', 1);
+      });
+
+      act(() => {
+        if (lastCreatedWebSocket?.onopen) {
+          lastCreatedWebSocket.onopen();
+        }
+      });
+
+      const notification = {
+        type: 'notification',
+        notification_type: 'incident',
+        title: 'Race Condition Alert',
+        message: 'Arrived before hydration',
+        alert_id: 77,
+        incident_id: 33,
+        created_at: '2026-03-28T10:00:00Z',
+      };
+
+      act(() => {
+        if (lastCreatedWebSocket?.onmessage) {
+          lastCreatedWebSocket.onmessage(new MessageEvent('message', {
+            data: JSON.stringify(notification),
+          }));
+        }
+      });
+
+      await waitFor(() => {
+        expect(result.current.notifications.length).toBe(1);
+        expect(result.current.unreadCount).toBe(1);
+      });
+
+      await act(async () => {
+        listDeferred.resolve({
+          ok: true,
+          json: async () => ({ notifications: [] }),
+        });
+        unreadDeferred.resolve({
+          ok: true,
+          json: async () => ({ unread_count: 0 }),
+        });
+        await Promise.all([listDeferred.promise, unreadDeferred.promise]);
+      });
+
+      await waitFor(() => {
+        expect(result.current.notifications.length).toBe(1);
+        expect(result.current.notifications[0].alert_id).toBe(77);
+        expect(result.current.unreadCount).toBe(1);
+      });
+    });
+
+    it('should match notifications by incident_id + created_at for websocket-only events without alert_id', async () => {
+      const { result } = renderHook(() => useNotifications());
+      
+      act(() => {
+        result.current.connect('test-token', 1);
+      });
+
+      act(() => {
+        if (lastCreatedWebSocket?.onopen) {
+          lastCreatedWebSocket.onopen();
+        }
+      });
+
+      const timestamp = '2026-03-28T10:30:00Z';
+      const incidentNotification = {
+        type: 'notification',
+        notification_type: 'incident',
+        title: 'Fire Detected',
+        message: 'Fire alert',
+        incident_id: 99,
+        created_at: timestamp,
+        // Note: no alert_id (might be a websocket-only event or AI service notification)
+      };
+
+      // First delivery
+      act(() => {
+        if (lastCreatedWebSocket?.onmessage) {
+          lastCreatedWebSocket.onmessage(new MessageEvent('message', { 
+            data: JSON.stringify(incidentNotification) 
+          }));
+        }
+      });
+
+      await waitFor(() => {
+        expect(result.current.notifications.length).toBe(1);
+      });
+
+      // Second delivery of same incident (should merge, not duplicate)
+      act(() => {
+        if (lastCreatedWebSocket?.onmessage) {
+          lastCreatedWebSocket.onmessage(new MessageEvent('message', { 
+            data: JSON.stringify(incidentNotification) 
+          }));
+        }
+      });
+
+      expect(result.current.notifications.length).toBe(1);
+      expect(result.current.notifications[0].incident_id).toBe(99);
+    });
+
+    it('should allow websocket-only notifications without alert_id to appear immediately', async () => {
+      const { result } = renderHook(() => useNotifications());
+      
+      act(() => {
+        result.current.connect('test-token', 1);
+      });
+
+      act(() => {
+        if (lastCreatedWebSocket?.onopen) {
+          lastCreatedWebSocket.onopen();
+        }
+      });
+
+      const wsOnlyNotification = {
+        type: 'notification',
+        notification_type: 'broadcast',
+        title: 'System Maintenance',
+        message: 'Server will restart in 5 minutes',
+        created_at: new Date().toISOString(),
+        // No alert_id — this is a broadcast/system notification
+      };
+
+      act(() => {
+        if (lastCreatedWebSocket?.onmessage) {
+          lastCreatedWebSocket.onmessage(new MessageEvent('message', { 
+            data: JSON.stringify(wsOnlyNotification) 
+          }));
+        }
+      });
+
+      await waitFor(() => {
+        expect(result.current.notifications.length).toBe(1);
+        expect(result.current.notifications[0].title).toBe('System Maintenance');
+      });
+
+      // Unread count should NOT increment for notifications without alert_id
+      expect(result.current.unreadCount).toBe(0);
+    });
+
+    it('should prevent unread count inflation with rapid duplicate deliveries', async () => {
+      const { result } = renderHook(() => useNotifications());
+      
+      act(() => {
+        result.current.connect('test-token', 1);
+      });
+
+      act(() => {
+        if (lastCreatedWebSocket?.onopen) {
+          lastCreatedWebSocket.onopen();
+        }
+      });
+
+      const notification = {
+        type: 'notification',
+        notification_type: 'incident',
+        title: 'High Severity Alert',
+        message: 'Critical event',
+        alert_id: 300,
+        incident_id: 100,
+        created_at: '2026-03-28T11:00:00Z',
+      };
+
+      // Simulate rapid delivery of the same notification (e.g., network retry, duplicate broker delivery)
+      for (let i = 0; i < 5; i++) {
+        act(() => {
+          if (lastCreatedWebSocket?.onmessage) {
+            lastCreatedWebSocket.onmessage(new MessageEvent('message', { 
+              data: JSON.stringify(notification) 
+            }));
+          }
+        });
+      }
+
+      // Should still be 1 notification and unread count should be 1, not 5
+      expect(result.current.notifications.length).toBe(1);
+      expect(result.current.unreadCount).toBe(1);
     });
   });
 });

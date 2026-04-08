@@ -62,14 +62,16 @@ class LiveCameraReader(IngestBackend):
     # ------------------------------------------------------------------
     def _connect(self) -> bool:
         try:
-            if self._cap:
-                self._cap.release()
-
-            self._cap = cv2.VideoCapture(self.camera_index)
+            # Force DSHOW on Windows for reliability + faster init
+            idx = int(self.camera_index)
+            self._cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
 
             if not self._cap.isOpened():
-                self._connected = False
-                return False
+                # Fallback if DSHOW fails (though rare on modern Windows)
+                self._cap = cv2.VideoCapture(idx)
+                if not self._cap.isOpened():
+                    self._connected = False
+                    return False
 
             ret, frame = self._cap.read()
             if ret and frame is not None:

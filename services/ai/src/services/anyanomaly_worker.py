@@ -66,9 +66,11 @@ class AnyAnomalyEngine:
 
     def _required_packages(self) -> List[str]:
         script_name = (self._entry_script_name or "").lower()
-        if "demo.py" in script_name:
-            return ["transformers"]
-        return ["vllm"]
+        if "vllm" in script_name:
+            return ["vllm"]
+        # All other scripts in the Paper-AnyAnomaly repo (MiniCPM, ChatUniVi)
+        # primarily use transformers and accelerate.
+        return ["transformers", "accelerate", "fastprogress"]
 
     def _missing_packages(self, required: List[str]) -> List[str]:
         if not required:

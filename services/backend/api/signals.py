@@ -24,6 +24,8 @@ def broadcast_incident_notification(sender, instance, created, **kwargs):
     was created via API (IncidentViewSet.perform_create) or Django admin.
     """
     if created:
+        if getattr(instance, "_skip_broadcast_notification", False):
+            return
         # Import here to avoid circular imports
         from .notification_service import NotificationService
         

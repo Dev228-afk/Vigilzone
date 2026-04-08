@@ -11,6 +11,8 @@ app_name = "ai_integration"
 
 urlpatterns = [
     # ── Proxy endpoints (JWT-protected) ───────────────────────
+    path("start/",                            views.ai_start,                      name="ai-start"),
+    path("stop/",                             views.ai_stop,                       name="ai-stop"),
     path("cameras/",                          views.ai_cameras,                    name="ai-cameras"),
     path("alerts/",                           views.ai_alerts,                     name="ai-alerts"),
     path("frame/<str:camera_id>/",            views.ai_frame,                      name="ai-frame"),

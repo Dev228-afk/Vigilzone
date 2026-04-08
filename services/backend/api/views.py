@@ -16,10 +16,18 @@ from django.db.models import Q, TextField
 from django.db.models.functions import Cast
 from django.conf import settings
 from django.utils import timezone
+from ai_integration.redis_queue import (
+    append_incident_event,
+    build_test_incident_event,
+    create_redis_client,
+    read_subscriber_status,
+    stream_length,
+)
+from server.redis_runtime import resolve_backend_redis_settings
 from .models import (
     Tenant, Membership, Camera, CameraZone, Incident, Detection,
     Alert, AuditLog, Profile, Invitation, KnownEntity, NotificationChannel,
-    TenantRuntimeSetting,
+    TenantRuntimeSetting, normalize_instant_notification_levels, severity_level_for_value,
 )
 from .stream_workers import STREAM_WORKERS
 from .serializers import (
@@ -175,7 +183,7 @@ def _probe_rtsp(rtsp_url: str, timeout_s: int = 3) -> dict:
     if shutil.which("ffprobe"):
         t0 = _time.monotonic()
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 [
                     "ffprobe", "-v", "error",
                     "-rtsp_transport", "tcp",
@@ -184,12 +192,16 @@ def _probe_rtsp(rtsp_url: str, timeout_s: int = 3) -> dict:
                     "-print_format", "json",
                     rtsp_url,
                 ],
-                capture_output=True, timeout=timeout_s + 2,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
+            proc.wait(timeout=timeout_s + 2)
+            stdout = proc.stdout.read(51200)  # Bound read to 50KB to prevent OOM
+            stderr = proc.stderr.read(51200)
+            
             latency = int((_time.monotonic() - t0) * 1000)
-            if proc.returncode == 0 and proc.stdout:
+            if proc.returncode == 0 and stdout:
                 try:
-                    info = _json.loads(proc.stdout)
+                    info = _json.loads(stdout)
                     streams = info.get("streams", [])
                     if streams:
                         s = streams[0]
@@ -206,8 +218,9 @@ def _probe_rtsp(rtsp_url: str, timeout_s: int = 3) -> dict:
                         }
                 except _json.JSONDecodeError:
                     pass
-            result["error"] = (proc.stderr or b"").decode(errors="replace").strip()[:300]
+            result["error"] = stderr.decode(errors="replace").strip()[:300]
         except subprocess.TimeoutExpired:
+            proc.kill()
             result["error"] = f"ffprobe timed out ({timeout_s}s)"
             result["latency_ms"] = timeout_s * 1000
             return result
@@ -217,7 +230,7 @@ def _probe_rtsp(rtsp_url: str, timeout_s: int = 3) -> dict:
     # ── Fallback: ffmpeg single-frame grab ────────────────────
     t0 = _time.monotonic()
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             [
                 "ffmpeg", "-hide_banner", "-loglevel", "error",
                 "-rtsp_transport", "tcp",
@@ -226,21 +239,225 @@ def _probe_rtsp(rtsp_url: str, timeout_s: int = 3) -> dict:
                 "-frames:v", "1",
                 "-f", "null", "-",
             ],
-            capture_output=True, timeout=timeout_s + 2,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
+        proc.wait(timeout=timeout_s + 2)
+        stdout = proc.stdout.read(51200)
+        stderr = proc.stderr.read(51200)
+        
         latency = int((_time.monotonic() - t0) * 1000)
         if proc.returncode == 0:
             return {"ok": True, "method": "ffmpeg", "latency_ms": latency}
         result["method"] = "ffmpeg"
         result["latency_ms"] = latency
-        result["error"] = (proc.stderr or b"").decode(errors="replace").strip()[:300]
+        result["error"] = stderr.decode(errors="replace").strip()[:300]
     except FileNotFoundError:
         result["error"] = "Neither ffprobe nor ffmpeg found on PATH"
     except subprocess.TimeoutExpired:
+        proc.kill()
         result["error"] = f"ffmpeg timed out ({timeout_s}s)"
         result["latency_ms"] = timeout_s * 1000
 
     return result
+
+# ── AI sync helpers ──────────────────────────────────────────
+def _get_canonical_camera_id(camera: Camera) -> str:
+    """Return a stable ID for MediaMTX paths and AI registration."""
+    from django.utils.text import slugify
+    if camera.stream_path:
+        return camera.stream_path
+    if camera.ai_camera_id:
+        return camera.ai_camera_id
+    if camera.name:
+        return slugify(camera.name)
+    return f"camera-{camera.pk}"
+
+
+from urllib.parse import urlparse
+
+
+def _get_mediamtx_loopback_url(stream_path: str) -> str:
+    """Return the RTSP loopback URL for AI ingestion through MediaMTX."""
+    base = os.getenv("MEDIAMTX_RTSP_BASE", "").strip()
+
+    if not base:
+        ai_base = os.getenv("AI_BASE_INTERNAL", "http://127.0.0.1:8080").strip()
+        ai_host = (urlparse(ai_base).hostname or "").lower()
+
+        if ai_host in {"127.0.0.1", "localhost", "0.0.0.0"}:
+            base = "rtsp://127.0.0.1:8554"
+        else:
+            base = "rtsp://mediamtx:8554"
+
+    return f"{base.rstrip('/')}/{str(stream_path).lstrip('/')}"
+
+
+def _get_mediamtx_api_base() -> str:
+    return os.getenv("MEDIAMTX_API_BASE", "http://127.0.0.1:9997").rstrip("/")
+
+
+def classify_camera_source(url: str) -> str:
+    lowered = url.strip().lower()
+    if lowered.startswith((
+        "rtsp://", "rtsps://", "rtmp://", "rtmps://",
+        "srt://", "whep://", "wheps://"
+    )):
+        return "native"
+    if ".m3u8" in lowered:
+        return "hls"
+    if any(x in lowered for x in ["getoneshot", "snapshot"]):
+        return "snapshot"
+    if any(x in lowered for x in [".mjpg", ".mjpeg", "/mjpg", "/mjpeg", "nphmotionjpeg", "motionjpeg"]):
+        return "mjpeg"
+    return "unknown"
+
+
+def build_mediamtx_path_payload(camera: Camera, path_name: str, source_kind: str) -> dict:
+    if source_kind in ("native", "hls"):
+        payload = {
+            "source": camera.rtsp_url,
+            "sourceOnDemand": True,
+            "sourceOnDemandStartTimeout": "20s",
+            "sourceOnDemandCloseAfter": "10s",
+        }
+        if source_kind == "native" and camera.rtsp_url.strip().lower().startswith("rtsp"):
+            payload["rtspTransport"] = "tcp"
+        if camera.source_fingerprint:
+            payload["sourceFingerprint"] = camera.source_fingerprint
+        return payload
+    elif source_kind == "mjpeg":
+        escaped_url = camera.rtsp_url.replace('"', '\\"')
+        
+        ffmpeg_cmd = 'ffmpeg -nostdin -loglevel warning '
+        if camera.rtsp_url.lower().startswith("https://"):
+            ffmpeg_cmd += '-tls_verify 0 '
+
+        run_on_demand = (
+            ffmpeg_cmd +
+            f'-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 '
+            f'-f mjpeg -i "{escaped_url}" '
+            f'-an -c:v libx264 -preset ultrafast -tune zerolatency '
+            f'-pix_fmt yuv420p -g 30 '
+            f'-f rtsp rtsp://127.0.0.1:8554/{path_name}'
+        )
+        return {
+            "source": "publisher",
+            "sourceOnDemand": False,
+            "runOnDemand": run_on_demand,
+            "runOnDemandRestart": True,
+            "runOnDemandStartTimeout": "20s",
+            "runOnDemandCloseAfter": "10s",
+        }
+    else:
+        raise ValueError(f"Unsupported source kind '{source_kind}' for MediaMTX live provisioning.")
+
+
+def _ensure_mediamtx_path(camera: Camera) -> tuple[str, str, str]:
+    import os
+    import requests as http_client
+
+    path_name = _get_canonical_camera_id(camera)
+    if not camera.rtsp_url:
+        raise ValueError(f"Camera '{camera.name}' has no rtsp_url; cannot provision MediaMTX.")
+
+    api_base = _get_mediamtx_api_base()
+    
+    source_kind = camera.source_kind or classify_camera_source(camera.rtsp_url)
+    payload = build_mediamtx_path_payload(camera, path_name, source_kind)
+
+    # Make sure API is reachable.
+    info_resp = http_client.get(f"{api_base}/v3/config/global/get", timeout=5)
+    info_resp.raise_for_status()
+
+    # Check whether path exists.
+    check_resp = http_client.get(f"{api_base}/v3/config/paths/get/{path_name}", timeout=5)
+
+    if check_resp.status_code == 200:
+        write_resp = http_client.patch(
+            f"{api_base}/v3/config/paths/patch/{path_name}",
+            json=payload,
+            timeout=5,
+        )
+        if write_resp.status_code >= 400:
+            raise RuntimeError(f"MediaMTX patch failed for {path_name}: {write_resp.status_code} {write_resp.text}")
+        write_resp.raise_for_status()
+    elif check_resp.status_code == 404:
+        write_resp = http_client.post(
+            f"{api_base}/v3/config/paths/add/{path_name}",
+            json=payload,
+            timeout=5,
+        )
+        if write_resp.status_code >= 400:
+            raise RuntimeError(f"MediaMTX add failed for {path_name}: {write_resp.status_code} {write_resp.text}")
+        write_resp.raise_for_status()
+    else:
+        raise RuntimeError(
+            f"Unexpected MediaMTX response while checking path '{path_name}': "
+            f"{check_resp.status_code} {check_resp.text[:300]}"
+        )
+
+    verify_resp = http_client.get(f"{api_base}/v3/config/paths/get/{path_name}", timeout=5)
+    verify_resp.raise_for_status()
+    verify_data = verify_resp.json()
+    actual_source = (verify_data.get("source") or "").strip()
+    
+    expected_source = payload["source"]
+    expected_run_on_demand = payload.get("runOnDemand")
+    actual_run_on_demand = verify_data.get("runOnDemand")
+    
+    if actual_source != expected_source.strip():
+        raise RuntimeError(
+            f"MediaMTX path '{path_name}' source mismatch. Expected '{expected_source}', got '{actual_source}'"
+        )
+        
+    if expected_run_on_demand and actual_run_on_demand != expected_run_on_demand:
+        raise RuntimeError(
+            f"MediaMTX path '{path_name}' runOnDemand mismatch. Expected runOnDemand to be set."
+        )
+        
+    return path_name, source_kind, expected_source
+
+
+from typing import Dict, List
+
+def reconcile_all_cameras_to_mediamtx() -> Dict[str, object]:
+    """
+    Replay all DB camera RTSP sources into MediaMTX path configs.
+    Returns counts and failures for diagnostics.
+    """
+    results: List[dict] = []
+    success = 0
+    failed = 0
+
+    for camera in Camera.objects.exclude(rtsp_url__isnull=True).exclude(rtsp_url__exact=""):
+        try:
+            path_name, source_kind, provisioned_source = _ensure_mediamtx_path(camera)
+            results.append({
+                "camera_id": camera.id,
+                "name": camera.name,
+                "path": path_name,
+                "source_kind": source_kind,
+                "provisioned_source": provisioned_source,
+                "status": "ok",
+                "source": camera.rtsp_url,
+            })
+            success += 1
+        except Exception as exc:
+            results.append({
+                "camera_id": camera.id,
+                "name": camera.name,
+                "status": "error",
+                "error": str(exc),
+                "source": camera.rtsp_url,
+            })
+            failed += 1
+
+    return {
+        "total": success + failed,
+        "success": success,
+        "failed": failed,
+        "results": results,
+    }
 
 
 class CameraViewSet(TenantScopedViewSet):
@@ -260,72 +477,179 @@ class CameraViewSet(TenantScopedViewSet):
         tenant = get_active_tenant(request)
         return assert_non_viewer(request, tenant)
 
+    def perform_create(self, serializer):
+        """
+        Save camera first, then provision the MediaMTX path immediately when rtsp_url exists.
+        """
+        from django.utils.text import slugify
+        
+        camera = serializer.save()
+        
+        # DECOUPLED FIX: Generate stream_path immediately upon creation.
+        # Do not wait for AI to sync. MediaMTX needs this path instantly.
+        if not camera.stream_path:
+            camera.stream_path = slugify(camera.name) or f"cam_{camera.id}"
+            camera.save(update_fields=["stream_path"])
+
+        if camera.rtsp_url:
+            try:
+                _ensure_mediamtx_path(camera)
+            except Exception:
+                # Creation should not hard-fail on provisioning in admin UI flows.
+                # sync_to_ai will surface a hard error later if still broken.
+                pass
+
+    def perform_update(self, serializer):
+        """Sync MediaMTX path when camera is updated."""
+        from django.utils.text import slugify
+        
+        camera = serializer.save()
+        
+        if not camera.stream_path:
+            camera.stream_path = slugify(camera.name) or f"cam_{camera.id}"
+            camera.save(update_fields=["stream_path"])
+
+        if camera.rtsp_url:
+            try:
+                _ensure_mediamtx_path(camera)
+            except Exception:
+                pass
+
+    def perform_destroy(self, instance):
+        """Cleanup MediaMTX path when camera is deleted."""
+        path_name = _get_canonical_camera_id(instance)
+        api_base = _get_mediamtx_api_base()
+        import requests as http_client
+        try:
+            http_client.delete(f"{api_base}/v3/config/paths/delete/{path_name}", timeout=5)
+        except Exception:
+            pass
+        instance.delete()
+
+    @action(detail=False, methods=["post"], url_path="reconcile_mediamtx")
+    def reconcile_mediamtx(self, request):
+        self._assert_camera_write_access(request)
+        summary = reconcile_all_cameras_to_mediamtx()
+        status_code = status.HTTP_200_OK if summary["failed"] == 0 else status.HTTP_207_MULTI_STATUS
+        return Response(summary, status=status_code)
+
     @action(detail=True, methods=["post"], url_path="sync_to_ai")
     def sync_to_ai(self, request, pk=None):
         """POST /api/cameras/{id}/sync_to_ai/ — register camera with AI module."""
         import requests as http_client
-        import re
-        from django.utils.text import slugify
+
         self._assert_camera_write_access(request)
         camera = self.get_object()
-        ai_base = os.getenv("AI_BASE_INTERNAL", "http://127.0.0.1:8080")
+        ai_base = os.getenv("AI_BASE_INTERNAL", "http://127.0.0.1:8080").rstrip("/")
 
-        # Prefer stable IDs that match what the UI/streams use.
-        # Avoid the old fallback cam_<pk> unless absolutely necessary.
-        def _default_camera_id() -> str:
-            if camera.ai_camera_id and not re.match(r"^cam_\d+$", camera.ai_camera_id):
-                return camera.ai_camera_id
-            if camera.stream_path:
-                return camera.stream_path
-            if camera.name:
-                return slugify(camera.name)
-            return f"cam_{camera.pk}"
+        try:
+            stream_id, source_kind, _ = _ensure_mediamtx_path(camera)
+        except Exception as exc:
+            return Response(
+                {"error": f"MediaMTX provisioning failed: {str(exc)}"},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        loopback_url = _get_mediamtx_loopback_url(stream_id)
 
         payload = {
-            "camera_id": _default_camera_id(),
-            "rtsp_url": camera.rtsp_url or "",
-            "ingest_backend": "opencv",
-            "enabled_lanes": ["rt_detr", "yolov8_fallback", "fire_smoke_yolo", "person_zone"],
-            "sample_hz": 2.0,
+            "camera_id": stream_id,
+            "rtsp_url": loopback_url,
+            "ingest_backend": request.data.get("ingest_backend", "opencv"),
+            "enabled_lanes": request.data.get(
+                "enabled_lanes",
+                camera.enabled_lanes if camera.enabled_lanes else ["rt_detr", "person_zone"],
+            ),
+            "sample_hz": request.data.get("sample_hz", 2.0),
         }
-        # Allow request body to override any field
-        for key in ("camera_id", "rtsp_url", "ingest_backend", "enabled_lanes", "sample_hz"):
-            if key in request.data:
-                payload[key] = request.data[key]
 
         try:
             resp = http_client.post(
                 f"{ai_base}/api/v1/cameras/register",
-                json=payload, timeout=15,
+                json=payload,
+                timeout=3.0,
             )
-            if resp.status_code in (200, 201):
-                ai_data = resp.json()
-                camera.ai_camera_id = ai_data.get("camera_id", payload["camera_id"])
-                camera.status = Camera.Status.ACTIVE
-                camera.source_type = Camera.SourceType.REGISTERED
-                # Ensure stream_path is populated (auto-derive triggers on save)
-                update_fields = ["ai_camera_id", "status", "source_type", "updated_at"]
-                if not camera.stream_path:
-                    camera.stream_path = camera.ai_camera_id
-                    update_fields.append("stream_path")
-                camera.save(update_fields=update_fields)
-                return Response({
-                    "status": "synced",
-                    "ai_camera_id": camera.ai_camera_id,
-                    "stream_path": camera.stream_path,
-                    "hot_loaded": ai_data.get("hot_loaded", False),
-                })
-            else:
-                camera.status = Camera.Status.INACTIVE
-                camera.save(update_fields=["status", "updated_at"])
-                return Response(
-                    {"error": f"AI returned {resp.status_code}", "detail": resp.text[:500]},
-                    status=status.HTTP_502_BAD_GATEWAY,
-                )
         except http_client.ConnectionError:
             return Response({"error": "AI service unavailable"}, status=status.HTTP_502_BAD_GATEWAY)
         except http_client.Timeout:
-            return Response({"error": "AI service timeout"}, status=status.HTTP_504_GATEWAY_TIMEOUT)
+            return Response(
+                {
+                    "error": "AI service is busy or starting up.", 
+                    "suggestion": "The request was sent, please refresh in a few moments."
+                }, 
+                status=status.HTTP_504_GATEWAY_TIMEOUT
+            )
+
+        if resp.status_code not in (200, 201):
+            camera.status = Camera.Status.INACTIVE
+            camera.save(update_fields=["status", "updated_at"])
+            return Response(
+                {"error": f"AI returned {resp.status_code}", "detail": resp.text[:500]},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        ai_data = resp.json()
+        camera.ai_camera_id = ai_data.get("camera_id", stream_id)
+        camera.status = Camera.Status.ACTIVE
+        camera.source_type = Camera.SourceType.REGISTERED
+        update_fields = ["ai_camera_id", "status", "source_type", "updated_at"]
+
+        camera.save(update_fields=update_fields)
+
+        return Response({
+            "status": "synced",
+            "ai_camera_id": camera.ai_camera_id,
+            "stream_path": camera.stream_path,
+            "hot_loaded": ai_data.get("hot_loaded", False),
+            "rtsp_url_sent": payload["rtsp_url"],
+            "path_name": stream_id,
+            "db_rtsp_url": camera.rtsp_url,
+            "loopback_rtsp_url": payload["rtsp_url"],
+        })
+
+    @action(detail=True, methods=["post"], url_path="runtime_control")
+    def runtime_control(self, request, pk=None):
+        """POST /api/cameras/{id}/runtime_control/ — start/stop AI task (Phase 3)."""
+        import requests as http_client
+        self._assert_camera_write_access(request)
+        camera = self.get_object()
+        enabled = request.data.get("enabled")
+        if enabled is None:
+            return Response({"error": "Field 'enabled' (bool) is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        ai_base = os.getenv("AI_BASE_INTERNAL", "http://127.0.0.1:8080")
+        cam_id = camera.ai_camera_id or _get_canonical_camera_id(camera)
+
+        # If enabling, ensure registered first (ensure AI knows about loopback)
+        if enabled:
+            sync_payload = {
+                "camera_id": cam_id,
+                "rtsp_url": _get_mediamtx_loopback_url(cam_id),
+                "enabled_lanes": camera.enabled_lanes if camera.enabled_lanes else ["rt_detr", "person_zone"],
+            }
+            try:
+                http_client.post(f"{ai_base}/api/v1/cameras/register", json=sync_payload, timeout=5)
+            except Exception:
+                pass
+
+        try:
+            # Fix: AI endpoint expects a raw boolean Body, not an object (Objective 4)
+            resp = http_client.post(
+                f"{ai_base}/api/v1/cameras/{cam_id}/runtime-control",
+                json=bool(enabled),
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                camera.status = Camera.Status.ACTIVE if data.get("running") else Camera.Status.INACTIVE
+                camera.save(update_fields=["status", "updated_at"])
+                return Response(data)
+            return Response(
+                {"error": f"AI returned {resp.status_code}", "detail": resp.text[:500]},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        except Exception as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
 
     # ── Zone CRUD ────────────────────────────────────────────
     @action(detail=True, methods=["get", "post"], url_path="zones")
@@ -376,9 +700,17 @@ class CameraViewSet(TenantScopedViewSet):
         try:
             resp = http_client.put(
                 f"{ai_base}/api/v1/cameras/{cam_id}/zones",
-                json=zones_payload, timeout=10,
+                json=zones_payload, timeout=3.0,
             )
             return Response({"status": "synced", "ai_status": resp.status_code, "zones_sent": len(zones_payload)})
+        except http_client.Timeout:
+            return Response(
+                {
+                    "error": "AI service is busy or starting up.", 
+                    "suggestion": "The request was sent, please refresh in a few moments."
+                }, 
+                status=status.HTTP_504_GATEWAY_TIMEOUT
+            )
         except Exception as exc:
             return Response({"error": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
 
@@ -399,34 +731,122 @@ class CameraViewSet(TenantScopedViewSet):
         try:
             resp = http_client.put(
                 f"{ai_base}/api/v1/cameras/{cam_id}/settings",
-                json=payload, timeout=10,
+                json=payload, timeout=3.0,
             )
             return Response({"status": "synced", "ai_status": resp.status_code})
+        except http_client.Timeout:
+            return Response(
+                {
+                    "error": "AI service is busy or starting up.", 
+                    "suggestion": "The request was sent, please refresh in a few moments."
+                }, 
+                status=status.HTTP_504_GATEWAY_TIMEOUT
+            )
         except Exception as exc:
             return Response({"error": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+
+    def _do_test_connection(self, rtsp_url, camera=None, timeout_s=5):
+        import uuid
+        import requests as http_client
+        if not rtsp_url:
+            return Response({"ok": False, "category": "missing_url", "error": "No URL provided."}, status=status.HTTP_400_BAD_REQUEST)
+        
+        source_kind = classify_camera_source(rtsp_url)
+        path_name = _get_canonical_camera_id(camera) if camera else f"test-{uuid.uuid4().hex[:8]}"
+
+        temp_cam = camera if camera else Camera(rtsp_url=rtsp_url)
+        try:
+            payload = build_mediamtx_path_payload(temp_cam, path_name, source_kind)
+        except ValueError as exc:
+            return Response({"ok": False, "category": "unsupported_source", "message": str(exc), "error": str(exc)})
+        api_base = _get_mediamtx_api_base()
+        
+        try:
+            info = http_client.get(f"{api_base}/v3/config/global/get", timeout=5)
+            info.raise_for_status()
+        except Exception:
+            return Response({"ok": False, "category": "mediamtx_api_unavailable", "message": "MediaMTX Control API unreachable.", "error": "MediaMTX Control API unreachable."})
+            
+        try:
+            check = http_client.get(f"{api_base}/v3/config/paths/get/{path_name}", timeout=5)
+            if check.status_code == 200:
+                write = http_client.patch(f"{api_base}/v3/config/paths/patch/{path_name}", json=payload, timeout=5)
+            else:
+                write = http_client.post(f"{api_base}/v3/config/paths/add/{path_name}", json=payload, timeout=5)
+            if write.status_code >= 400:
+                raise RuntimeError(f"{write.status_code} {write.text}")
+        except Exception as exc:
+            if "tls" in str(exc).lower() or "certificate" in str(exc).lower():
+                cat = "tls_validation_error"
+            else:
+                cat = "path_provision_failed"
+            return Response({"ok": False, "category": cat, "message": str(exc), "error": str(exc)})
+            
+        loopback_url = _get_mediamtx_loopback_url(path_name)
+        
+        from .stream_workers import _probe_rtsp
+        probe_result = _probe_rtsp(loopback_url, timeout_s=timeout_s)
+        
+        if not camera:
+            try:
+                http_client.delete(f"{api_base}/v3/config/paths/delete/{path_name}", timeout=5)
+            except Exception:
+                pass
+                
+        if not probe_result.get("ok"):
+            cat = "source_timeout" if "timeout" in str(probe_result.get("error", "")).lower() else "loopback_unavailable"
+            return Response({
+                "ok": False, 
+                "category": cat, 
+                "message": probe_result.get("error", "Unknown probe error"),
+                "error": probe_result.get("error", "Unknown probe error"),
+                "source_kind": source_kind,
+                "path_name": path_name,
+                "loopback_rtsp_url": loopback_url,
+            })
+            
+        return Response({
+            "ok": True,
+            "category": "ok",
+            "message": f"Connection OK ({probe_result.get('method')})",
+            "source_kind": source_kind,
+            "path_name": path_name,
+            "loopback_rtsp_url": loopback_url,
+            "details": probe_result.get("details"),
+            "latency_ms": probe_result.get("latency_ms"),
+            "method": probe_result.get("method"),
+        })
 
     # ── Test connection (existing camera) ───────────────────
     @action(detail=True, methods=["post"], url_path="test_connection")
     def test_connection_detail(self, request, pk=None):
-        """POST /api/cameras/{id}/test_connection/ — test stored RTSP URL."""
+        """POST /api/cameras/{id}/test_connection/ — test stored RTSP URL via MediaMTX."""
         self._assert_camera_write_access(request)
         camera = self.get_object()
-        rtsp_url = camera.rtsp_url
-        if not rtsp_url:
-            return Response({"ok": False, "error": "No RTSP URL stored for this camera"}, status=status.HTTP_400_BAD_REQUEST)
-        timeout_s = min(int(request.data.get("timeout_s", 3)), 10)
-        return Response(_probe_rtsp(rtsp_url, timeout_s))
+        timeout_s = min(int(request.data.get("timeout_s", 5)), 15)
+        return self._do_test_connection(camera.rtsp_url, camera=camera, timeout_s=timeout_s)
 
     # ── Test connection (unsaved URL) ───────────────────────
     @action(detail=False, methods=["post"], url_path="test_connection")
     def test_connection_list(self, request):
-        """POST /api/cameras/test_connection/ — test an arbitrary RTSP URL."""
+        """
+        CLOUD FIX: HTTP 202 Accepted Pattern.
+        Instead of running ffprobe in the web thread, enqueue it.
+        """
         self._assert_camera_write_access(request)
         rtsp_url = request.data.get("rtsp_url", "").strip()
         if not rtsp_url:
-            return Response({"ok": False, "error": "rtsp_url is required"}, status=status.HTTP_400_BAD_REQUEST)
-        timeout_s = min(int(request.data.get("timeout_s", 3)), 10)
-        return Response(_probe_rtsp(rtsp_url, timeout_s))
+            return Response({"error": "rtsp_url is required"}, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Example pseudo-code for Celery task queuing
+        # task = probe_rtsp_task.delay(rtsp_url)
+        # return Response({"task_id": task.id, "status": "processing"}, status=status.HTTP_202_ACCEPTED)
+
+        # If Celery is not yet implemented, simulate a strict 2-second timeout locally,
+        # but tag this heavily for Phase 2 infrastructure migration.
+        timeout_s = 2 # Strictly reduced for Cloud Load Balancers
+        result = self._do_test_connection(rtsp_url, camera=None, timeout_s=timeout_s)
+        return Response(result)
 
 class IncidentViewSet(TenantScopedViewSet):
     queryset = Incident.objects.select_related("camera").all()
@@ -601,14 +1021,29 @@ def dashboard_summary(request):
 
     incidents = Incident.objects.filter(tenant=tenant)
 
-    # Cameras
-    cameras = list(Camera.objects.filter(tenant=tenant).values("id", "name", "site", "status", "ai_camera_id", "source_type"))
+    # Cameras - DECOUPLED FIX: Include stream_path so the UI can construct 
+    # MediaMTX WebRTC URLs without waiting for AI synchronization.
+    cameras_qs = Camera.objects.filter(tenant=tenant).values(
+        "id", "name", "site", "status", "ai_camera_id", "source_type", "stream_path", "rtsp_url"
+    )
+    
+    cameras = []
+    for cam in cameras_qs:
+        # Convert rtsp_url presence to a safe boolean for the UI (hide credentials)
+        cam["has_stream"] = bool(cam.pop("rtsp_url", None))
+        cameras.append(cam)
+
+    active_cameras = sum(1 for cam in cameras if cam.get("status") == Camera.Status.ACTIVE)
 
     # Incident counts
     stats = {
         "today": incidents.filter(started_at__gte=today_start).count(),
         "week": incidents.filter(started_at__gte=week_start).count(),
         "month": incidents.filter(started_at__gte=month_start).count(),
+        "open": incidents.filter(status=Incident.Status.OPEN).count(),
+        "critical": incidents.filter(severity__gte=4, started_at__gte=today_start).count(),
+        "camera_total": len(cameras),
+        "camera_live": active_cameras,
     }
 
     # Recent incidents (last 10)
@@ -634,11 +1069,16 @@ def dashboard_summary(request):
     ai_healthy = False
     try:
         import requests as http_client
+        from requests.exceptions import RequestException
+        import logging
+        
         ai_base = os.getenv("AI_BASE_INTERNAL", "http://127.0.0.1:8080")
         resp = http_client.get(f"{ai_base}/api/v1/health", timeout=3)
         ai_healthy = resp.status_code == 200
-    except Exception:
-        pass
+    except RequestException as exc:
+        import logging
+        logging.getLogger(__name__).warning("AI Engine health check failed: %s", exc)
+        # Continue silently for the user, but now we have an audit trail
 
     return Response({
         "cameras": cameras,
@@ -787,27 +1227,23 @@ class KnownEntityViewSet(TenantScopedViewSet):
             if resp.status_code in (200, 201):
                 ai_data = resp.json()
                 entity.ai_entity_id = str(ai_data.get("entity_id", ai_data.get("id", "")))
-                # Build thumbnail URL from first saved image
-                saved_urls = ai_data.get("saved_image_urls", [])
-                if saved_urls:
-                    # IMPORTANT: store a URL that the frontend can fetch through
-                    # the Django API base (/api) without double-prefixing.
-                    # Frontend axios baseURL is "/api", so we store paths like "/ai/...".
-                    # AI returns paths like "/enroll_images/<id>/<file>", which are served
-                    # through Django at "/api/ai/enroll_images/...".
-                    p = str(saved_urls[0])
-                    if p.startswith("/api/"):
-                        p = p[4:]  # "/api/ai/..." -> "/ai/..."
-                    if p.startswith("/enroll_images/"):
-                        p = f"/ai{p}"  # -> "/ai/enroll_images/..."
+                
+                # CLOUD FIX: Do not rely on local file paths like /enroll_images/...
+                # In the cloud, the AI engine MUST upload the crop to an S3 bucket 
+                # and return the CDN URL, or return a Base64 string for lightweight thumbnails.
+                
+                if ai_data.get("thumbnail_b64"):
+                    # Store small base64 directly, or save to Django's configured Storage backend (S3)
+                    entity.thumbnail_url = f"data:image/jpeg;base64,{ai_data['thumbnail_b64']}"
+                elif ai_data.get("s3_url"):
+                    entity.thumbnail_url = ai_data["s3_url"]
+                else:
+                    # Fallback ONLY if strictly needed during local dev migration
+                    p = str(ai_data.get("thumbnail", ""))
+                    if p.startswith("/api/"): p = p[4:]
+                    if p.startswith("/enroll_images/"): p = f"/ai{p}"
                     entity.thumbnail_url = p
-                elif ai_data.get("thumbnail"):
-                    p = str(ai_data["thumbnail"])
-                    if p.startswith("/api/"):
-                        p = p[4:]
-                    if p.startswith("/enroll_images/"):
-                        p = f"/ai{p}"
-                    entity.thumbnail_url = p
+
                 entity.save(update_fields=["ai_entity_id", "thumbnail_url", "updated_at"])
                 self._sync_entity_to_ai(entity)
         except Exception as exc:
@@ -1255,9 +1691,11 @@ def _mjpeg_generator(camera_id: int, fps: int):
 @api_view(["GET"])
 @permission_classes([])
 def streams_mjpeg(request, camera_id):
-    """Signed query token auth for browser <img> compatibility."""
-    from django.http import StreamingHttpResponse
-
+    """
+    CLOUD FIX: Django no longer spawns stateful OpenCV threads.
+    It simply validates the token and acts as a stateless reverse proxy 
+    or redirects to the dedicated streaming server (MediaMTX).
+    """
     token_param = request.GET.get("token", "")
     ok, _payload = _verify_stream_token(token_param, camera_id) if token_param else (False, {})
     if not ok:
@@ -1268,17 +1706,15 @@ def streams_mjpeg(request, camera_id):
     except Camera.DoesNotExist:
         return Response({"error": "Camera not found"}, status=status.HTTP_404_NOT_FOUND)
 
-    cfg = _stream_preview_config()
-    STREAM_WORKERS.ensure_running(camera, **cfg)
-    STREAM_WORKERS.add_viewer(int(camera.pk))
-
-    resp = StreamingHttpResponse(
-        _mjpeg_generator(int(camera.pk), cfg["fps"]),
-        content_type="multipart/x-mixed-replace; boundary=frame",
-    )
-    resp["Cache-Control"] = "no-store"
-    resp["X-Accel-Buffering"] = "no"
-    return resp
+    # In a cloud environment, redirect the client directly to the MediaMTX stream 
+    # or the AI Edge Node handling the camera, removing the load from Django entirely.
+    # Assuming MediaMTX is available at a known internal/external URL:
+    mediamtx_url = os.getenv("MEDIAMTX_EXTERNAL_URL", "http://localhost:8888")
+    stream_path = camera.stream_path or f"cam_{camera.id}"
+    
+    # Redirect directly to MediaMTX API for the HLS/WebRTC/MJPEG feed
+    from django.shortcuts import redirect
+    return redirect(f"{mediamtx_url}/{stream_path}/stream")
 
 
 @api_view(["GET"])
@@ -1303,18 +1739,50 @@ logger = logging.getLogger(__name__)
 @api_view(["GET", "PUT"])
 @permission_classes([IsAuthenticated])
 def notification_settings(request):
-    """GET/PUT /api/notifications/settings/ — tenant notification prefs."""
+    """GET/PUT /api/notifications/settings/ — tenant channel prefs + user instant-alert preferences."""
     tenant = get_active_tenant(request)
     if not assert_member(request, tenant):
         raise PermissionDenied()
     channel, _ = NotificationChannel.objects.get_or_create(tenant=tenant)
+    profile, _ = Profile.objects.get_or_create(user=request.user)
+
     if request.method == "GET":
-        return Response(NotificationChannelSerializer(channel).data)
-    assert_role_in(request, tenant, allowed_roles={"owner", "admin"})
-    ser = NotificationChannelSerializer(channel, data=request.data, partial=True)
-    ser.is_valid(raise_exception=True)
-    ser.save()
-    return Response(ser.data)
+        return Response({
+            **NotificationChannelSerializer(channel).data,
+            "instant_notification_levels": normalize_instant_notification_levels(profile.instant_notification_levels),
+            "available_instant_notification_levels": [
+                {"value": "critical", "label": "Critical"},
+                {"value": "severe", "label": "Severe"},
+                {"value": "moderate", "label": "Moderate"},
+                {"value": "low", "label": "Low"},
+                {"value": "info", "label": "Info"},
+            ],
+        })
+
+    channel_payload = dict(request.data)
+    instant_levels = channel_payload.pop("instant_notification_levels", None)
+
+    if instant_levels is not None:
+        profile.instant_notification_levels = normalize_instant_notification_levels(instant_levels)
+        profile.save(update_fields=["instant_notification_levels"])
+
+    if channel_payload:
+        assert_role_in(request, tenant, allowed_roles={"owner", "admin"})
+        ser = NotificationChannelSerializer(channel, data=channel_payload, partial=True)
+        ser.is_valid(raise_exception=True)
+        ser.save()
+
+    return Response({
+        **NotificationChannelSerializer(channel).data,
+        "instant_notification_levels": normalize_instant_notification_levels(profile.instant_notification_levels),
+        "available_instant_notification_levels": [
+            {"value": "critical", "label": "Critical"},
+            {"value": "severe", "label": "Severe"},
+            {"value": "moderate", "label": "Moderate"},
+            {"value": "low", "label": "Low"},
+            {"value": "info", "label": "Info"},
+        ],
+    })
 
 
 @api_view(["POST"])
@@ -1395,7 +1863,60 @@ def _coerce_bool(raw, default=False):
     return default
 
 
-def _set_ai_webcam_runtime(enabled: bool) -> dict:
+def _ensure_tenant_webcam_camera(tenant: Tenant, enabled: bool | None = None) -> Camera:
+    """Ensure a stable cam_live record exists for the tenant."""
+    camera = (
+        Camera.objects.filter(tenant=tenant)
+        .filter(
+            Q(ai_camera_id="cam_live")
+            | Q(stream_path="cam_live")
+            | Q(source_type=Camera.SourceType.WEBCAM)
+        )
+        .order_by("id")
+        .first()
+    )
+
+    target_status = (
+        Camera.Status.ACTIVE
+        if enabled is True
+        else Camera.Status.INACTIVE
+        if enabled is False
+        else None
+    )
+
+    if camera is None:
+        return Camera.objects.create(
+            tenant=tenant,
+            name="Live Webcam",
+            ai_camera_id="cam_live",
+            stream_path="cam_live",
+            source_type=Camera.SourceType.WEBCAM,
+            status=target_status or Camera.Status.INACTIVE,
+        )
+
+    update_fields = []
+    if not camera.name:
+        camera.name = "Live Webcam"
+        update_fields.append("name")
+    if camera.ai_camera_id != "cam_live":
+        camera.ai_camera_id = "cam_live"
+        update_fields.append("ai_camera_id")
+    if camera.stream_path != "cam_live":
+        camera.stream_path = "cam_live"
+        update_fields.append("stream_path")
+    if camera.source_type != Camera.SourceType.WEBCAM:
+        camera.source_type = Camera.SourceType.WEBCAM
+        update_fields.append("source_type")
+    if target_status and camera.status != target_status:
+        camera.status = target_status
+        update_fields.append("status")
+    if update_fields:
+        update_fields.append("updated_at")
+        camera.save(update_fields=update_fields)
+    return camera
+
+
+def _set_ai_webcam_runtime(enabled: bool, tenant: Tenant | None = None) -> dict:
     import requests as http_client
 
     ai_base = os.getenv("AI_BASE_INTERNAL", "http://127.0.0.1:8080").rstrip("/")
@@ -1403,8 +1924,15 @@ def _set_ai_webcam_runtime(enabled: bool) -> dict:
     status_url = f"{ai_base}/api/v1/cameras/cam_live/runtime-status"
 
     timeout_s = 25
-    # AI endpoint currently accepts a raw JSON boolean body for `enabled`.
-    resp = http_client.post(control_url, json=bool(enabled), timeout=timeout_s)
+    control_payload: bool | dict = bool(enabled)
+    if tenant is not None:
+        control_payload = {
+            "enabled": bool(enabled),
+            "tenant_id": tenant.id,
+            "camera_id": "cam_live",
+            "source_type": "webcam",
+        }
+    resp = http_client.post(control_url, json=control_payload, timeout=timeout_s)
     if resp.status_code >= 400:
         raise RuntimeError(f"AI runtime-control failed: {resp.status_code} {resp.text[:200]}")
 
@@ -1452,14 +1980,25 @@ def ai_webcam_state(request):
             return Response({"error": "enabled is required"}, status=status.HTTP_400_BAD_REQUEST)
 
         enabled = _coerce_bool(request.data.get("enabled"), default=False)
+        webcam_camera = _ensure_tenant_webcam_camera(tenant, enabled=enabled)
         runtime_setting.webcam_enabled = enabled
         runtime_setting.save(update_fields=["webcam_enabled", "updated_at"])
 
         try:
-            ai_result = _set_ai_webcam_runtime(enabled)
+            ai_result = _set_ai_webcam_runtime(enabled, tenant=tenant)
+            runtime_payload = ai_result.get("status", {}) or {}
+            running = runtime_payload.get("running")
+            desired_status = (
+                Camera.Status.ACTIVE if running else Camera.Status.INACTIVE
+            ) if isinstance(running, bool) else (Camera.Status.ACTIVE if enabled else Camera.Status.INACTIVE)
+            if webcam_camera.status != desired_status:
+                webcam_camera.status = desired_status
+                webcam_camera.save(update_fields=["status", "updated_at"])
             return Response({
                 "webcam_enabled": runtime_setting.webcam_enabled,
-                "runtime": ai_result.get("status", {}),
+                "runtime": runtime_payload,
+                "camera_id": webcam_camera.ai_camera_id,
+                "camera_db_id": webcam_camera.id,
                 "applied": True,
             })
         except Exception as exc:
@@ -1467,17 +2006,29 @@ def ai_webcam_state(request):
             try:
                 runtime = _get_ai_webcam_runtime_status()
                 if isinstance(runtime.get("running"), bool) and runtime["running"] == enabled:
+                    desired_status = Camera.Status.ACTIVE if enabled else Camera.Status.INACTIVE
+                    if webcam_camera.status != desired_status:
+                        webcam_camera.status = desired_status
+                        webcam_camera.save(update_fields=["status", "updated_at"])
                     return Response({
                         "webcam_enabled": runtime_setting.webcam_enabled,
                         "runtime": runtime,
+                        "camera_id": webcam_camera.ai_camera_id,
+                        "camera_db_id": webcam_camera.id,
                         "applied": True,
                         "warning": str(exc),
                     })
             except Exception:
                 pass
+            fallback_status = Camera.Status.INACTIVE if not enabled else webcam_camera.status
+            if webcam_camera.status != fallback_status:
+                webcam_camera.status = fallback_status
+                webcam_camera.save(update_fields=["status", "updated_at"])
             return Response({
                 "webcam_enabled": runtime_setting.webcam_enabled,
                 "runtime": runtime,
+                "camera_id": webcam_camera.ai_camera_id,
+                "camera_db_id": webcam_camera.id,
                 "applied": False,
                 "warning": str(exc),
             }, status=status.HTTP_502_BAD_GATEWAY)
@@ -1509,8 +2060,7 @@ def _ensure_user_alert_backfill(tenant, user, max_incidents=300):
     existing_alert_incident_ids = set(
         Alert.objects.filter(incident_id__in=incident_ids)
         .filter(
-            Q(payload__user_id=user.id)
-            | Q(payload__user_id=str(user.id))
+            Q(payload__user_id=str(user.id))
             | Q(payload__user_id__isnull=True)
         )
         .values_list("incident_id", flat=True)
@@ -1521,8 +2071,12 @@ def _ensure_user_alert_backfill(tenant, user, max_incidents=300):
         return 0
 
     severity_labels = {1: "Low", 2: "Medium-Low", 3: "Medium", 4: "High", 5: "Critical"}
+    profile, _ = Profile.objects.get_or_create(user=user)
     alerts = []
     for incident in missing_incidents:
+        if not profile.allows_instant_notification(incident.severity):
+            continue
+        severity_level = severity_level_for_value(incident.severity)
         alerts.append(Alert(
             incident=incident,
             channel="websocket",
@@ -1534,12 +2088,15 @@ def _ensure_user_alert_backfill(tenant, user, max_incidents=300):
                     "type": incident.type,
                     "status": incident.status,
                     "severity": incident.severity,
+                    "severity_level": severity_level,
                     "camera_id": incident.camera_id,
                     "camera_name": incident.camera.name if incident.camera else None,
                     "started_at": incident.started_at.isoformat() if incident.started_at else None,
                     "details": incident.details,
                 },
-                "user_id": user.id,
+                "severity": incident.severity,
+                "severity_level": severity_level,
+                "user_id": str(user.id),
                 "username": user.username,
                 "backfilled": True,
             }
@@ -1583,8 +2140,7 @@ def notifications_list(request):
     alerts_qs = Alert.objects.filter(
         incident__in=incidents_qs,
     ).filter(
-        Q(payload__user_id=request.user.id)
-        | Q(payload__user_id=str(request.user.id))
+        Q(payload__user_id=str(request.user.id))
         | Q(payload__user_id__isnull=True)
     ).select_related("incident", "incident__camera").order_by("-created_at")
     
@@ -1607,8 +2163,10 @@ def notifications_list(request):
             "created_at": alert.created_at.isoformat(),
             "incident_id": alert.incident_id,
             "incident_type": alert.incident.get_type_display() if alert.incident else None,
-            "severity": alert.incident.severity if alert.incident else None,
+            "severity": payload.get("severity", alert.incident.severity if alert.incident else None),
+            "severity_level": payload.get("severity_level") or payload.get("data", {}).get("severity_level") or (severity_level_for_value(alert.incident.severity) if alert.incident else None),
             "camera_name": alert.incident.camera.name if alert.incident and alert.incident.camera else None,
+            "alert_id": alert.id,
         })
     
     return Response({
@@ -1640,8 +2198,7 @@ def notifications_mark_read(request):
         updated = Alert.objects.filter(
             incident__in=incidents_qs,
             ).filter(
-            Q(payload__user_id=request.user.id)
-            | Q(payload__user_id=str(request.user.id))
+            Q(payload__user_id=str(request.user.id))
             | Q(payload__user_id__isnull=True)
         ).filter(
             delivered_at__isnull=True
@@ -1653,8 +2210,7 @@ def notifications_mark_read(request):
             id__in=notification_ids,
             incident__in=incidents_qs,
             ).filter(
-            Q(payload__user_id=request.user.id)
-            | Q(payload__user_id=str(request.user.id))
+            Q(payload__user_id=str(request.user.id))
             | Q(payload__user_id__isnull=True)
         ).update(delivered_at=timezone.now())
     else:
@@ -1675,21 +2231,53 @@ def notifications_unread_count(request):
     tenant = get_active_tenant(request)
     if not assert_member(request, tenant):
         raise PermissionDenied()
-
-    _ensure_user_alert_backfill(tenant, request.user)
     
     incidents_qs = Incident.objects.filter(tenant=tenant)
     count = Alert.objects.filter(
         incident__in=incidents_qs,
     ).filter(
-        Q(payload__user_id=request.user.id)
-        | Q(payload__user_id=str(request.user.id))
+        Q(payload__user_id=str(request.user.id))
         | Q(payload__user_id__isnull=True)
     ).filter(
         delivered_at__isnull=True
     ).count()
     
     return Response({"unread_count": count})
+
+
+def _notification_transport_snapshot() -> dict:
+    channel_cfg = settings.CHANNEL_LAYERS.get("default", {}) if hasattr(settings, "CHANNEL_LAYERS") else {}
+    backend_path = str(channel_cfg.get("BACKEND", ""))
+    uses_redis = "channels_redis" in backend_path
+    redis_settings = resolve_backend_redis_settings()
+
+    redis_reachable = False
+    redis_error = None
+    subscriber_status = None
+
+    try:
+        client = create_redis_client(redis_settings)
+        client.ping()
+        redis_reachable = True
+        subscriber_status = read_subscriber_status(client, redis_settings.incident_channel)
+        client.close()
+    except Exception as exc:
+        redis_error = str(exc)
+
+    return {
+        "channel_backend": backend_path,
+        "uses_redis": uses_redis,
+        "realtime_ready": bool(uses_redis and redis_reachable),
+        "queue_mode": redis_settings.queue_mode,
+        "incident_stream": redis_settings.incident_channel,
+        "incident_channel": redis_settings.incident_channel,
+        "incident_consumer_group": redis_settings.incident_consumer_group,
+        "incident_consumer_name": redis_settings.incident_consumer_name,
+        "redis": redis_settings.to_diagnostics(),
+        "redis_reachable": redis_reachable,
+        "redis_error": redis_error,
+        "subscriber": subscriber_status,
+    }
 
 
 @api_view(["GET"])
@@ -1704,49 +2292,7 @@ def notifications_transport_status(request):
     if not assert_member(request, tenant):
         raise PermissionDenied()
 
-    channel_cfg = settings.CHANNEL_LAYERS.get("default", {}) if hasattr(settings, "CHANNEL_LAYERS") else {}
-    backend_path = str(channel_cfg.get("BACKEND", ""))
-    uses_redis = "channels_redis" in backend_path
-
-    redis_host = str(os.getenv("REDIS_HOST", "")).strip() or "127.0.0.1"
-    redis_port = 6379
-    try:
-        redis_port = int(os.getenv("REDIS_PORT", "6379"))
-    except ValueError:
-        redis_port = 6379
-
-    # Prefer host/port from channel-layer config when present.
-    hosts_cfg = (channel_cfg.get("CONFIG") or {}).get("hosts") or []
-    if hosts_cfg:
-        first_host = hosts_cfg[0]
-        if isinstance(first_host, (list, tuple)) and len(first_host) >= 2:
-            redis_host = str(first_host[0]) or redis_host
-            try:
-                redis_port = int(first_host[1])
-            except (TypeError, ValueError):
-                pass
-        elif isinstance(first_host, str):
-            parsed = urlparse(first_host)
-            if parsed.hostname:
-                redis_host = parsed.hostname
-            if parsed.port:
-                redis_port = parsed.port
-
-    redis_reachable = False
-    try:
-        sock = socket.create_connection((redis_host, redis_port), timeout=0.75)
-        sock.close()
-        redis_reachable = True
-    except OSError:
-        redis_reachable = False
-
-    return Response({
-        "channel_backend": backend_path,
-        "uses_redis": uses_redis,
-        "redis_host": redis_host,
-        "redis_port": redis_port,
-        "redis_reachable": redis_reachable,
-    })
+    return Response(_notification_transport_snapshot())
 
 
 @api_view(["POST"])
@@ -1811,6 +2357,92 @@ def notifications_test_websocket(request):
         "success": True,
         "result": result,
         "message": "Test notification sent to all connected clients"
+    })
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def notifications_test_incident(request):
+    """
+    POST /api/notifications/test-incident/ — append a synthetic incident to Redis Streams.
+    This exercises the canonical AI -> Redis stream -> subscriber -> websocket path.
+    """
+    tenant = get_active_tenant(request)
+    if not assert_member(request, tenant):
+        raise PermissionDenied()
+    assert_role_in(request, tenant, allowed_roles={"owner", "admin"})
+
+    camera_token = str(request.data.get("camera_id", "")).strip()
+    camera = None
+    if camera_token:
+        camera = (
+            Camera.objects.filter(tenant=tenant)
+            .filter(
+                Q(ai_camera_id=camera_token)
+                | Q(stream_path=camera_token)
+                | Q(name=camera_token)
+            )
+            .first()
+        )
+        if camera is None and camera_token.isdigit():
+            camera = Camera.objects.filter(pk=int(camera_token), tenant=tenant).first()
+    if camera is None:
+        camera = (
+            Camera.objects.filter(tenant=tenant, status=Camera.Status.ACTIVE)
+            .order_by("id")
+            .first()
+            or Camera.objects.filter(tenant=tenant).order_by("id").first()
+        )
+    if camera is None:
+        return Response(
+            {"error": "No camera available for this tenant"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    incident_type = str(request.data.get("type", "intrusion")).strip() or "intrusion"
+    try:
+        severity = max(1, min(5, int(request.data.get("severity", 4))))
+    except (TypeError, ValueError):
+        severity = 4
+
+    event = build_test_incident_event(
+        camera_id=camera.ai_camera_id or camera.stream_path or camera.name,
+        tenant_id=tenant.id,
+        incident_type=incident_type,
+        severity=severity,
+    )
+    redis_settings = resolve_backend_redis_settings()
+
+    try:
+        client = create_redis_client(redis_settings)
+        client.ping()
+        stream_entry_id = append_incident_event(client, redis_settings.incident_channel, event)
+        current_stream_length = stream_length(client, redis_settings.incident_channel)
+        subscriber_status = read_subscriber_status(client, redis_settings.incident_channel)
+        client.close()
+    except Exception as exc:
+        return Response(
+            {
+                "success": False,
+                "error": str(exc),
+                "redis": redis_settings.to_diagnostics(),
+                "incident_stream": redis_settings.incident_channel,
+                "incident_channel": redis_settings.incident_channel,
+            },
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+
+    return Response({
+        "success": True,
+        "queued": True,
+        "event_id": event["data"]["id"],
+        "stream_entry_id": stream_entry_id,
+        "stream_length": current_stream_length,
+        "camera_id": event["data"]["camera_id"],
+        "incident_stream": redis_settings.incident_channel,
+        "incident_channel": redis_settings.incident_channel,
+        "redis": redis_settings.to_diagnostics(),
+        "subscriber": subscriber_status,
     })
 
 
@@ -1907,6 +2539,7 @@ def debug_system(request):
             "db_ok": db_ok,
             "debug_mode": os.getenv("DJANGO_DEBUG", "1") == "1",
         },
+        "notifications": _notification_transport_snapshot(),
         "ai": ai_status,
         "ai_cameras": ai_cameras,
         "ai_reachable": ai_reachable,

@@ -58,15 +58,11 @@ except ImportError:
 LANE_TO_ALERT_TYPE = {
     "rt_detr": None,              # dynamic — depends on label
     "yolov8_fallback": None,      # dynamic
-    "person_zone": "INTRUSION_PERSON_IN_ZONE",
-    "fire_smoke": "FIRE_SMOKE",
     "fire_smoke_yolo": "FIRE_SMOKE",
-    "violence": "VIOLENCE_FIGHT",
     "violence_candidate": "VIOLENCE_FIGHT",
     "fall_candidate": "FALL",
     "weapon_yolo": "WEAPON_DETECTED",
     "accident": "ACCIDENT",
-    "vad_generic": "UNKNOWN_SEVERE_ANOMALY",
     "anyanomaly": "UNKNOWN_SEVERE_ANOMALY",
     "anomalyclip": "UNKNOWN_SEVERE_ANOMALY",
     "temporal_verifier": None,     # never fires directly
@@ -139,6 +135,7 @@ class AlertAggregator:
 
         # Real-time callbacks
         self.alert_callbacks: List[Callable[[Alert], None]] = []
+        self.on_observation_callbacks: List[Callable[[Observation], None]] = []
 
         # In-memory buffer
         self.alert_buffer: List[Alert] = []
@@ -189,9 +186,6 @@ class AlertAggregator:
             lambda: deque(maxlen=20)
         )
 
-        # ── Loitering observations from person_zone lane ──────────────
-        self._person_zone_lanes: Dict[str, Any] = {}  # camera_id → PersonZoneLane
-
         # ── Identity subsystem (§8-§9) ────────────────────────────────
         self._identity_enabled = False
         self._identity_policy = None      # IdentityPolicy
@@ -220,6 +214,9 @@ class AlertAggregator:
     def add_alert_callback(self, callback: Callable[[Alert], None]):
         self.alert_callbacks.append(callback)
 
+    def add_observation_callback(self, callback: Callable[[Observation], None]):
+        self.on_observation_callbacks.append(callback)
+
     def set_identity(self, policy, store):
         """Wire identity policy + store into the aggregator."""
         self._identity_policy = policy
@@ -233,54 +230,9 @@ class AlertAggregator:
             if zones:
                 self._zone_cameras.add(cam_id)
 
-    def set_person_zone_lane(self, camera_id: str, person_zone_lane):
-        """Wire person_zone lane for loitering observation polling."""
-        self._person_zone_lanes[camera_id] = person_zone_lane
-
     def get_incident_registry(self):
         """Return incident registry for diagnostics."""
         return self._incident_registry
-
-    # ------------------------------------------------------------------
-    def process_loitering(self, camera_id: str, evidence_request_callback=None, ringbuffer=None):
-        """
-        Poll person_zone lane for pending loitering events and emit LOITERING alerts.
-        Called by the camera processor after each processing cycle.
-        """
-        pz_lane = self._person_zone_lanes.get(camera_id)
-        if pz_lane is None or not hasattr(pz_lane, "get_pending_loitering"):
-            return
-
-        pending = pz_lane.get_pending_loitering()
-        for event in pending:
-            # Create a synthetic observation for loitering
-            obs = Observation(
-                ts_utc=event.get("ts_utc", now_iso_utc()),
-                camera_id=camera_id,
-                lane="person_zone",
-                score=min(1.0, event.get("dwell_s", 0) / max(event.get("threshold_s", 30), 1)),
-                trigger=True,
-                label="loitering",
-                track_id=event.get("track_id"),
-                zone_name=event.get("zone_name"),
-                debug={
-                    "reason_codes": [
-                        f"loitering_dwell ({event.get('dwell_s', 0):.0f}s > {event.get('threshold_s', 0):.0f}s)",
-                        f"zone={event.get('zone_name', 'global')}",
-                    ],
-                    "dwell_s": event.get("dwell_s", 0),
-                },
-            )
-            alert = self.process_observation(
-                obs,
-                evidence_request_callback=evidence_request_callback,
-                ringbuffer=ringbuffer,
-            )
-            if alert:
-                self.logger.info(
-                    f"LOITERING alert: cam={camera_id} track={event.get('track_id')} "
-                    f"dwell={event.get('dwell_s', 0):.0f}s zone={event.get('zone_name')}"
-                )
 
     # ------------------------------------------------------------------
     def _resolve_alert_type(self, obs: Observation) -> str:
@@ -385,6 +337,13 @@ class AlertAggregator:
         Process an observation through K-of-N → cooldown → deduper → (two-stage / temporal) → fire.
         Identity-lane observations are cached rather than alert-producing.
         """
+        # ── Trigger real-time observation callbacks ──
+        for cb in self.on_observation_callbacks:
+            try:
+                cb(obs)
+            except Exception as e:
+                self.logger.error(f"Observation callback error: {e}")
+
         # Track secondary anomaly signals for fire two-stage
         self._track_secondary_signal(obs)
 
@@ -549,7 +508,7 @@ class AlertAggregator:
         identity_evidence = {}
         identity_match = None
         if self._identity_enabled:
-            # For INTRUSION alerts, person_zone and entity_identity lanes use
+            # For INTRUSION alerts, detector and entity_identity lanes use
             # different trackers, so track_id won't match.  Check camera-level
             # identity cache instead.
             if alert_type == "INTRUSION_PERSON_IN_ZONE":
@@ -733,7 +692,7 @@ class AlertAggregator:
     # ------------------------------------------------------------------
     def _track_detector_observation(self, obs: Observation):
         """Cache recent detector observations for motion-explainability check."""
-        detector_lanes = {"rt_detr", "yolov8_fallback", "person_zone"}
+        detector_lanes = {"rt_detr", "yolov8_fallback"}
         if obs.lane not in detector_lanes:
             return
         if not obs.trigger:
@@ -893,7 +852,7 @@ class AlertAggregator:
         Check if ANY known (enrolled) entity is currently visible on a camera.
         Returns the best known identity dict if found, else None.
 
-        This is needed because person_zone and entity_identity lanes use
+        This is needed because detector and entity_identity lanes use
         different trackers, so track_id matching will fail. Instead, for
         INTRUSION alerts, we check the identity cache at the camera level.
         """

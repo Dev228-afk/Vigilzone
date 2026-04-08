@@ -1,6 +1,6 @@
 """
 FastAPI server for alerts, evidence, live frame feed,
-upload mode (offline video processing), and /metrics.
+and /metrics.
 """
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Query, Body
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
@@ -56,12 +56,6 @@ class AlertServer:
         self._camera_processors = []   # set externally for live frame
         self._aggregator = None  # live aggregator reference
 
-        # Upload jobs
-        self._jobs: Dict[str, Dict[str, Any]] = {}
-        self._job_alerts: Dict[str, List[Dict[str, Any]]] = {}
-        self._upload_dir = Path("uploads")
-        self._upload_dir.mkdir(parents=True, exist_ok=True)
-
         # §A1 — staging uploads directory
         self._staging_dir = Path("data/staging_uploads")
         self._staging_dir.mkdir(parents=True, exist_ok=True)
@@ -77,9 +71,6 @@ class AlertServer:
         # GPU scheduler + throttle refs (set externally)
         self._gpu_scheduler = None
         self._auto_throttle = None
-
-        # Video processor callback (set by main app)
-        self._process_video_fn = None
 
         # Identity subsystem refs (set externally)
         self._entity_store = None       # EntityStore
@@ -207,6 +198,61 @@ class AlertServer:
             pass
         return True
 
+    def _update_runtime_camera_metadata(self, camera_id: str, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        """Persist camera metadata used to enrich outbound alert events."""
+        clean_metadata = {
+            key: value
+            for key, value in (metadata or {}).items()
+            if key != "enabled" and value not in (None, "")
+        }
+        if not clean_metadata:
+            return {}
+
+        proc = self._find_camera_processor(camera_id)
+        if proc is not None:
+            proc.camera_cfg.update(clean_metadata)
+
+        ctx = self._app_context if isinstance(self._app_context, dict) else {}
+        camera_configs = ctx.get("camera_configs", [])
+        if isinstance(camera_configs, list):
+            for cfg in camera_configs:
+                if str(cfg.get("camera_id", "")).strip() == camera_id:
+                    cfg.update(clean_metadata)
+                    break
+
+        runtime_file = Path("data/cameras_runtime.json")
+        runtime_file.parent.mkdir(parents=True, exist_ok=True)
+        runtime_cameras: Dict[str, Any] = {}
+        if runtime_file.exists():
+            try:
+                runtime_cameras = json.loads(runtime_file.read_text())
+            except Exception:
+                runtime_cameras = {}
+        existing_cfg = runtime_cameras.get(camera_id, {"camera_id": camera_id})
+        if isinstance(existing_cfg, dict):
+            existing_cfg.update(clean_metadata)
+            runtime_cameras[camera_id] = existing_cfg
+            runtime_file.write_text(json.dumps(runtime_cameras, indent=2))
+
+        return clean_metadata
+
+    @staticmethod
+    def _parse_runtime_control_payload(payload: Any) -> tuple[bool, Dict[str, Any]]:
+        """Accept either the legacy raw boolean or a richer metadata object."""
+        if isinstance(payload, bool):
+            return payload, {}
+        if isinstance(payload, dict):
+            enabled = payload.get("enabled")
+            if isinstance(enabled, bool):
+                return enabled, {k: v for k, v in payload.items() if k != "enabled"}
+            if isinstance(enabled, str):
+                lowered = enabled.strip().lower()
+                if lowered in {"1", "true", "yes", "on"}:
+                    return True, {k: v for k, v in payload.items() if k != "enabled"}
+                if lowered in {"0", "false", "no", "off"}:
+                    return False, {k: v for k, v in payload.items() if k != "enabled"}
+        raise ValueError("runtime-control body must be a boolean or an object with boolean enabled")
+
     # ------------------------------------------------------------------
     def _setup_routes(self):
 
@@ -237,10 +283,17 @@ class AlertServer:
         @self.app.get("/health")
         async def health():
             count = len(self._aggregator.get_recent_alerts()) if self._aggregator else len(self.alert_buffer)
+            redis_transport = {}
+            try:
+                from ..services.redis_publisher import get_publisher
+                redis_transport = get_publisher().status_snapshot()
+            except Exception as exc:
+                redis_transport = {"ready": False, "error": str(exc)}
             return {
                 "status": "healthy",
                 "alerts_count": count,
                 "ws_clients": len(self.ws_clients),
+                "redis_transport": redis_transport,
             }
 
         @self.app.get("/cameras")
@@ -304,63 +357,8 @@ class AlertServer:
             )
 
         # ==============================================================
-        # UPLOAD MODE (Offline Video Processing) — spec §8
+        # UPLOAD MODE (Offline Video Processing) — REMOVED
         # ==============================================================
-        @self.app.post("/upload_video")
-        async def upload_video(file: UploadFile = File(...),
-                               force_anyanomaly: bool = False):
-            """Upload a video file for offline processing."""
-            job_id = str(uuid.uuid4())[:12]
-            video_path = self._upload_dir / f"{job_id}_{file.filename}"
-
-            # Save uploaded file
-            with open(video_path, "wb") as f:
-                shutil.copyfileobj(file.file, f)
-
-            self._jobs[job_id] = {
-                "job_id": job_id,
-                "filename": file.filename,
-                "video_path": str(video_path),
-                "status": "queued",
-                "progress": 0.0,
-                "created_at": time.time(),
-                "started_at": None,
-                "finished_at": None,
-                "force_anyanomaly": force_anyanomaly,
-                "alerts_count": 0,
-                "error": None,
-            }
-            self._job_alerts[job_id] = []
-
-            # Launch processing in background thread
-            thread = threading.Thread(
-                target=self._run_upload_job,
-                args=(job_id,),
-                daemon=True,
-            )
-            thread.start()
-
-            return {"job_id": job_id, "status": "queued"}
-
-        @self.app.get("/jobs")
-        async def list_jobs():
-            """List all upload jobs."""
-            return list(self._jobs.values())
-
-        @self.app.get("/jobs/{job_id}")
-        async def get_job(job_id: str):
-            """Get status of a specific upload job."""
-            job = self._jobs.get(job_id)
-            if not job:
-                return {"error": "Job not found"}
-            return job
-
-        @self.app.get("/jobs/{job_id}/alerts")
-        async def get_job_alerts(job_id: str):
-            """Get alerts from a completed upload job."""
-            if job_id not in self._jobs:
-                return {"error": "Job not found"}
-            return self._job_alerts.get(job_id, [])
 
         # ==============================================================
         # METRICS — spec addendum §5
@@ -1209,6 +1207,12 @@ class AlertServer:
             uptime_s = time.time() - self._start_time
             cam_count = len(self._camera_processors)
             alert_count = len(self._aggregator.get_recent_alerts()) if self._aggregator else len(self.alert_buffer)
+            redis_transport = {}
+            try:
+                from ..services.redis_publisher import get_publisher
+                redis_transport = get_publisher().status_snapshot()
+            except Exception as exc:
+                redis_transport = {"ready": False, "error": str(exc)}
             return {
                 "service": "vigilzone-ai",
                 "status": "healthy",
@@ -1218,7 +1222,20 @@ class AlertServer:
                 "alerts_total": alert_count,
                 "ws_clients": len(self.ws_clients),
                 "webhooks_registered": len(self._webhooks),
+                "redis_transport": redis_transport,
             }
+
+        @self.app.get("/api/v1/alerts")
+        async def api_alerts(
+            limit: int = Query(50, ge=1, le=1000),
+            severity: Optional[str] = Query(None, description="Filter by severity: SEVERE, HIGH, MED, LOW"),
+            alert_type: Optional[str] = Query(None, description="Filter by type: FIRE_SMOKE, VIOLENCE_FIGHT, etc."),
+            camera_id: Optional[str] = Query(None, description="Filter by camera"),
+        ):
+            """
+            Fetch recent alerts with optional filters.
+            Designed for polling integration (complement to webhooks).
+            """
 
         @self.app.get("/api/v1/alerts")
         async def api_alerts(
@@ -1256,10 +1273,10 @@ class AlertServer:
                 result.append({
                     "camera_id": stats.get("camera_id"),
                     "source_type": stats.get("source_type"),
-                    "active": stats.get("active", True),
-                    "fps": stats.get("fps"),
-                    "lanes": stats.get("enabled_lanes", []),
-                    "frame_count": stats.get("frame_count", 0),
+                    "active": stats.get("active", stats.get("connected", False)),
+                    "fps": stats.get("fps", 0.0),
+                    "lanes": stats.get("active_lanes", []),
+                    "frame_count": stats.get("frame_count", stats.get("frames_processed", 0)),
                 })
             return {"count": len(result), "cameras": result}
 
@@ -1275,31 +1292,59 @@ class AlertServer:
         @self.app.post("/api/v1/cameras/{camera_id}/runtime-control")
         async def api_camera_runtime_control(
             camera_id: str,
-            enabled: bool = Body(..., description="true to start, false to stop"),
+            payload: Any = Body(..., description="true/false or { enabled, tenant_id, ... }"),
         ):
-            """Runtime start/stop control (cam_live only, no service restart)."""
-            if camera_id != "cam_live":
-                return JSONResponse(
-                    status_code=400,
-                    content={"error": "runtime-control is only supported for cam_live"},
-                )
+            """Runtime start/stop control (fully generalized for any registered camera)."""
+            try:
+                enabled, runtime_metadata = self._parse_runtime_control_payload(payload)
+            except ValueError as exc:
+                return JSONResponse(status_code=400, content={"error": str(exc)})
 
             running = self._find_camera_processor(camera_id) is not None
             if enabled and running:
-                return {"camera_id": camera_id, "running": True, "changed": False}
+                return {
+                    "camera_id": camera_id,
+                    "running": True,
+                    "changed": False,
+                    "metadata_applied": self._update_runtime_camera_metadata(camera_id, runtime_metadata),
+                }
             if (not enabled) and (not running):
-                return {"camera_id": camera_id, "running": False, "changed": False}
+                return {
+                    "camera_id": camera_id,
+                    "running": False,
+                    "changed": False,
+                    "metadata_applied": self._update_runtime_camera_metadata(camera_id, runtime_metadata),
+                }
 
             if not enabled:
                 stopped = self._stop_camera_processor(camera_id)
-                return {"camera_id": camera_id, "running": False, "changed": stopped}
+                return {
+                    "camera_id": camera_id,
+                    "running": False,
+                    "changed": stopped,
+                    "metadata_applied": self._update_runtime_camera_metadata(camera_id, runtime_metadata),
+                }
 
+            # If enabling, we need a config.
+            cfg = None
+            # 1. Try in-memory app context
             camera_configs = self._app_context.get("camera_configs", []) if isinstance(self._app_context, dict) else []
             cfg = next((c for c in camera_configs if str(c.get("camera_id", "")) == camera_id), None)
+
+            # 2. Try persistent runtime storage (Phase 4)
+            if not cfg:
+                runtime_file = Path("data/cameras_runtime.json")
+                if runtime_file.exists():
+                    try:
+                        runtime_cameras = json.loads(runtime_file.read_text())
+                        cfg = runtime_cameras.get(camera_id)
+                    except Exception:
+                        pass
+
             if not cfg:
                 return JSONResponse(
                     status_code=404,
-                    content={"error": f"Camera config '{camera_id}' not found"},
+                    content={"error": f"Camera config '{camera_id}' not found. Register it first."},
                 )
 
             started = self._start_camera_processor(cfg)
@@ -1308,7 +1353,12 @@ class AlertServer:
                     status_code=500,
                     content={"error": f"Failed to start camera '{camera_id}'"},
                 )
-            return {"camera_id": camera_id, "running": True, "changed": True}
+            return {
+                "camera_id": camera_id,
+                "running": True,
+                "changed": True,
+                "metadata_applied": self._update_runtime_camera_metadata(camera_id, runtime_metadata),
+            }
 
         @self.app.post("/api/v1/cameras/register")
         async def api_register_camera(
@@ -1316,31 +1366,46 @@ class AlertServer:
             rtsp_url: str = Body("", description="RTSP stream URL"),
             ingest_backend: str = Body("opencv", description="Ingest backend: opencv or ffmpeg"),
             enabled_lanes: List[str] = Body(
-                ["rt_detr", "yolov8_fallback", "fire_smoke_yolo", "person_zone"],
+                ["rt_detr", "yolov8_fallback", "fire_smoke_yolo"],
                 description="Detection lanes to enable",
             ),
             sample_hz: float = Body(2.0, description="Frame sample rate"),
         ):
             """
-            Register a runtime camera. Creates a camera processor and persists
-            to data/cameras_runtime.json so it survives restarts.
+            Register or Update a runtime camera.
+            Handles upserts (Objective 2): restarts processor if config changed.
             """
-            for proc in self._camera_processors:
-                if proc.camera_id == camera_id:
+            # 1. Load active state
+            existing_proc = self._find_camera_processor(camera_id)
+            
+            # 2. Check for changes if already running
+            config_changed = False
+            if existing_proc:
+                stats = existing_proc.get_stats()
+                if (stats.get("rtsp_url") != rtsp_url or
+                    stats.get("ingest_backend") != ingest_backend or
+                    set(stats.get("enabled_lanes", [])) != set(enabled_lanes) or
+                    stats.get("sample_hz") != sample_hz):
+                    config_changed = True
+                    self.logger.info(f"Re-registering camera {camera_id}: config changed. Restarting processor.")
+                    self._stop_camera_processor(camera_id)
+                else:
                     return {
                         "status": "already_registered",
                         "camera_id": camera_id,
-                        "message": f"Camera {camera_id} is already active",
+                        "message": f"Camera {camera_id} is already active with same config",
+                        "hot_loaded": True,
                     }
 
+            # 3. Update persistent storage
             runtime_file = Path("data/cameras_runtime.json")
             runtime_file.parent.mkdir(parents=True, exist_ok=True)
             runtime_cameras = {}
             if runtime_file.exists():
                 try:
                     runtime_cameras = json.loads(runtime_file.read_text())
-                except Exception:
-                    pass
+                except Exception: pass
+            
             runtime_cameras[camera_id] = {
                 "camera_id": camera_id,
                 "rtsp_url": rtsp_url,
@@ -1351,12 +1416,7 @@ class AlertServer:
             }
             runtime_file.write_text(json.dumps(runtime_cameras, indent=2))
 
-            self.logger.info(
-                f"Camera registered: {camera_id} rtsp={rtsp_url} "
-                f"lanes={enabled_lanes} hz={sample_hz}"
-            )
-
-            # ── Hot-load: create CameraProcessor and start it immediately ──
+            # 4. Start/Restart processor
             cam_cfg = {
                 "camera_id": camera_id,
                 "rtsp_url": rtsp_url,
@@ -1368,17 +1428,11 @@ class AlertServer:
             hot_loaded = self._start_camera_processor(cam_cfg)
 
             return {
-                "status": "registered",
+                "status": "updated" if config_changed else "registered",
                 "camera_id": camera_id,
                 "rtsp_url": rtsp_url,
-                "enabled_lanes": enabled_lanes,
-                "sample_hz": sample_hz,
                 "hot_loaded": hot_loaded,
-                "message": (
-                    f"Camera {camera_id} registered and started."
-                    if hot_loaded
-                    else f"Camera {camera_id} registered. Will start on next restart."
-                ),
+                "message": f"Camera {camera_id} {'updated and restarted' if config_changed else 'registered and started'}.",
             }
 
         @self.app.get("/api/v1/cameras/{camera_id}/snapshot")
@@ -1464,6 +1518,7 @@ class AlertServer:
                 "cameras": [],
                 "webhooks": len(self._webhooks),
                 "diagnostics": {},
+                "redis_transport": {},
             }
             if self._doctor_report:
                 dev = self._doctor_report.device_info
@@ -1480,6 +1535,11 @@ class AlertServer:
                 })
             if self._aggregator:
                 result["diagnostics"] = self._aggregator.get_diagnostics()
+            try:
+                from ..services.redis_publisher import get_publisher
+                result["redis_transport"] = get_publisher().status_snapshot()
+            except Exception as exc:
+                result["redis_transport"] = {"ready": False, "error": str(exc)}
             return result
 
     # ------------------------------------------------------------------
@@ -1490,10 +1550,6 @@ class AlertServer:
     def set_auto_throttle(self, throttle):
         """Attach auto-throttle for /metrics."""
         self._auto_throttle = throttle
-
-    def set_process_video_fn(self, fn):
-        """Set the callback for offline video processing."""
-        self._process_video_fn = fn
 
     def set_doctor_report(self, report):
         """Attach startup doctor report for /system/diagnostics."""
@@ -1514,71 +1570,10 @@ class AlertServer:
         self._enrollment_cfg = enrollment_cfg or {}
 
     # ------------------------------------------------------------------
-    def _run_upload_job(self, job_id: str):
-        """Process an uploaded video file (runs in background thread)."""
-        job = self._jobs.get(job_id)
-        if not job:
-            return
-
-        job["status"] = "processing"
-        job["started_at"] = time.time()
-
-        try:
-            video_path = job["video_path"]
-            cap = cv2.VideoCapture(video_path)
-            if not cap.isOpened():
-                job["status"] = "error"
-                job["error"] = "Cannot open video file"
-                return
-
-            fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            job_alerts = []
-
-            if self._process_video_fn:
-                # Use main app's processor for full lane pipeline
-                alerts = self._process_video_fn(
-                    video_path=video_path,
-                    job_id=job_id,
-                    fps=fps,
-                    force_anyanomaly=job.get("force_anyanomaly", False),
-                    progress_callback=lambda p: job.__setitem__("progress", p),
-                )
-                job_alerts = alerts
-            else:
-                # Basic frame-by-frame stub processing
-                frame_idx = 0
-                while True:
-                    ret, frame = cap.read()
-                    if not ret:
-                        break
-                    frame_idx += 1
-                    if total_frames > 0:
-                        job["progress"] = round(frame_idx / total_frames * 100, 1)
-                # No alerts without lane pipeline
-
-            cap.release()
-
-            self._job_alerts[job_id] = [a if isinstance(a, dict) else a for a in job_alerts]
-            job["alerts_count"] = len(job_alerts)
-            job["status"] = "completed"
-            job["finished_at"] = time.time()
-            job["progress"] = 100.0
-
-            self.logger.info(f"Upload job {job_id} completed: {len(job_alerts)} alerts")
-
-        except Exception as e:
-            job["status"] = "error"
-            job["error"] = str(e)
-            job["finished_at"] = time.time()
-            self.logger.error(f"Upload job {job_id} failed: {e}")
-
-    # ------------------------------------------------------------------
     async def broadcast_alert(self, alert: Dict[str, Any]):
-        """Push alert to WebSocket clients AND to registered webhooks."""
-        # WebSocket push
+        """Broadcast a confirmed alert (incident) to WebSockets, Webhooks, and Redis."""
+        message = json.dumps({"event": "alert.created", "data": alert})
         if self.ws_clients:
-            message = json.dumps(alert)
             disconnected = []
             for client in self.ws_clients:
                 try:
@@ -1592,6 +1587,29 @@ class AlertServer:
         # Webhook dispatch (async, non-blocking)
         await self._dispatch_webhooks("alert.created", alert)
 
+        # Redis Streams dispatch (for backend incident subscriber)
+        try:
+            from ..services.redis_publisher import get_publisher
+            publisher = get_publisher()
+            if publisher.is_enabled:
+                publisher.publish_alert(alert)
+        except Exception as exc:
+            self.logger.debug("Redis publish skipped: %s", exc)
+
+    async def broadcast_detection(self, detection: Dict[str, Any]):
+        """Broadcast a real-time observation (unconfirmed detection) to UI for overlays."""
+        message = json.dumps({"event": "observation.detected", "data": detection})
+        if self.ws_clients:
+            # We don't dispatch detections to Redis or Webhooks (too high frequency)
+            disconnected = []
+            for client in self.ws_clients:
+                try:
+                    await client.send_text(message)
+                except Exception:
+                    disconnected.append(client)
+            for client in disconnected:
+                if client in self.ws_clients:
+                    self.ws_clients.remove(client)
     async def _dispatch_webhooks(self, event_type: str, data: Any):
         """POST event to all active webhooks subscribed to this event type."""
         targets = [

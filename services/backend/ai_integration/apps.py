@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 def _auto_register_webhook():
     """Best-effort webhook registration on startup (non-blocking)."""
     import time
-    time.sleep(5)  # Give AI module time to boot
+    time.sleep(10)  # Give AI module time to boot
 
     import requests
 
@@ -51,14 +51,10 @@ class AiIntegrationConfig(AppConfig):
     verbose_name = "AI Integration"
 
     def ready(self):
-        # Auto-register webhook in a background thread (non-blocking).
-        # In local debug, default to off to avoid noisy retries when AI service is down.
+        # Webhook registration is an explicit fallback path now.
         debug_mode = os.getenv("DJANGO_DEBUG", "1") not in ("0", "false", "False")
-        auto_register = os.getenv("AI_AUTO_REGISTER_WEBHOOK")
-        if auto_register is None:
-            auto_register_enabled = not debug_mode
-        else:
-            auto_register_enabled = auto_register.lower() in ("1", "true", "yes")
+        auto_register = os.getenv("AI_AUTO_REGISTER_WEBHOOK", "0")
+        auto_register_enabled = auto_register.lower() in ("1", "true", "yes")
 
         if auto_register_enabled and (os.getenv("RUN_MAIN") == "true" or not debug_mode):
             thread = threading.Thread(target=_auto_register_webhook, daemon=True)

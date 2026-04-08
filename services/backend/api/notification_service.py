@@ -203,9 +203,9 @@ class NotificationService:
                         socket_timeout=5
                     )
                 
-                # channels_redis encodes groups internally with prefix "asgi" and single colon
-                prefix = "asgi"
-                group_key = f"{prefix}:group:{group_name}"
+                # FIX: channels_redis encodes groups internally with prefix "asgi:" (Note the colon)
+                prefix = "asgi:"
+                group_key = f"{prefix}group:{group_name}"
                 channels = client.zrange(group_key, 0, -1)
                 
                 if not channels:
@@ -215,10 +215,12 @@ class NotificationService:
                 for channel_bytes in channels:
                     channel_name = channel_bytes.decode("utf-8")
                     
-                    # Resolve Redis key for this channel (handled identical to channels_redis)
+                    # Resolve Redis key for this channel
                     non_local = channel_name
                     if "!" in channel_name:
                         non_local = channel_name.split("!")[0] + "!"
+                        
+                    # FIX: Correctly construct the channel key with the colon separator
                     channel_key = prefix + non_local
                     
                     # Build message identical to channels_redis group_send output

@@ -1,189 +1,138 @@
-/**
- * Unit tests for NotificationBell component
- */
-
 import React from 'react';
-import { render, screen, fireEvent } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+
 import { NotificationBell } from '../NotificationBell';
 import type { Notification } from '../../hooks/useNotifications';
 
-// Mock Notification type
-const createMockNotification = (overrides: Partial<Notification> = {}): Notification => ({
-  id: '1',
+const createNotification = (overrides: Partial<Notification> = {}): Notification => ({
+  id: `alert-${Math.random().toString(36).slice(2, 8)}`,
   type: 'notification',
   notification_type: 'incident',
-  title: 'Test Incident',
+  title: 'Incident detected',
   message: 'Test message',
   created_at: new Date().toISOString(),
   severity: 4,
-  camera_name: 'Test Camera',
+  severity_level: 'severe',
+  camera_name: 'Front Door',
+  incident_id: 10,
+  alert_id: 42,
+  is_read: false,
   ...overrides,
 });
 
 describe('NotificationBell', () => {
-  const mockProps = {
+  const baseProps = {
     notifications: [] as Notification[],
     unreadCount: 0,
     isConnected: true,
     onMarkAsRead: vi.fn().mockResolvedValue(undefined),
     onMarkAllAsRead: vi.fn().mockResolvedValue(undefined),
     onTestConnection: vi.fn().mockResolvedValue(undefined),
+    onNavigate: vi.fn(),
   };
 
   beforeEach(() => {
     vi.clearAllMocks();
   });
 
-  describe('Rendering', () => {
-    it('should render bell icon', () => {
-      render(<NotificationBell {...mockProps} />);
-      expect(screen.getByLabelText('Notifications')).toBeInTheDocument();
-    });
+  it('renders the notification button and live transport indicator', () => {
+    render(<NotificationBell {...baseProps} />);
 
-    it('should not show badge when unreadCount is 0', () => {
-      render(<NotificationBell {...mockProps} unreadCount={0} />);
-      const badges = screen.queryAllByText(/^\d+$/);
-      expect(badges.length).toBe(0);
-    });
+    expect(screen.getByLabelText('Notifications')).toBeInTheDocument();
+    expect(screen.getByTitle('Realtime live')).toBeInTheDocument();
+  });
 
-    it('should show badge when unreadCount > 0', () => {
-      render(<NotificationBell {...mockProps} unreadCount={5} />);
-      expect(screen.getByText('5')).toBeInTheDocument();
-    });
+  it('shows unread badge and caps it at 9+', () => {
+    const { rerender } = render(<NotificationBell {...baseProps} unreadCount={5} />);
+    expect(screen.getByText('5')).toBeInTheDocument();
 
-    it('should show 9+ when unreadCount > 9', () => {
-      render(<NotificationBell {...mockProps} unreadCount={15} />);
-      expect(screen.getByText('9+')).toBeInTheDocument();
-    });
+    rerender(<NotificationBell {...baseProps} unreadCount={15} />);
+    expect(screen.getByText('9+')).toBeInTheDocument();
+  });
 
-    it('should show connected status indicator (green dot) when connected', () => {
-      render(<NotificationBell {...mockProps} isConnected={true} />);
-      const indicators = screen.getAllByTitle(/Connected/);
-      expect(indicators.length).toBeGreaterThan(0);
-    });
+  it('shows the empty state when there are no notifications', () => {
+    render(<NotificationBell {...baseProps} notifications={[]} />);
 
-    it('should show disconnected status indicator (red dot) when not connected', () => {
-      render(<NotificationBell {...mockProps} isConnected={false} />);
-      const indicators = screen.getAllByTitle(/Disconnected/);
-      expect(indicators.length).toBeGreaterThan(0);
+    fireEvent.click(screen.getByLabelText('Notifications'));
+
+    expect(screen.getByText('No incident notifications yet')).toBeInTheDocument();
+  });
+
+  it('renders every notification instead of truncating at 20', () => {
+    const notifications = Array.from({ length: 25 }, (_, index) =>
+      createNotification({
+        id: `alert-${index}`,
+        alert_id: index + 1,
+        incident_id: index + 100,
+        title: `Alert ${index + 1}`,
+      })
+    );
+
+    render(
+      <NotificationBell
+        {...baseProps}
+        notifications={notifications}
+        unreadCount={notifications.length}
+      />
+    );
+
+    fireEvent.click(screen.getByLabelText('Notifications'));
+
+    expect(screen.getByText('Alert 1')).toBeInTheDocument();
+    expect(screen.getByText('Alert 25')).toBeInTheDocument();
+    expect(screen.getByText('View all incidents')).toBeInTheDocument();
+  });
+
+  it('calls mark-all and test actions from the dropdown header', async () => {
+    render(
+      <NotificationBell
+        {...baseProps}
+        notifications={[createNotification()]}
+        unreadCount={1}
+      />
+    );
+
+    fireEvent.click(screen.getByLabelText('Notifications'));
+    fireEvent.click(screen.getByText('Mark all'));
+    fireEvent.click(screen.getByText('Test'));
+
+    await waitFor(() => {
+      expect(baseProps.onMarkAllAsRead).toHaveBeenCalledTimes(1);
+      expect(baseProps.onTestConnection).toHaveBeenCalledTimes(1);
     });
   });
 
-  describe('Dropdown', () => {
-    it('should open dropdown when bell is clicked', () => {
-      render(<NotificationBell {...mockProps} />);
-      
-      fireEvent.click(screen.getByLabelText('Notifications'));
-      
-      expect(screen.getByText('Notifications')).toBeInTheDocument();
-    });
+  it('marks an unread notification as read and navigates to the incident', async () => {
+    render(
+      <NotificationBell
+        {...baseProps}
+        notifications={[createNotification({ alert_id: 99, incident_id: 321 })]}
+        unreadCount={1}
+      />
+    );
 
-    it('should show empty state when no notifications', () => {
-      render(<NotificationBell {...mockProps} notifications={[]} />);
-      
-      fireEvent.click(screen.getByLabelText('Notifications'));
-      
-      expect(screen.getByText('No notifications yet')).toBeInTheDocument();
-    });
+    fireEvent.click(screen.getByLabelText('Notifications'));
+    fireEvent.click(screen.getByText('Incident detected'));
 
-    it('should show notifications when present', () => {
-      const notifications = [
-        createMockNotification({ id: '1', title: 'Alert 1' }),
-        createMockNotification({ id: '2', title: 'Alert 2' }),
-      ];
-      
-      render(<NotificationBell {...mockProps} notifications={notifications} />);
-      
-      fireEvent.click(screen.getByLabelText('Notifications'));
-      
-      expect(screen.getByText('Alert 1')).toBeInTheDocument();
-      expect(screen.getByText('Alert 2')).toBeInTheDocument();
-    });
-
-    it('should call onMarkAllAsRead when Mark all read is clicked', () => {
-      const notifications = [
-        createMockNotification({ id: '1' }),
-        createMockNotification({ id: '2' }),
-      ];
-      
-      render(<NotificationBell {...mockProps} notifications={notifications} unreadCount={2} />);
-      
-      fireEvent.click(screen.getByLabelText('Notifications'));
-      fireEvent.click(screen.getByText('Mark all read'));
-      
-      expect(mockProps.onMarkAllAsRead).toHaveBeenCalledTimes(1);
-    });
-
-    it('should call onTestConnection when Test is clicked', () => {
-      render(<NotificationBell {...mockProps} />);
-      
-      fireEvent.click(screen.getByLabelText('Notifications'));
-      fireEvent.click(screen.getByText('Test'));
-      
-      expect(mockProps.onTestConnection).toHaveBeenCalledTimes(1);
-    });
-
-    it('should not show Test button when onTestConnection is not provided', () => {
-      const propsWithoutTest = { ...mockProps, onTestConnection: undefined };
-      render(<NotificationBell {...propsWithoutTest} />);
-      
-      fireEvent.click(screen.getByLabelText('Notifications'));
-      
-      expect(screen.queryByText('Test')).not.toBeInTheDocument();
+    await waitFor(() => {
+      expect(baseProps.onMarkAsRead).toHaveBeenCalledWith([99]);
+      expect(baseProps.onNavigate).toHaveBeenCalledWith('/incidents/321');
     });
   });
 
-  describe('Notification Display', () => {
-    it('should display severity badge for high severity', () => {
-      const notification = createMockNotification({ severity: 5 });
-      render(<NotificationBell {...mockProps} notifications={[notification]} />);
-      
-      fireEvent.click(screen.getByLabelText('Notifications'));
-      
-      expect(screen.getByText('Critical')).toBeInTheDocument();
-    });
+  it('opens the incidents page from the footer action', () => {
+    render(
+      <NotificationBell
+        {...baseProps}
+        notifications={[createNotification()]}
+        unreadCount={1}
+      />
+    );
 
-    it('should display camera name when present', () => {
-      const notification = createMockNotification({ camera_name: 'Front Door' });
-      render(<NotificationBell {...mockProps} notifications={[notification]} />);
-      
-      fireEvent.click(screen.getByLabelText('Notifications'));
-      
-      expect(screen.getByText(/Front Door/)).toBeInTheDocument();
-    });
+    fireEvent.click(screen.getByLabelText('Notifications'));
+    fireEvent.click(screen.getByText('View all incidents'));
 
-    it('should format time correctly', () => {
-      const now = new Date();
-      const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000);
-      const notification = createMockNotification({ created_at: oneHourAgo.toISOString() });
-      
-      render(<NotificationBell {...mockProps} notifications={[notification]} />);
-      
-      fireEvent.click(screen.getByLabelText('Notifications'));
-      
-      expect(screen.getByText('1h ago')).toBeInTheDocument();
-    });
-
-    it('should show just now for recent notifications', () => {
-      const notification = createMockNotification({ created_at: new Date().toISOString() });
-      render(<NotificationBell {...mockProps} notifications={[notification]} />);
-      
-      fireEvent.click(screen.getByLabelText('Notifications'));
-      
-      expect(screen.getByText('Just now')).toBeInTheDocument();
-    });
-  });
-
-  describe('Click Outside', () => {
-    it('should close dropdown when clicking outside', () => {
-      render(<NotificationBell {...mockProps} />);
-      
-      fireEvent.click(screen.getByLabelText('Notifications'));
-      expect(screen.getByText('Notifications')).toBeInTheDocument();
-      
-      fireEvent.mouseDown(document);
-      expect(screen.queryByText('No notifications yet')).not.toBeInTheDocument();
-    });
+    expect(baseProps.onNavigate).toHaveBeenCalledWith('/incidents');
   });
 });

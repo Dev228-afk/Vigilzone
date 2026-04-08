@@ -30,8 +30,6 @@ LANE_PRIORITY = {
     "rt_detr": 0,
     "yolov8_fallback": 0,
     "fire_smoke_yolo": 1,
-    "fire_smoke": 1,
-    "person_zone": 1,
     "temporal_verifier": 2,
     "anyanomaly": 3,
     "anomalyclip": 3,
@@ -42,11 +40,9 @@ LANE_TO_BUDGET_KEY = {
     "rt_detr": "rtdetr",
     "yolov8_fallback": "rtdetr",
     "fire_smoke_yolo": "fire_smoke",
-    "fire_smoke": "fire_smoke",
     "temporal_verifier": "temporal_verifier",
     "anyanomaly": "anyanomaly",
     "anomalyclip": "anyanomaly",
-    "person_zone": "fire_smoke",
 }
 
 

@@ -109,7 +109,7 @@ def _build_defaults() -> Dict[str, IncidentDefinition]:
     defs["FIRE_SMOKE"] = IncidentDefinition(
         incident_type="FIRE_SMOKE",
         display_name="Fire / Smoke",
-        candidate_sources=["fire_smoke_yolo", "fire_smoke"],
+        candidate_sources=["fire_smoke_yolo"],
         persistence_k=4, persistence_n=8,
         confirm=ConfirmPolicy(
             require_temporal_verifier=False,      # uses two-stage instead
@@ -171,7 +171,7 @@ def _build_defaults() -> Dict[str, IncidentDefinition]:
     defs["UNKNOWN_SEVERE_ANOMALY"] = IncidentDefinition(
         incident_type="UNKNOWN_SEVERE_ANOMALY",
         display_name="Unknown Anomaly",
-        candidate_sources=["anyanomaly", "anomalyclip", "vad_generic"],
+        candidate_sources=["anyanomaly", "anomalyclip"],
         persistence_k=4, persistence_n=8,
         confirm=ConfirmPolicy(
             require_temporal_verifier=False,

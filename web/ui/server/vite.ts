@@ -34,7 +34,11 @@ export async function setupVite(app: Express, server: Server) {
       ...viteLogger,
       error: (msg, options) => {
         viteLogger.error(msg, options);
-        process.exit(1);
+        // Do not call process.exit(1) here — it causes the dev server to 
+        // prematurely crash on recoverable proxy errors (like 127.0.0.1:9997 failing).
+        if (typeof msg === "string" && msg.includes("http proxy error")) {
+          return;
+        }
       },
     },
     server: serverOptions,

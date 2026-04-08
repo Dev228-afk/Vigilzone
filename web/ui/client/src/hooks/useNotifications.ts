@@ -316,32 +316,34 @@ export function useNotifications(): UseNotificationsReturn {
               is_read: false,
             };
 
+            // FIX: Track insertion status locally. Do NOT call side effects inside setNotifications.
+            let wasInserted = false;
+            let hasAlertId = false;
+
             setNotifications((prev) => {
               const result = upsertNotification(prev, notification);
-              // Only increment unread count if this is a true insert (not an update)
-              if (result.inserted && notification.alert_id) {
-                setUnreadCount((current) => current + 1);
-                // Only play sound for truly new notifications (B2 fix)
-                playNotificationSound();
-
-                // 3. Automated Cache Invalidation - Trigger immediate React Query refresh
-                if (queryClient) {
-                  // Refresh main lists and summaries
-                  queryClient.invalidateQueries({ queryKey: ["incidents"] });
-                  queryClient.invalidateQueries({ queryKey: ["dashboard-summary"] });
-                  queryClient.invalidateQueries({ queryKey: ["community-activity"] });
-                  queryClient.invalidateQueries({ queryKey: ["ai-entities-dash"] });
-
-                  // Refresh specific incident if it matches
-                  if (notification.incident_id) {
-                    queryClient.invalidateQueries({ queryKey: ["incident", String(notification.incident_id)] });
-                  }
-
-                  console.log(`[WebSocket] Triggered cache invalidation for incident #${notification.incident_id}`);
-                }
+              if (result.inserted) {
+                wasInserted = true;
+                hasAlertId = !!notification.alert_id;
               }
               return result.items;
             });
+
+            // FIX: Defer side-effects to run immediately after the render phase tick
+            setTimeout(() => {
+              if (wasInserted && hasAlertId) {
+                setUnreadCount((current) => current + 1);
+                playNotificationSound();
+
+                if (queryClient) {
+                  // Opt out of immediate global invalidation to prevent backend DDoS.
+                  // Only refresh specific Incident query to keep cards live.
+                  if (notification.incident_id) {
+                    queryClient.invalidateQueries({ queryKey: ["incident", String(notification.incident_id)] });
+                  }
+                }
+              }
+            }, 0);
           }
         } catch (err) {
           console.error('[WS] Failed to parse message:', err);

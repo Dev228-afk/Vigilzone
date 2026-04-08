@@ -6,24 +6,126 @@ AI Integration views.
 """
 import hashlib
 import hmac
-import json
 import logging
 import os
-from datetime import datetime, timedelta, timezone as dt_timezone
-from typing import Optional
 
-from django.db import transaction
-from django.utils import timezone
+from django.db import models
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 
-from api.models import Camera, Detection, Incident, Tenant
-
+from api.models import Camera
+from api.views import (
+    _ensure_mediamtx_path,
+    _get_canonical_camera_id,
+    _get_mediamtx_loopback_url,
+    assert_member,
+    assert_non_viewer,
+    get_active_tenant,
+)
 from .proxy import proxy_request
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_control_camera(request, raw_camera_id):
+    tenant = get_active_tenant(request)
+    if not assert_member(request, tenant):
+        return None, tenant, Response(
+            {"error": "Not a member of this tenant."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
+    camera = None
+    camera_token = str(raw_camera_id or "").strip()
+    if not camera_token:
+        return None, tenant, Response(
+            {"error": "camera_id is required"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    if camera_token.isdigit():
+        camera = Camera.objects.filter(pk=int(camera_token), tenant=tenant).first()
+
+    if camera is None:
+        camera = Camera.objects.filter(
+            tenant=tenant,
+        ).filter(
+            models.Q(ai_camera_id=camera_token) | models.Q(stream_path=camera_token)
+        ).first()
+
+    if camera is None:
+        return None, tenant, Response(
+            {"error": "Camera not found for tenant"},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    return camera, tenant, None
+
+
+def _set_camera_runtime(camera: Camera, enabled: bool) -> dict:
+    import requests as http_client
+
+    ai_base = os.getenv("AI_BASE_INTERNAL", "http://127.0.0.1:8080").rstrip("/")
+    stream_id = camera.ai_camera_id or _get_canonical_camera_id(camera)
+
+    if enabled:
+        provisioned_stream_id, _, _ = _ensure_mediamtx_path(camera)
+        stream_id = provisioned_stream_id
+        register_payload = {
+            "camera_id": stream_id,
+            "rtsp_url": _get_mediamtx_loopback_url(stream_id),
+            "ingest_backend": "opencv",
+            "enabled_lanes": ["rt_detr", "yolov8_fallback", "fire_smoke_yolo", "person_zone"],
+            "sample_hz": 2.0,
+        }
+        register_resp = http_client.post(
+            f"{ai_base}/api/v1/cameras/register",
+            json=register_payload,
+            timeout=15,
+        )
+        if register_resp.status_code not in (200, 201):
+            raise RuntimeError(
+                f"AI register failed: {register_resp.status_code} {register_resp.text[:200]}"
+            )
+
+    runtime_resp = http_client.post(
+        f"{ai_base}/api/v1/cameras/{stream_id}/runtime-control",
+        json=bool(enabled),
+        timeout=10,
+    )
+    if runtime_resp.status_code >= 400:
+        raise RuntimeError(
+            f"AI runtime-control failed: {runtime_resp.status_code} {runtime_resp.text[:200]}"
+        )
+
+    runtime_status = {"running": enabled}
+    try:
+        status_resp = http_client.get(
+            f"{ai_base}/api/v1/cameras/{stream_id}/runtime-status",
+            timeout=5,
+        )
+        if status_resp.ok:
+            runtime_status = status_resp.json() or runtime_status
+    except Exception:
+        pass
+
+    camera.ai_camera_id = stream_id
+    if not camera.stream_path:
+        camera.stream_path = stream_id
+    camera.status = Camera.Status.ACTIVE if runtime_status.get("running") else Camera.Status.INACTIVE
+    camera.save(update_fields=["ai_camera_id", "stream_path", "status", "updated_at"])
+
+    return {
+        "camera_db_id": camera.id,
+        "camera_id": camera.ai_camera_id,
+        "name": camera.name,
+        "stream_path": camera.stream_path,
+        "loopback_rtsp_url": _get_mediamtx_loopback_url(camera.ai_camera_id or camera.stream_path),
+        "running": bool(runtime_status.get("running")),
+        "runtime": runtime_status,
+    }
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 1. PROXY ENDPOINTS  (JWT-protected, for the UI)
@@ -72,6 +174,52 @@ def ai_frame(request, camera_id):
 def ai_system_status(request):
     """GET /api/ai/system/status/ → proxy to AI system status."""
     return proxy_request(request, "/api/v1/system/status")
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def ai_start(request):
+    """POST /api/ai/start/ → authorize tenant camera and start AI runtime."""
+    camera, tenant, error_response = _resolve_control_camera(
+        request,
+        request.data.get("camera_id"),
+    )
+    if error_response is not None:
+        return error_response
+
+    assert_non_viewer(request, tenant)
+
+    try:
+        payload = _set_camera_runtime(camera, enabled=True)
+    except Exception as exc:
+        logger.warning("Failed to start AI runtime for camera %s: %s", camera.id, exc)
+        return Response({"error": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+
+    payload["status"] = "started"
+    return Response(payload, status=status.HTTP_200_OK)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def ai_stop(request):
+    """POST /api/ai/stop/ → authorize tenant camera and stop AI runtime."""
+    camera, tenant, error_response = _resolve_control_camera(
+        request,
+        request.data.get("camera_id"),
+    )
+    if error_response is not None:
+        return error_response
+
+    assert_non_viewer(request, tenant)
+
+    try:
+        payload = _set_camera_runtime(camera, enabled=False)
+    except Exception as exc:
+        logger.warning("Failed to stop AI runtime for camera %s: %s", camera.id, exc)
+        return Response({"error": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+
+    payload["status"] = "stopped"
+    return Response(payload, status=status.HTTP_200_OK)
 
 
 # ── Entity endpoints ──────────────────────────────────────────
@@ -177,188 +325,8 @@ def ai_enroll_image(request, entity_id, filename):
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 2. WEBHOOK RECEIVER  (called by AI service, token-protected)
+#    All ingestion logic is in ai_integration.incident_ingest
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-INCIDENT_TYPE_MAP = {
-    "fire":             Incident.Type.FIRE,
-    "fire_smoke":       Incident.Type.FIRE,
-    "weapon":           Incident.Type.ROBBERY,
-    "weapon_detected":  Incident.Type.ROBBERY,
-    "intrusion":        Incident.Type.INTRUSION,
-    "intrusion_person_in_zone": Incident.Type.INTRUSION,
-    "stranger":         Incident.Type.STRANGER,
-    "loitering":        Incident.Type.INTRUSION,
-    "abandoned_object": Incident.Type.OTHER,
-    "crowd":            Incident.Type.OTHER,
-    "fall":             Incident.Type.OTHER,
-    "animal":           Incident.Type.OTHER,
-    "anomaly":          Incident.Type.OTHER,
-}
-
-SEVERITY_MAP = {
-    "critical": 5,
-    "severe": 5,
-    "high": 4,
-    "medium": 3,
-    "med": 3,
-    "moderate": 3,
-    "low": 2,
-    "info": 1,
-}
-
-# Active-window: if last alert for same (camera, type) was within this many
-# seconds, update the existing incident instead of creating a new one.
-INCIDENT_ACTIVE_WINDOW_SECONDS = 60
-
-
-def _resolve_tenant_hint(data: dict) -> Optional[Tenant]:
-    """Resolve explicit tenant hint from webhook payload only."""
-    raw_tenant_id = data.get("tenant_id")
-    if raw_tenant_id is None:
-        return None
-    try:
-        return Tenant.objects.get(pk=int(raw_tenant_id))
-    except (TypeError, ValueError, Tenant.DoesNotExist):
-        return None
-
-
-def _resolve_camera(camera_id_str: str, tenant_hint: Optional[Tenant] = None):
-    """Find Camera by ai_camera_id/name, avoiding ambiguous cross-tenant matches."""
-    camera_id_str = (camera_id_str or "").strip()
-    if not camera_id_str:
-        return None, None, False
-
-    # If caller gives a tenant hint, prioritize deterministic lookup there.
-    if tenant_hint:
-        cam = Camera.objects.filter(
-            tenant=tenant_hint,
-            ai_camera_id=camera_id_str,
-        ).first()
-        if cam:
-            return cam, cam.tenant, False
-        cam = Camera.objects.filter(
-            tenant=tenant_hint,
-            name=camera_id_str,
-        ).first()
-        if cam:
-            return cam, cam.tenant, False
-        # Tenant hint is authoritative: allow caller flow to auto-create camera
-        # for this tenant instead of doing cross-tenant ambiguity checks.
-        return None, tenant_hint, False
-
-    ai_matches = list(
-        Camera.objects.filter(ai_camera_id=camera_id_str)
-        .select_related("tenant")[:2]
-    )
-    if len(ai_matches) == 1:
-        cam = ai_matches[0]
-        return cam, cam.tenant, False
-    if len(ai_matches) > 1:
-        logger.warning("Ambiguous ai_camera_id '%s' across tenants", camera_id_str)
-        return None, None, True
-
-    name_matches = list(
-        Camera.objects.filter(name=camera_id_str)
-        .select_related("tenant")[:2]
-    )
-    if len(name_matches) == 1:
-        cam = name_matches[0]
-        return cam, cam.tenant, False
-    if len(name_matches) > 1:
-        logger.warning("Ambiguous camera name '%s' across tenants", camera_id_str)
-        return None, None, True
-
-    return None, None, False
-
-
-def _resolve_tenant_for_unmapped_camera(data: dict):
-    """Resolve best tenant target for webhook alerts when camera is not mapped."""
-    default_tenant_id = os.getenv("DEFAULT_AI_TENANT_ID")
-    if default_tenant_id:
-        try:
-            return Tenant.objects.get(pk=int(default_tenant_id))
-        except (TypeError, ValueError, Tenant.DoesNotExist):
-            pass
-
-    tenant_hint = _resolve_tenant_hint(data)
-    if tenant_hint:
-        return tenant_hint
-
-    # Prefer tenants with active members over camera-count heuristics.
-    from django.db.models import Count
-    tenant = (
-        Tenant.objects.annotate(
-            member_count=Count("memberships", distinct=True),
-            cam_count=Count("cameras", distinct=True),
-        )
-        .order_by("-member_count", "-cam_count")
-        .first()
-    )
-    return tenant
-
-
-def _normalize_alert_type(raw) -> str:
-    text = str(raw or "other").strip().lower().replace("-", "_").replace(" ", "_")
-    aliases = {
-        "fire_smoke": "fire_smoke",
-        "fire": "fire",
-        "weapon_detected": "weapon_detected",
-        "weapon": "weapon",
-        "intrusion_person_in_zone": "intrusion_person_in_zone",
-        "person_zone": "intrusion_person_in_zone",
-        "intrusion": "intrusion",
-        "stranger": "stranger",
-        "loitering": "loitering",
-        "abandoned_object": "abandoned_object",
-        "crowd": "crowd",
-        "fall": "fall",
-        "animal": "animal",
-        "anomaly": "anomaly",
-    }
-    return aliases.get(text, text)
-
-
-def _parse_severity(raw) -> int:
-    if isinstance(raw, int):
-        return max(1, min(5, raw))
-    if isinstance(raw, str):
-        return SEVERITY_MAP.get(raw.lower(), 3)
-    return 3
-
-
-def _parse_timestamp(raw) -> datetime:
-    if isinstance(raw, (int, float)):
-        try:
-            return datetime.fromtimestamp(float(raw), tz=dt_timezone.utc)
-        except (ValueError, OSError, TypeError):
-            pass
-    if isinstance(raw, str):
-        try:
-            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-            if timezone.is_naive(dt):
-                dt = timezone.make_aware(dt)
-            return dt
-        except (ValueError, TypeError):
-            pass
-    return timezone.now()
-
-
-def _extract_entity_details(data: dict) -> dict:
-    """Normalize entity metadata from webhook payload variants."""
-    raw_entity = data.get("entity") or data.get("identity") or {}
-    if not isinstance(raw_entity, dict):
-        return {}
-
-    known_fields = {
-        "id": raw_entity.get("id") or raw_entity.get("entity_id"),
-        "name": raw_entity.get("name"),
-        "type": raw_entity.get("type") or raw_entity.get("entity_type"),
-        "kind": raw_entity.get("kind"),
-        "species": raw_entity.get("species"),
-        "confidence": raw_entity.get("confidence") or raw_entity.get("score"),
-        "known_entity_id": raw_entity.get("known_entity_id") or raw_entity.get("db_id"),
-    }
-    return {k: v for k, v in known_fields.items() if v not in (None, "")}
 
 
 @api_view(["POST"])
@@ -370,20 +338,8 @@ def ai_webhook_receive(request):
     Called by the AI service when an alert is created.
     Protected by X-AI-WEBHOOK-TOKEN header (shared secret).
 
-    Payload:
-    {
-      "event": "alert.created",
-      "data": {
-        "id": "...",
-        "camera_id": "cam_01",
-        "type": "fire",
-        "severity": "high" | 4,
-        "timestamp": "2025-01-01T12:00:00Z",
-        "message": "Fire detected",
-        "confidence": 0.92,
-        "evidence": { "keyframe": "evidence/cam_01/...", "clip": "..." }
-      }
-    }
+    Now delegates to the shared ingest function for consistent processing
+    with the Redis subscriber path.
     """
     # ── Auth: accept X-AI-WEBHOOK-TOKEN  **or**  X-Vigilzone-Signature ─
     expected_token = os.getenv("AI_WEBHOOK_TOKEN", "")
@@ -425,148 +381,37 @@ def ai_webhook_receive(request):
         logger.info("Ignoring webhook event: %s", event)
         return Response({"status": "ignored", "event": event})
 
-    camera_id_str = str(data.get("camera_id", "")).strip()
-    if not camera_id_str:
-        return Response(
-            {"error": "Invalid payload: data.camera_id is required"},
-            status=status.HTTP_400_BAD_REQUEST,
-        )
+    # Extract stable event ID for idempotency
+    event_id = str(data.get("id", "")).strip() or None
 
-    alert_type_raw = data.get("type", "other")
-    alert_type = _normalize_alert_type(alert_type_raw)
-    severity_raw = data.get("severity", 3)
-    timestamp_raw = data.get("timestamp") or data.get("ts_utc") or payload.get("timestamp")
-    message = data.get("message", "")
-    confidence = data.get("confidence")
-    recognized_entity = _extract_entity_details(data)
+    # Delegate to shared ingest function
+    from .incident_ingest import process_alert_event
 
-    # ── Resolve / auto-create camera ──────────────────────────
-    tenant_hint = _resolve_tenant_hint(data)
-    camera, tenant, ambiguous_camera = _resolve_camera(camera_id_str, tenant_hint=tenant_hint)
-    if ambiguous_camera:
-        return Response(
-            {
-                "error": "Ambiguous camera mapping",
-                "camera_id": camera_id_str,
-            },
-            status=status.HTTP_409_CONFLICT,
-        )
-    if not camera:
-        tenant = _resolve_tenant_for_unmapped_camera(data) or Tenant.objects.first()
-        if not tenant:
-            return Response(
-                {"error": "No tenant configured"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        source_hint = str(data.get("source_type", "")).strip().lower()
-        is_webcam_source = camera_id_str == "cam_live" or source_hint in {"webcam", "live_camera"}
-        camera = Camera.objects.create(
-            tenant=tenant,
-            name=camera_id_str,
-            ai_camera_id=camera_id_str,
-            source_type=Camera.SourceType.WEBCAM if is_webcam_source else Camera.SourceType.REGISTERED,
-            status=Camera.Status.ACTIVE,
-        )
-        logger.info("Auto-created camera '%s' for tenant '%s'", camera_id_str, tenant.name)
-
-    incident_type = INCIDENT_TYPE_MAP.get(alert_type, Incident.Type.OTHER)
-    severity = _parse_severity(severity_raw)
-    alert_ts = _parse_timestamp(timestamp_raw)
-
-    # Evidence URL (routed through Django proxy)
-    # Accept both naming conventions: keyframe/keyframe_path, clip/clip_path
-    evidence = data.get("evidence", {})
-    keyframe = evidence.get("keyframe_path") or evidence.get("keyframe", "")
-    clip = evidence.get("clip_path") or evidence.get("clip", "")
-    media_key = f"/api/ai/evidence/{keyframe}" if keyframe else ""
-    clip_url = f"/api/ai/evidence/{clip}" if clip else ""
-
-    with transaction.atomic():
-        # ── Active-window: reuse or create incident ───────────
-        cutoff = alert_ts - timedelta(seconds=INCIDENT_ACTIVE_WINDOW_SECONDS)
-        existing = (
-            Incident.objects.filter(
-                camera=camera,
-                type=incident_type,
-                status=Incident.Status.OPEN,
-                started_at__gte=cutoff,
-            )
-            .order_by("-started_at")
-            .first()
-        )
-
-        if existing:
-            # Update the existing active incident
-            existing.severity = max(existing.severity, severity)
-            existing.details = {
-                **(existing.details or {}),
-                "last_alert_id": data.get("id", ""),
-                "last_message": message,
-                "alert_count": (existing.details or {}).get("alert_count", 1) + 1,
-            }
-            if recognized_entity:
-                existing.details["recognized_entity"] = recognized_entity
-            if clip_url:
-                existing.details["clip_url"] = clip_url
-            if media_key:
-                existing.media_key = media_key
-            existing.save(update_fields=["severity", "details", "media_key", "updated_at"])
-            incident = existing
-            created = False
-        else:
-            details_dict = {
-                "ai_alert_id": data.get("id", ""),
-                "message": message,
-                "alert_type": alert_type,
-                "alert_type_raw": alert_type_raw,
-                "confidence": confidence,
-                "alert_count": 1,
-            }
-            if recognized_entity:
-                details_dict["recognized_entity"] = recognized_entity
-            if clip_url:
-                details_dict["clip_url"] = clip_url
-            incident = Incident.objects.create(
-                tenant=tenant,
-                camera=camera,
-                type=incident_type,
-                status=Incident.Status.OPEN,
-                severity=severity,
-                started_at=alert_ts,
-                details=details_dict,
-                media_key=media_key,
-            )
-            created = True
-
-        # Always store raw detection
-        Detection.objects.create(
-            tenant=tenant,
-            camera=camera,
-            ts=alert_ts,
-            payload=data,
-        )
-
-    logger.info(
-        "AI webhook: %s incident #%s (%s, sev=%d) for camera '%s'",
-        "created" if created else "updated",
-        incident.pk,
-        incident_type,
-        severity,
-        camera_id_str,
+    result = process_alert_event(
+        data=data,
+        source="webhook",
+        event_id=event_id,
     )
 
-    # Incident creation is handled by post_save signal; explicit dispatch only on updates.
-    if not created:
-        try:
-            from api.views import dispatch_notifications
-            dispatch_notifications(incident)
-        except Exception as exc:
-            logger.warning("Notification dispatch error: %s", exc)
+    if result.status == "error":
+        http_status = status.HTTP_400_BAD_REQUEST
+        if "Ambiguous" in (result.error or ""):
+            http_status = status.HTTP_409_CONFLICT
+        return Response(
+            {"error": result.error, "status": result.status},
+            status=http_status,
+        )
+
+    if result.status == "duplicate":
+        return Response(
+            {"status": "duplicate", "incident_id": result.incident_id},
+            status=status.HTTP_200_OK,
+        )
 
     return Response(
         {
-            "status": "created" if created else "updated",
-            "incident_id": incident.pk,
+            "status": result.status,
+            "incident_id": result.incident_id,
         },
-        status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        status=status.HTTP_201_CREATED if result.status == "created" else status.HTTP_200_OK,
     )

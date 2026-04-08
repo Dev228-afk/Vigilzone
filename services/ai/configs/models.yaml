@@ -122,8 +122,8 @@ models:
     enabled: true
     repo_dir: "third_party/Paper-AnyAnomaly"
     repo_url: "https://github.com/SkiddieAhn/Paper-AnyAnomaly.git"
-    python_exe: ".venv_anyanomaly/Scripts/python.exe"
-    entry_script: "vad_proposed_Qwen_vllm.py"      # explicit — no guessing
+    python_exe: "C:\\Users\\devan\\OneDrive\\Desktop\\yolov12-cls\\.venv\\Scripts\\python.exe"
+    entry_script: "vad_proposed_MiniCPM.py"
     entry_args_template: "--dataset=custom --type={events_csv}"
     sensitivity: 0.6
     prompt_template: "Detect abnormal events: {events}. Return anomaly score."
@@ -131,7 +131,7 @@ models:
     max_clip_sec: 4
     clip_fps: 4
     candidate_threshold: 0.40
-    model_path: "models/anyanomaly_ckpt.pth"
+    model_path: "MiniCPM-V-2_6-int4"
 
   # ANOMALY DETECTION LITE: AnomalyCLIP
   # No public checkpoint exists — stub mode is the expected default.
