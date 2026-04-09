@@ -24,6 +24,9 @@ import SelectCommunity from "./pages/SelectCommunity";
 import AuthOnlyRoute from "./components/routing/AuthOnlyRoute";
 import TenantOnlyRoute from "./components/routing/TenantOnlyRoute";
 import PublicOnlyRoute from "./components/routing/PublicOnlyRoute";
+import { useEffect } from "react";
+import { unlockAudio } from "@/lib/audio";
+
 function AuthenticatedLayout({ children }: { children: React.ReactNode }) {
   return (
     <div className="min-h-screen bg-background">
@@ -126,6 +129,24 @@ function Router() {
   );
 }
 function App() {
+  useEffect(() => {
+    // High-performance, one-time listener to unlock the Web Audio API on first interaction.
+    // This allows background notification sounds for the rest of the session.
+    const handleFirstInteraction = () => {
+      unlockAudio();
+      document.removeEventListener('click', handleFirstInteraction);
+      document.removeEventListener('keydown', handleFirstInteraction);
+    };
+
+    document.addEventListener('click', handleFirstInteraction);
+    document.addEventListener('keydown', handleFirstInteraction);
+
+    return () => {
+      document.removeEventListener('click', handleFirstInteraction);
+      document.removeEventListener('keydown', handleFirstInteraction);
+    };
+  }, []);
+
   return (
     <QueryClientProvider client={queryClient}>
       <ThemeProvider>

@@ -5,6 +5,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { toast } from './use-toast';
+import { playChime } from '@/lib/audio';
 
 export interface Notification {
   id: string;
@@ -332,10 +333,11 @@ export function useNotifications(): UseNotificationsReturn {
             // FIX: Defer side-effects to run immediately after the render phase tick
             setTimeout(() => {
               if (wasInserted && hasAlertId) {
-                setUnreadCount((current) => current + 1);
-                playNotificationSound();
-
-                if (queryClient) {
+                if (notification.incident_id) {
+                  setUnreadCount((current) => current + 1);
+                  playChime();
+                  
+                  if (queryClient) {
                   // Opt out of immediate global invalidation to prevent backend DDoS.
                   // Only refresh specific Incident query to keep cards live.
                   if (notification.incident_id) {
@@ -343,7 +345,8 @@ export function useNotifications(): UseNotificationsReturn {
                   }
                 }
               }
-            }, 0);
+            }
+          }, 0);
           }
         } catch (err) {
           console.error('[WS] Failed to parse message:', err);
@@ -500,21 +503,3 @@ export function useNotifications(): UseNotificationsReturn {
   };
 }
 
-function playNotificationSound() {
-  if (typeof window === 'undefined') return;
-  try {
-    const AudioContextCtor = window.AudioContext || (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-    if (!AudioContextCtor) return;
-    const audioContext = new AudioContextCtor();
-    const oscillator = audioContext.createOscillator();
-    const gainNode = audioContext.createGain();
-    oscillator.connect(gainNode);
-    gainNode.connect(audioContext.destination);
-    oscillator.frequency.value = 880;
-    gainNode.gain.value = 0.04;
-    oscillator.start();
-    oscillator.stop(audioContext.currentTime + 0.12);
-  } catch {
-    // ignore audio failures
-  }
-}

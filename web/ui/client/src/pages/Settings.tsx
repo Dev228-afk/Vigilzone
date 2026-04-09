@@ -14,7 +14,8 @@ import { useToast } from "@/hooks/use-toast";
 import { useAuth } from "@/auth/AuthProvider";
 import { api } from "@/lib/api";
 import { queryClient } from "@/lib/queryClient";
-import { BellRing } from "lucide-react";
+import { BellRing, Volume2 } from "lucide-react";
+import { VZ_SETTINGS_KEYS } from "@/lib/audio";
 
 interface ProfileData {
   id: number;
@@ -114,6 +115,7 @@ export default function Settings() {
     email: true,
     push: true,
     sms: false,
+    sound: localStorage.getItem(VZ_SETTINGS_KEYS.NOTIFY_SOUND) !== "false",
   });
 
   const [preferences, setPreferences] = useState({
@@ -139,7 +141,7 @@ export default function Settings() {
         email: p.email || user?.email || "",
         bio: p.bio || "",
       });
-      setNotifications({ email: p.notify_email, push: p.notify_push, sms: p.notify_sms });
+      setNotifications((prev) => ({ ...prev, email: p.notify_email, push: p.notify_push, sms: p.notify_sms }));
       setPreferences({
         alertSensitivity: p.alert_sensitivity,
         dataRetention: String(p.data_retention_days),
@@ -177,7 +179,11 @@ export default function Settings() {
   };
 
   const handleSaveNotifications = () => {
-    if (!canManage) return;
+    localStorage.setItem(VZ_SETTINGS_KEYS.NOTIFY_SOUND, String(notifications.sound));
+    if (!canManage) {
+      toast({ title: "Sound preference saved locally" });
+      return;
+    }
     saveProfileMut.mutate({
       notify_email: notifications.email,
       notify_push: notifications.push,
@@ -322,8 +328,23 @@ export default function Settings() {
                       data-testid="toggle-sms"
                     />
                   </div>
-                  <Button className="mt-4" onClick={handleSaveNotifications} disabled={saveProfileMut.isPending || !canManage}>
-                    Save delivery channels
+                  <div className="mt-4 flex items-center justify-between border-t border-border pt-4">
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <Volume2 className="h-4 w-4 text-primary" />
+                        <Label htmlFor="sound-alerts" className="text-base">Sound Alerts</Label>
+                      </div>
+                      <p className="text-sm text-muted-foreground">Play a chime when new notifications arrive</p>
+                    </div>
+                    <Switch
+                      id="sound-alerts"
+                      checked={notifications.sound}
+                      onCheckedChange={(checked) => setNotifications({ ...notifications, sound: checked })}
+                      data-testid="toggle-sound"
+                    />
+                  </div>
+                  <Button className="mt-4 w-full" onClick={handleSaveNotifications} disabled={saveProfileMut.isPending}>
+                    Save notification preferences
                   </Button>
                 </div>
 
