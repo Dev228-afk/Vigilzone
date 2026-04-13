@@ -5,7 +5,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { toast } from './use-toast';
-import { playChime } from '@/lib/audio';
+import { playChime, unlockAudio } from '@/lib/audio';
 
 export interface Notification {
   id: string;
@@ -14,18 +14,18 @@ export interface Notification {
   title: string;
   message: string;
   data?: {
-    incident_id?: number;
+    incident_id?: string | number;
     severity?: number;
     severity_level?: string;
     camera_name?: string;
     [key: string]: unknown;
   };
   created_at: string;
-  incident_id?: number;
+  incident_id?: string | number;
   severity?: number;
   severity_level?: string;
   camera_name?: string;
-  alert_id?: number;
+  alert_id?: string;
   is_read?: boolean;
 }
 
@@ -38,10 +38,16 @@ export interface UseNotificationsReturn {
   error: string | null;
   connect: (token: string, tenantId: number) => void;
   disconnect: () => void;
-  markAsRead: (notificationIds: number[]) => Promise<void>;
+  markAsRead: (notificationIds: string[]) => Promise<void>;
   markAllAsRead: () => Promise<void>;
   testWebSocket: (tenantId: number) => Promise<void>;
   clearNotifications: () => void;
+}
+
+function normalizeId(value: unknown): string | undefined {
+  if (value === null || value === undefined) return undefined;
+  const normalized = String(value).trim();
+  return normalized.length > 0 ? normalized : undefined;
 }
 
 function getStoredToken(): string | null {
@@ -56,6 +62,15 @@ function resolveWsUrl(): string {
   }
   if (typeof window !== 'undefined') {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    // In development, Vite's middleware-mode proxy does not reliably forward
+    // WebSocket upgrade requests.  Connect directly to the Django/Daphne
+    // backend on port 8000.  In production the reverse-proxy (nginx) handles
+    // the upgrade so we can use the same host.
+    const backendPort = import.meta.env.VITE_BACKEND_PORT || '8000';
+    const isDev = import.meta.env.DEV;
+    if (isDev) {
+      return `${protocol}//${window.location.hostname}:${backendPort}/ws/notifications/`;
+    }
     return `${protocol}//${window.location.host}/ws/notifications/`;
   }
   return 'ws://localhost:8000/ws/notifications/';
@@ -80,14 +95,21 @@ interface UpsertResult {
  */
 export function upsertNotification(prev: Notification[], incoming: Notification): UpsertResult {
   const matchIndex = prev.findIndex((item) => {
+    const incomingAlertId = normalizeId(incoming.alert_id);
+    const itemAlertId = normalizeId(item.alert_id);
+
     // Priority 1: match by alert_id (most reliable)
-    if (incoming.alert_id && item.alert_id) {
-      return item.alert_id === incoming.alert_id;
+    if (incomingAlertId && itemAlertId) {
+      return itemAlertId === incomingAlertId;
     }
+
     // Priority 2: match by incident_id + created_at (for websocket-only events)
-    if (incoming.incident_id && item.incident_id && incoming.created_at && item.created_at) {
-      return item.incident_id === incoming.incident_id && item.created_at === incoming.created_at;
+    const incomingIncidentId = normalizeId(incoming.incident_id);
+    const itemIncidentId = normalizeId(item.incident_id);
+    if (incomingIncidentId && itemIncidentId && incoming.created_at && item.created_at) {
+      return itemIncidentId === incomingIncidentId && item.created_at === incoming.created_at;
     }
+
     // Priority 3: match by id (fallback for truly unique identifiers)
     return item.id === incoming.id;
   });
@@ -137,6 +159,9 @@ export function useNotifications(): UseNotificationsReturn {
   const maxReconnectAttempts = 5;
   const healthIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const healthFailureCountRef = useRef(0);
+  // Track processed alert IDs to avoid duplicate unread increments.
+  const processedAlertIds = useRef<Set<string>>(new Set());
+  const audioUnlockedRef = useRef(false);
 
   const stopHealthPolling = useCallback(() => {
     if (healthIntervalRef.current) {
@@ -204,15 +229,23 @@ export function useNotifications(): UseNotificationsReturn {
       if (listResp.ok) {
         const listJson = await listResp.json();
         const items = Array.isArray(listJson?.notifications) ? listJson.notifications : [];
+        
+        // Add this quick loop to register hydrated IDs
+        items.forEach((item: any) => {
+          const alertId = normalizeId(item.alert_id ?? item.id);
+          if (alertId) processedAlertIds.current.add(alertId);
+        });
+
         const mapped: Notification[] = items.map((item: Record<string, unknown>) => {
           const data = (item.data as Record<string, unknown>) || {};
           const severity = (item.severity as number | undefined) ?? (data.severity as number | undefined);
           const severityLevel = (item.severity_level as string | undefined) ?? (data.severity_level as string | undefined);
           const cameraName = (item.camera_name as string | undefined) ?? (data.camera_name as string | undefined);
-          const incidentId = (item.incident_id as number | undefined) ?? (data.incident_id as number | undefined);
-          const alertId = Number(item.alert_id ?? item.id);
+          const incidentId = (item.incident_id as string | number | undefined) ?? (data.incident_id as string | number | undefined);
+          const alertId = normalizeId(item.alert_id ?? item.id);
+          
           return {
-            id: `alert-${String(alertId)}`,
+            id: alertId ? `alert-${alertId}` : `alert-${String(item.id ?? Date.now())}`,
             type: 'notification',
             notification_type: 'incident',
             title: String(item.title ?? 'Notification'),
@@ -223,16 +256,21 @@ export function useNotifications(): UseNotificationsReturn {
             severity,
             severity_level: severityLevel,
             camera_name: cameraName,
-            alert_id: Number.isFinite(alertId) ? alertId : undefined,
+            alert_id: alertId,
             is_read: Boolean(item.is_read),
           };
         });
         setNotifications((prev) => mergeHydratedNotifications(prev, mapped));
       }
 
+      if (unreadResp.status === 401) {
+        console.warn('[Notifications] 401 Unauthorized during hydration. Token may be invalid.');
+      }
+
       if (unreadResp.ok) {
         const unreadJson = await unreadResp.json();
         const nextUnreadCount = Number(unreadJson?.unread_count ?? 0);
+        console.log('[Notifications] Hydrated unread count:', nextUnreadCount);
         setUnreadCount((prev) => mergeHydratedUnreadCount(prev, nextUnreadCount));
       }
     } catch (err) {
@@ -272,6 +310,7 @@ export function useNotifications(): UseNotificationsReturn {
       const ws = new WebSocket(wsUrl);
 
       ws.onopen = () => {
+        console.log('[WS] WebSocket Connected to:', wsUrl);
         setIsConnected(true);
         setError(null);
         reconnectAttempts.current = 0;
@@ -305,59 +344,56 @@ export function useNotifications(): UseNotificationsReturn {
             return;
           }
 
-          if (data.type === 'notification') {
+          if (data.type === 'NEW_NOTIFICATION' || data.type === 'notification') {
             const payloadData = (data.data || {}) as Record<string, unknown>;
+            
+            // Normalize ID: use alert_id with prefix if available, else random
             const notification: Notification = {
               id: data.alert_id ? `alert-${String(data.alert_id)}` : `ws-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
               ...data,
-              incident_id: (data.incident_id ?? payloadData.incident_id) as number | undefined,
+              incident_id: (data.incident_id ?? payloadData.incident_id) as string | number | undefined,
               severity: (data.severity ?? payloadData.severity) as number | undefined,
               severity_level: (data.severity_level ?? payloadData.severity_level) as string | undefined,
               camera_name: (data.camera_name ?? payloadData.camera_name) as string | undefined,
               is_read: false,
             };
 
-            // FIX: Track insertion status locally. Do NOT call side effects inside setNotifications.
-            let wasInserted = false;
-            let hasAlertId = false;
-
-            setNotifications((prev) => {
-              const result = upsertNotification(prev, notification);
-              if (result.inserted) {
-                wasInserted = true;
-                hasAlertId = !!notification.alert_id;
+            // 1. Process side-effects using the Ref (Sync check)
+            const alertId = normalizeId(data.alert_id ?? data.id);
+            if (alertId && !processedAlertIds.current.has(alertId)) {
+              processedAlertIds.current.add(alertId);
+              
+              // Use absolute count if provided, otherwise increment
+              if (typeof data.unread_count === 'number') {
+                console.log(`[WS] Setting absolute unread count: ${data.unread_count}`);
+                setUnreadCount(data.unread_count);
+              } else {
+                setUnreadCount((current) => current + 1);
               }
-              return result.items;
-            });
+              
+              playChime();
 
-            // FIX: Defer side-effects to run immediately after the render phase tick
-            setTimeout(() => {
-              if (wasInserted && hasAlertId) {
-                if (notification.incident_id) {
-                  setUnreadCount((current) => current + 1);
-                  playChime();
-                  
-                  if (queryClient) {
-                  // Opt out of immediate global invalidation to prevent backend DDoS.
-                  // Only refresh specific Incident query to keep cards live.
-                  if (notification.incident_id) {
-                    queryClient.invalidateQueries({ queryKey: ["incident", String(notification.incident_id)] });
-                  }
-                }
+              // Force React Query components (Incident Cards) to pull fresh data
+              if (queryClient && notification.incident_id) {
+                queryClient.invalidateQueries({ queryKey: ["incident", String(notification.incident_id)] });
               }
             }
-          }, 0);
+
+            // 2. Safely push the notification object into the dropdown list array
+            setNotifications((prev) => upsertNotification(prev, notification).items);
           }
         } catch (err) {
           console.error('[WS] Failed to parse message:', err);
         }
       };
 
-      ws.onerror = () => {
+      ws.onerror = (error) => {
+        console.error('[WS] WebSocket Error:', error);
         setError('WebSocket connection error');
       };
 
       ws.onclose = (event) => {
+        console.log(`[WS] WebSocket Closed: code=${event.code}, reason=${event.reason}`);
         setIsConnected(false);
         setIsSubscribed(false);
 
@@ -412,7 +448,7 @@ export function useNotifications(): UseNotificationsReturn {
     setRedisReachable(false);
   }, [stopHealthPolling]);
 
-  const markAsRead = useCallback(async (notificationIds: number[]) => {
+  const markAsRead = useCallback(async (notificationIds: string[]) => {
     const token = getStoredToken();
     if (!token) return;
 
@@ -428,8 +464,9 @@ export function useNotifications(): UseNotificationsReturn {
       });
 
       if (response.ok) {
+        const readIds = new Set(notificationIds.map((id) => normalizeId(id)).filter(Boolean) as string[]);
         setNotifications((prev) => prev.map((n) => (
-          n.alert_id && notificationIds.includes(n.alert_id) ? { ...n, is_read: true } : n
+          n.alert_id && readIds.has(n.alert_id) ? { ...n, is_read: true } : n
         )));
         setUnreadCount((prev) => Math.max(0, prev - notificationIds.length));
       }
@@ -483,6 +520,27 @@ export function useNotifications(): UseNotificationsReturn {
   const clearNotifications = useCallback(() => {
     setNotifications([]);
     setUnreadCount(0);
+  }, []);
+
+  useEffect(() => {
+    const unlockFromInteraction = () => {
+      if (audioUnlockedRef.current) return;
+      audioUnlockedRef.current = true;
+      void unlockAudio();
+      window.removeEventListener('pointerdown', unlockFromInteraction);
+      window.removeEventListener('keydown', unlockFromInteraction);
+      window.removeEventListener('touchstart', unlockFromInteraction);
+    };
+
+    window.addEventListener('pointerdown', unlockFromInteraction, { passive: true });
+    window.addEventListener('keydown', unlockFromInteraction, { passive: true });
+    window.addEventListener('touchstart', unlockFromInteraction, { passive: true });
+
+    return () => {
+      window.removeEventListener('pointerdown', unlockFromInteraction);
+      window.removeEventListener('keydown', unlockFromInteraction);
+      window.removeEventListener('touchstart', unlockFromInteraction);
+    };
   }, []);
 
   useEffect(() => () => disconnect(), [disconnect]);

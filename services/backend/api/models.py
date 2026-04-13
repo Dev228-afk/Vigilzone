@@ -187,6 +187,7 @@ class Incident(TimeStamped):
         ACK = "acknowledged", "Acknowledged"
         RESOLVED = "resolved", "Resolved"
 
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="incidents")
     camera = models.ForeignKey(Camera, on_delete=models.CASCADE, related_name="incidents")
     type = models.CharField(max_length=24, choices=Type.choices)
@@ -213,10 +214,18 @@ class Detection(TimeStamped):
         ]
 
 class Alert(TimeStamped):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     incident = models.ForeignKey(Incident, on_delete=models.CASCADE, related_name="alerts")
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="alerts", null=True, blank=True)
     channel = models.CharField(max_length=32, default="email")   # email|webhook|sms|push
     payload = models.JSONField(default=dict, blank=True)
     delivered_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["user", "created_at"]),
+            models.Index(fields=["user", "delivered_at"]),
+        ]
 
 class AuditLog(TimeStamped):
     tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="audit_logs")

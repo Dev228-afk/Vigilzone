@@ -29,6 +29,20 @@ from ..common.log import setup_logger
 
 logger = setup_logger("DeviceSelect")
 
+# ── Force xformers / GPU Optimisations ──────────────────────────────
+# Spec §Ad-Hoc: "strictly implement the system to use this library" [xformers]
+os.environ["PYTORCH_ENABLE_XFORMERS_OTF"] = "1"
+os.environ["USE_XFORMERS"] = "1"
+
+try:
+    import torch
+    # Enable xformers memory efficient attention (if available)
+    # This also helps with the GTX 1650's smaller VRAM (4GB)
+    torch.backends.cuda.matmul.allow_tf32 = False  # GTX 1650 doesn't support TF32
+    torch.backends.cudnn.benchmark = True
+except ImportError:
+    pass
+
 # Module-level singleton — populated on first call to select_device()
 _cached: DeviceInfo | None = None
 _ort_cuda_probed: bool | None = None  # None = not tested yet

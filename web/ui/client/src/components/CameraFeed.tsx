@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { Video, Wifi, WifiOff } from "lucide-react";
+import { Video, Wifi, WifiOff, Sparkles, Activity } from "lucide-react";
 import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import CanvasStream from "@/components/CanvasStream"; // Legacy
@@ -89,7 +89,7 @@ export default function CameraFeed({
     if (streamUrl && mtxChecked && mtxReachable && !failed.has('webrtc-iframe')) {
       // Feature Flag: Is the API healthcheck enabled? (Objective 3)
       const apiHealthcheckEnabled = String(import.meta.env.VITE_ENABLE_MEDIAMTX_API_HEALTHCHECK ?? "true").toLowerCase() === "true";
-      
+
       if (!apiHealthcheckEnabled) {
         // If API check is disabled, we trust mtxReachable (ping) and the provided streamUrl
         return 'webrtc-iframe';
@@ -108,7 +108,7 @@ export default function CameraFeed({
           // Not a valid URL
         }
       }
-      
+
       if (finalPath && mtxActivePaths.has(finalPath)) {
         return 'webrtc-iframe';
       }
@@ -206,38 +206,51 @@ export default function CameraFeed({
       <div className="relative aspect-video bg-muted">
         {renderMedia()}
         {/* DECOUPLED FIX: Separate Media Status from AI Status */}
-        <div className="absolute top-2 left-2 flex flex-col gap-1">
-          {/* Stream Status Badge - Based on actual media presence */}
-          <Badge variant={(mtxReachable && streamUrl) || displaySrc ? "default" : "destructive"} className="gap-1 w-max opacity-90">
-            {(mtxReachable && streamUrl) || displaySrc ? <Wifi className="w-3 h-3" /> : <WifiOff className="w-3 h-3" />}
-            {(mtxReachable && streamUrl) || displaySrc ? "Live Feed" : "Feed Offline"}
+        <div className="absolute top-2 left-2 flex items-start gap-1.5 p-1">
+          {/* Main Status Badge: Live Feed (Functional) */}
+          <Badge
+            variant={(mtxReachable && streamUrl) || displaySrc ? "default" : "destructive"}
+            className={`${isFocused ? 'h-6 px-2.5 gap-1.5' : 'h-4 px-1.4 gap-1.4'} shadow-lg backdrop-blur-md opacity-95 transition-all`}
+          >
+            {(mtxReachable && streamUrl) || displaySrc ? (
+              <Wifi className={`${isFocused ? 'w-3.5 h-3.5' : 'w-2.5 h-2.5'} animate-pulse`} />
+            ) : (
+              <WifiOff className={isFocused ? 'w-3.5 h-3.5' : 'w-2.5 h-2.5'} />
+            )}
+            <span className={`font-bold ${isFocused ? 'text-[10px]' : 'text-[7px]'} tracking-tight grayscale-0`}>
+              {(mtxReachable && streamUrl) || displaySrc ? "LIVE FEED" : "OFFLINE"}
+            </span>
           </Badge>
-          
-          {/* AI Status Badge - Maps specifically to the backend 'status' prop */}
-          <Badge variant={status === "active" ? "secondary" : "outline"} className="w-max opacity-90 bg-background/80 backdrop-blur-sm">
-            {status === "active" ? "AI Synced" : "AI Unsynced"}
-          </Badge>
+
+          {/* AI Sync Badge: Shown ONLY when camera is active and in sync */}
+          {status === "active" && (
+            <Badge
+              variant="secondary"
+              className={` ${isFocused ? 'h-6 px-2.5 gap-1.5' : 'h-4 px-1.4 gap-1.5'} bg-sky-500/90 text-white border-0 shadow-lg backdrop-blur-md opacity-95`}
+            >
+              <Sparkles className={isFocused ? 'w-3.5 h-3.5' : 'w-2.5 h-2.5'} />
+              <span className={`font-bold ${isFocused ? 'text-[10px]' : 'text-[7px]'} tracking-tight`}>AI SYNCED</span>
+            </Badge>
+          )}
         </div>
+
         {timestamp && (
-          <div className="absolute bottom-2 right-2 bg-black/70 text-white text-xs px-2 py-1 rounded">
+          <div className={`absolute bottom-2 right-2 bg-black/60 backdrop-blur-sm text-white ${isFocused ? 'text-[10px]' : 'text-[8px]'} font-mono px-2 py-1 rounded-md border border-white/10`}>
             {timestamp}
           </div>
         )}
-        {health && (
-          <div className="absolute bottom-2 left-2 bg-black/70 text-white text-[10px] px-2 py-1 rounded">
-            {health.connected ? "Connected" : "Warming"}
+
+        {/* Stream Status: Only show 'Active Stream' when connected to avoid clutter during warming */}
+        {health?.connected && (
+          <div className="absolute bottom-2 left-2 flex items-center gap-1.5 bg-black/60 backdrop-blur-sm px-2 py-1 rounded-md border border-white/10">
+            <div className={`${isFocused ? 'h-1.5 w-1.5' : 'h-1 w-1'} rounded-full bg-emerald-500`} />
+            <span className={`text-white ${isFocused ? 'text-[10px]' : 'text-[9px]'} font-medium tracking-tight`}>Active Stream</span>
           </div>
         )}
-        {/* Streaming Method Indicator */}
-        <div className="absolute top-12 left-2">
-          <Badge className={`${METHOD_COLORS[activeMethod] || 'bg-slate-400'} text-white text-xs`}>
-            {METHOD_LABELS[activeMethod] || 'Unknown'}
-          </Badge>
-        </div>
       </div>
-      <div className="p-3">
-        <h3 className="font-semibold text-sm" data-testid={`text-camera-${name.toLowerCase().replace(/\s/g, '-')}`}>{name}</h3>
-        <p className="text-xs text-muted-foreground">{location}</p>
+      <div className={isFocused ? "p-3" : "p-2.5"}>
+        <h3 className={`font-semibold ${isFocused ? 'text-sm' : 'text-xs'} truncate`} data-testid={`text-camera-${name.toLowerCase().replace(/\s/g, '-')}`}>{name}</h3>
+        <p className={`${isFocused ? 'text-xs' : 'text-[11px]'} text-muted-foreground truncate`}>{location}</p>
       </div>
     </Card>
   );

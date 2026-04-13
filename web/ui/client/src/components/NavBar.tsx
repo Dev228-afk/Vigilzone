@@ -130,7 +130,7 @@ export default function NavBar() {
               onMarkAllAsRead={markAllAsRead}
               isConnected={isConnected}
               isSubscribed={isSubscribed}
-              transportHealthy={redisReachable}
+              transportHealthy={redisReachable && isConnected && isSubscribed}
               tenantId={tenantIdNum}
               onTestConnection={canTestNotifications ? () => testWebSocket(tenantIdNum) : undefined}
               onNavigate={(path) => setLocation(path)}

@@ -25,8 +25,9 @@ sys.path.insert(0, str(parent_dir))
 os.chdir(parent_dir)
 
 # Load environment variables from .env
-load_dotenv()
-load_dotenv(parent_dir / ".env")  # Also try root .env
+load_dotenv()  # CWD (services/ai after chdir)
+load_dotenv(parent_dir / ".env")  # services/ai/.env
+load_dotenv(parent_dir.parent.parent / ".env", override=False)  # monolith root .env (fallback)
 
 from src.common.config import Config
 from src.common.log import setup_logger

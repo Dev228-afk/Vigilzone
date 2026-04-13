@@ -70,12 +70,11 @@
     "ingest_backend": "opencv",
     "enabled_lanes": [
       "rt_detr",
-      "yolov8_fallback",
-      "fire_smoke_yolo",
-      "person_zone"
+      "person_zone",
+      "fire_smoke_yolo"
     ],
     "sample_hz": 2.0,
-    "registered_at": 1775360484.7809255
+    "registered_at": 1776036537.6921015
   },
   "main-door": {
     "camera_id": "main-door",
@@ -105,7 +104,7 @@
   },
   "cam_live": {
     "camera_id": "cam_live",
-    "tenant_id": 8,
+    "tenant_id": 1,
     "source_type": "webcam"
   }
 }

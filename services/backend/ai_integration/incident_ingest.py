@@ -14,10 +14,12 @@ persistence, and notification dispatch logic across two code paths.
 
 import logging
 import os
+import time
+import random
 from datetime import datetime, timedelta, timezone as dt_timezone
 from typing import Optional, Tuple
 
-from django.db import transaction, IntegrityError
+from django.db import transaction, IntegrityError, OperationalError
 from django.utils import timezone
 
 from api.models import (
@@ -243,26 +245,45 @@ def _extract_entity_details(data: dict) -> dict:
 
 class IngestResult:
     """Result object from process_alert_event()."""
-
-    def __init__(
-        self,
-        status: str,
-        incident_id: Optional[int] = None,
-        error: Optional[str] = None,
-    ):
+    def __init__(self, status: str, incident_id: Optional[int] = None, error: Optional[str] = None):
         self.status = status       # "created", "updated", "duplicate", "ignored", "error"
         self.incident_id = incident_id
         self.error = error
 
     def to_dict(self) -> dict:
         d = {"status": self.status}
-        if self.incident_id:
-            d["incident_id"] = self.incident_id
-        if self.error:
-            d["error"] = self.error
+        if self.incident_id: d["incident_id"] = self.incident_id
+        if self.error: d["error"] = self.error
         return d
 
 
+def retry_on_lock(retries=2, delay=0.1, backoff=2):
+    """Decorator to retry on SQLite 'database is locked' OperationalError."""
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            last_exc = None
+            current_delay = delay
+            for i in range(retries):
+                try:
+                    return func(*args, **kwargs)
+                except OperationalError as e:
+                    if "locked" in str(e).lower():
+                        last_exc = e
+                        jitter = random.uniform(0, 0.1)
+                        logger.warning(
+                            "Database locked (attempt %d/%d). Retrying in %.2fs...",
+                            i + 1, retries, current_delay + jitter
+                        )
+                        time.sleep(current_delay + jitter)
+                        current_delay *= backoff
+                    else:
+                        raise e
+            raise last_exc
+        return wrapper
+    return decorator
+
+
+@retry_on_lock(retries=2, delay=0.1)
 def process_alert_event(
     data: dict,
     source: str = "webhook",

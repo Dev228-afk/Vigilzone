@@ -89,6 +89,7 @@ class NotificationServiceTests(TestCase):
         self.assertIsNotNone(alert.payload)
         self.assertIn('title', alert.payload)
     
+    @patch('sys.platform', 'linux')
     @patch('api.notification_service.get_channel_layer')
     def test_broadcast_incident_calls_channel(self, mock_get_layer):
         """Test that broadcast_incident sends to channel layer."""
@@ -125,6 +126,7 @@ class NotificationServiceTests(TestCase):
         # Verify message was sent
         self.assertIsNotNone(result)
     
+    @patch('sys.platform', 'linux')
     @patch('api.notification_service.get_channel_layer')
     def test_broadcast_handles_channel_unavailable(self, mock_get_layer):
         """Test graceful handling when channel layer is unavailable."""
@@ -259,6 +261,25 @@ class NotificationAPITests(APITestCase):
         self.assertIn('notifications', response.data)
         # Should have at least the alert we created
         self.assertGreaterEqual(len(response.data['notifications']), 1)
+
+    @patch('api.notification_service.get_channel_layer')
+    def test_list_notifications_falls_back_when_payload_message_missing(self, mock_get_layer):
+        """List endpoint should always provide non-empty title/message fallbacks."""
+        mock_get_layer.return_value = MagicMock()
+
+        sparse_alert = Alert.objects.create(
+            incident=self.incident,
+            channel='websocket',
+            payload={'data': {}},
+        )
+
+        response = self.client.get('/api/notifications/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        matched = next((item for item in response.data['notifications'] if item['id'] == sparse_alert.id), None)
+        self.assertIsNotNone(matched)
+        self.assertTrue(matched['title'])
+        self.assertTrue(matched['message'])
     
     def test_list_notifications_requires_auth(self):
         """Test that listing notifications requires authentication."""
@@ -315,6 +336,20 @@ class NotificationAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertGreaterEqual(response.data['unread_count'], 1)
 
+    def test_unread_count_includes_legacy_payload_scoped_alerts(self):
+        """Unread count should include legacy alerts with user_id stored in payload."""
+        Alert.objects.filter(pk=self.alert.pk).update(user=None, payload={
+            'title': 'Legacy Alert',
+            'message': 'Legacy payload-scoped notification',
+            'user_id': str(self.owner.id),
+            'data': {},
+        })
+
+        response = self.client.get('/api/notifications/unread-count/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertGreaterEqual(response.data['unread_count'], 1)
+
     def test_unread_count_does_not_backfill_alerts(self):
         """Unread count should be read-only and must not create alert rows."""
         incident_without_alert = Incident.objects.create(
@@ -359,10 +394,32 @@ class NotificationAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertIn('uses_redis', response.data)
         self.assertIn('redis_reachable', response.data)
+        self.assertIn('subscriber_healthy', response.data)
         self.assertIn('channel_backend', response.data)
         self.assertEqual(response.data['incident_channel'], 'vigilzone.ai.incidents')
         self.assertEqual(response.data['redis']['connection_display'], 'redis://default:***@localhost:32768/0')
         self.assertEqual(response.data['subscriber']['last_event_id'], 'evt-123')
+        self.assertTrue(response.data['subscriber_healthy'])
+        self.assertTrue(response.data['realtime_ready'])
+
+    def test_transport_status_requires_subscriber_heartbeat(self):
+        """Test transport readiness stays false without a fresh subscriber heartbeat."""
+        with patch.dict(os.environ, {
+            'REDIS_URL': 'redis://default:redispw@localhost:32768/0',
+            'AI_INCIDENT_CHANNEL': 'vigilzone.ai.incidents',
+        }, clear=False):
+            with patch('api.views.create_redis_client') as mock_create_client:
+                mock_client = MagicMock()
+                mock_client.get.return_value = None
+                mock_create_client.return_value = mock_client
+
+                response = self.client.get('/api/notifications/transport-status/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data['redis_reachable'])
+        self.assertFalse(response.data['subscriber_healthy'])
+        self.assertIsNone(response.data['subscriber'])
+        self.assertFalse(response.data['realtime_ready'])
 
     def test_test_incident_endpoint_enqueues_synthetic_incident(self):
         """Test POST /api/notifications/test-incident/ appends a synthetic stream event."""
@@ -504,6 +561,7 @@ class NotificationServiceChannelTests(TestCase):
     def setUp(self):
         self.tenant = Tenant.objects.create(name='Channel Test Tenant')
     
+    @patch('sys.platform', 'linux')
     @patch('api.notification_service.get_channel_layer')
     def test_broadcast_to_channel_builds_correct_group_name(self, mock_get_layer):
         """Test that _broadcast_to_channel uses correct group name format."""
@@ -553,7 +611,7 @@ class NotificationServiceChannelTests(TestCase):
         self.assertIn('created_at', notification)
         
         # Verify data contents
-        self.assertEqual(notification['data']['incident_id'], incident.id)
+        self.assertEqual(notification['data']['incident_id'], str(incident.id))
         self.assertEqual(notification['data']['severity'], 4)
         self.assertEqual(notification['data']['camera_name'], 'Test Cam')
 

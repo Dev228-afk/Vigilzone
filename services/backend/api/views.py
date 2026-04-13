@@ -1,4 +1,5 @@
 import os
+import uuid as uuid_mod
 import logging
 import hashlib
 import hmac
@@ -51,6 +52,13 @@ def get_active_tenant(request, required=True):
         or request.META.get("HTTP_X_TENANT_ID")
     )
     if not tid:
+        # AUTO-DISCOVERY: If no header, check if the authenticated user has exactly one membership.
+        # This simplifies UI/API calls for single-community users.
+        if request.user and request.user.is_authenticated:
+            memberships = Membership.objects.filter(user=request.user)
+            if memberships.count() == 1:
+                return memberships.first().tenant
+
         if required:
             raise PermissionDenied("Missing X-Tenant-ID header.")
         return None
@@ -305,6 +313,12 @@ def classify_camera_source(url: str) -> str:
         return "native"
     if ".m3u8" in lowered:
         return "hls"
+    
+    # If the URL contains frame_count, it's almost certainly intended to be a stream
+    # even if it uses a "snapshot" or "oneshot" endpoint. 
+    if "frame_count" in lowered or "framecount" in lowered:
+        return "mjpeg"
+
     if any(x in lowered for x in ["getoneshot", "snapshot"]):
         return "snapshot"
     if any(x in lowered for x in [".mjpg", ".mjpeg", "/mjpg", "/mjpeg", "nphmotionjpeg", "motionjpeg"]):
@@ -325,17 +339,21 @@ def build_mediamtx_path_payload(camera: Camera, path_name: str, source_kind: str
         if camera.source_fingerprint:
             payload["sourceFingerprint"] = camera.source_fingerprint
         return payload
-    elif source_kind == "mjpeg":
+    elif source_kind in ("mjpeg", "snapshot"):
+        # We treat "snapshot" sources as potential video streams (sequential snapshots) 
+        # when provisioning a live path. ffmpeg is robust enough to ingest them.
         escaped_url = camera.rtsp_url.replace('"', '\\"')
         
         ffmpeg_cmd = 'ffmpeg -nostdin -loglevel warning '
         if camera.rtsp_url.lower().startswith("https://"):
             ffmpeg_cmd += '-tls_verify 0 '
 
+        # DECOUPLED FIX: Remove '-f mjpeg' to allow ffmpeg to auto-detect input format.
+        # This matches how 'ffplay' handles sequential snapshot URLs like GetOneShot.
         run_on_demand = (
             ffmpeg_cmd +
             f'-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 '
-            f'-f mjpeg -i "{escaped_url}" '
+            f'-i "{escaped_url}" '
             f'-an -c:v libx264 -preset ultrafast -tune zerolatency '
             f'-pix_fmt yuv420p -g 30 '
             f'-f rtsp rtsp://127.0.0.1:8554/{path_name}'
@@ -483,7 +501,9 @@ class CameraViewSet(TenantScopedViewSet):
         """
         from django.utils.text import slugify
         
-        camera = serializer.save()
+        tenant = get_active_tenant(self.request)
+        assert_non_viewer(self.request, tenant)
+        camera = serializer.save(tenant=tenant)
         
         # DECOUPLED FIX: Generate stream_path immediately upon creation.
         # Do not wait for AI to sync. MediaMTX needs this path instantly.
@@ -503,6 +523,8 @@ class CameraViewSet(TenantScopedViewSet):
         """Sync MediaMTX path when camera is updated."""
         from django.utils.text import slugify
         
+        tenant = get_active_tenant(self.request)
+        assert_non_viewer(self.request, tenant)
         camera = serializer.save()
         
         if not camera.stream_path:
@@ -1178,17 +1200,23 @@ class KnownEntityViewSet(TenantScopedViewSet):
         """
         import requests as http_client
 
-        # Build serializer from combined POST data (works for both JSON and multipart)
-        data = request.data.copy() if hasattr(request.data, 'copy') else dict(request.data)
-        serializer = self.get_serializer(data=data)
+        # Build serializer from POST data (DRF handles QueryDict correctly)
+        serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
         tenant = get_active_tenant(self.request)
         assert_non_viewer(self.request, tenant)
         entity = serializer.save(tenant=tenant)
 
-        # Collect uploaded files
+        # Collect uploaded files (read into memory immediately to allow handle closure)
         uploaded_files = request.FILES.getlist("files")
+        files_payload = []
+        for f in uploaded_files:
+            f.seek(0)  # ensure at start
+            files_payload.append(("files", (f.name, f.read(), f.content_type or "image/jpeg")))
+        
+        # CLEAR handles immediately to avoid pickling failures if later steps fail on Windows
+        del uploaded_files
 
         # Best-effort AI enrollment (forward images to AI module)
         ai_base = os.getenv("AI_BASE_INTERNAL", "http://127.0.0.1:8080")
@@ -1199,13 +1227,8 @@ class KnownEntityViewSet(TenantScopedViewSet):
 
         ai_data = {}
         try:
-            if uploaded_files:
+            if files_payload:
                 # Multipart: forward files to AI's /entities/enroll_person or /entities/enroll_pet
-                files_payload = []
-                for f in uploaded_files:
-                    f.seek(0)  # ensure at start
-                    files_payload.append(("files", (f.name, f.read(), f.content_type or "image/jpeg")))
-
                 form_data = {"name": entity.name}
                 if entity.category != "pet":
                     form_data["role"] = "VISITOR"
@@ -1223,6 +1246,9 @@ class KnownEntityViewSet(TenantScopedViewSet):
                     data={"name": entity.name, "role": "VISITOR"},
                     timeout=10,
                 )
+            
+            # CLEAR payload now that request is sent
+            del files_payload
 
             if resp.status_code in (200, 201):
                 ai_data = resp.json()
@@ -2084,12 +2110,12 @@ def _ensure_user_alert_backfill(tenant, user, max_incidents=300):
                 "title": f"🚨 {incident.get_type_display()} Detected",
                 "message": f"{severity_labels.get(incident.severity, 'Unknown')} severity incident at {incident.camera.name if incident.camera else 'Unknown camera'}",
                 "data": {
-                    "incident_id": incident.id,
+                    "incident_id": str(incident.id),
                     "type": incident.type,
                     "status": incident.status,
                     "severity": incident.severity,
                     "severity_level": severity_level,
-                    "camera_id": incident.camera_id,
+                    "camera_id": incident.camera_id if not isinstance(incident.camera_id, uuid_mod.UUID) else str(incident.camera_id),
                     "camera_name": incident.camera.name if incident.camera else None,
                     "started_at": incident.started_at.isoformat() if incident.started_at else None,
                     "details": incident.details,
@@ -2110,6 +2136,16 @@ def _ensure_user_alert_backfill(tenant, user, max_incidents=300):
 # §5  REAL-TIME NOTIFICATION API
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+def _alerts_for_user_in_tenant(user, tenant):
+    """Return alerts visible to a user for a tenant, covering legacy and current storage."""
+    return Alert.objects.filter(incident__tenant=tenant).filter(
+        Q(user=user)
+        | Q(user__isnull=True, payload__user_id=str(user.id))
+        | Q(user__isnull=True, payload__user_id=user.id)
+        | Q(user__isnull=True, payload__user_id__isnull=True)
+    )
+
+
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def notifications_list(request):
@@ -2121,8 +2157,6 @@ def notifications_list(request):
     - offset: Pagination offset
     - unread_only: If 'true', only return unread notifications
     """
-    from django.db.models import Count, Q
-    
     tenant = get_active_tenant(request)
     if not assert_member(request, tenant):
         raise PermissionDenied()
@@ -2133,40 +2167,67 @@ def notifications_list(request):
     offset = int(request.query_params.get("offset", 0))
     unread_only = request.query_params.get("unread_only", "false").lower() == "true"
     
-    # Get incidents for this tenant
-    incidents_qs = Incident.objects.filter(tenant=tenant)
-    
-    # Get alerts for these incidents
-    alerts_qs = Alert.objects.filter(
-        incident__in=incidents_qs,
-    ).filter(
-        Q(payload__user_id=str(request.user.id))
-        | Q(payload__user_id__isnull=True)
-    ).select_related("incident", "incident__camera").order_by("-created_at")
+    alerts_qs = _alerts_for_user_in_tenant(request.user, tenant).select_related("incident", "incident__camera").order_by("-created_at")
     
     if unread_only:
         alerts_qs = alerts_qs.filter(delivered_at__isnull=True)
     
     total_count = alerts_qs.count()
     alerts = list(alerts_qs[offset:offset + limit])
+    severity_labels = {
+        5: "Critical",
+        4: "High",
+        3: "Medium",
+        2: "Low",
+        1: "Info",
+    }
     
+    def _safe_str(val):
+        """Convert UUID or other non-serializable objects to strings."""
+        if isinstance(val, uuid_mod.UUID):
+            return str(val)
+        return val
+
     notifications = []
     for alert in alerts:
         payload = alert.payload or {}
+        payload_data = {k: _safe_str(v) for k, v in (payload.get("data") or {}).items()}
+        incident = alert.incident
+        camera_name = payload.get("camera_name") or payload_data.get("camera_name")
+        if not camera_name and incident and incident.camera:
+            camera_name = incident.camera.name
+
+        incident_type_label = incident.get_type_display() if incident else "Incident"
+        severity_value = payload.get("severity", incident.severity if incident else None)
+        severity_label = severity_labels.get(severity_value, "Unknown") if severity_value is not None else None
+
+        title = payload.get("title")
+        if not title:
+            title = f"{incident_type_label} Detected"
+
+        message = payload.get("message")
+        if not message:
+            if severity_label and camera_name:
+                message = f"{severity_label} severity incident at {camera_name}"
+            elif camera_name:
+                message = f"Incident detected at {camera_name}"
+            else:
+                message = "New incident detected"
+
         notifications.append({
-            "id": alert.id,
+            "id": str(alert.id),
             "type": "incident",
-            "title": payload.get("title", f"Incident #{alert.incident_id}"),
-            "message": payload.get("message", ""),
-            "data": payload.get("data", {}),
+            "title": title,
+            "message": message,
+            "data": payload_data,
             "is_read": alert.delivered_at is not None,
             "created_at": alert.created_at.isoformat(),
-            "incident_id": alert.incident_id,
-            "incident_type": alert.incident.get_type_display() if alert.incident else None,
-            "severity": payload.get("severity", alert.incident.severity if alert.incident else None),
-            "severity_level": payload.get("severity_level") or payload.get("data", {}).get("severity_level") or (severity_level_for_value(alert.incident.severity) if alert.incident else None),
-            "camera_name": alert.incident.camera.name if alert.incident and alert.incident.camera else None,
-            "alert_id": alert.id,
+            "incident_id": str(alert.incident_id) if alert.incident_id else None,
+            "incident_type": incident_type_label if incident else None,
+            "severity": severity_value,
+            "severity_level": payload.get("severity_level") or payload_data.get("severity_level") or (severity_level_for_value(incident.severity) if incident else None),
+            "camera_name": camera_name,
+            "alert_id": str(alert.id),
         })
     
     return Response({
@@ -2194,24 +2255,13 @@ def notifications_mark_read(request):
     
     if mark_all:
         # Mark all unread notifications for this tenant as read
-        incidents_qs = Incident.objects.filter(tenant=tenant)
-        updated = Alert.objects.filter(
-            incident__in=incidents_qs,
-            ).filter(
-            Q(payload__user_id=str(request.user.id))
-            | Q(payload__user_id__isnull=True)
-        ).filter(
+        updated = _alerts_for_user_in_tenant(request.user, tenant).filter(
             delivered_at__isnull=True
         ).update(delivered_at=timezone.now())
     elif notification_ids:
         # Mark specific notifications as read
-        incidents_qs = Incident.objects.filter(tenant=tenant)
-        updated = Alert.objects.filter(
+        updated = _alerts_for_user_in_tenant(request.user, tenant).filter(
             id__in=notification_ids,
-            incident__in=incidents_qs,
-            ).filter(
-            Q(payload__user_id=str(request.user.id))
-            | Q(payload__user_id__isnull=True)
         ).update(delivered_at=timezone.now())
     else:
         return Response({"error": "Provide notification_ids or mark_all=true"}, status=status.HTTP_400_BAD_REQUEST)
@@ -2232,13 +2282,7 @@ def notifications_unread_count(request):
     if not assert_member(request, tenant):
         raise PermissionDenied()
     
-    incidents_qs = Incident.objects.filter(tenant=tenant)
-    count = Alert.objects.filter(
-        incident__in=incidents_qs,
-    ).filter(
-        Q(payload__user_id=str(request.user.id))
-        | Q(payload__user_id__isnull=True)
-    ).filter(
+    count = _alerts_for_user_in_tenant(request.user, tenant).filter(
         delivered_at__isnull=True
     ).count()
     
@@ -2254,20 +2298,29 @@ def _notification_transport_snapshot() -> dict:
     redis_reachable = False
     redis_error = None
     subscriber_status = None
+    subscriber_healthy = False
+    client = None
 
     try:
         client = create_redis_client(redis_settings)
         client.ping()
         redis_reachable = True
         subscriber_status = read_subscriber_status(client, redis_settings.incident_channel)
-        client.close()
     except Exception as exc:
         redis_error = str(exc)
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+    subscriber_healthy = bool(subscriber_status)
 
     return {
         "channel_backend": backend_path,
         "uses_redis": uses_redis,
-        "realtime_ready": bool(uses_redis and redis_reachable),
+        "realtime_ready": bool(uses_redis and redis_reachable and subscriber_healthy),
         "queue_mode": redis_settings.queue_mode,
         "incident_stream": redis_settings.incident_channel,
         "incident_channel": redis_settings.incident_channel,
@@ -2276,6 +2329,7 @@ def _notification_transport_snapshot() -> dict:
         "redis": redis_settings.to_diagnostics(),
         "redis_reachable": redis_reachable,
         "redis_error": redis_error,
+        "subscriber_healthy": subscriber_healthy,
         "subscriber": subscriber_status,
     }
 
@@ -2286,7 +2340,8 @@ def notifications_transport_status(request):
     """
     GET /api/notifications/transport-status/ — report notification transport health.
 
-    The status is Redis-based: green when Redis is reachable, red otherwise.
+    The status is healthy only when Redis is reachable and the subscriber
+    heartbeat is still present.
     """
     tenant = get_active_tenant(request)
     if not assert_member(request, tenant):

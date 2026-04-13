@@ -16,7 +16,7 @@ const createNotification = (overrides: Partial<Notification> = {}): Notification
   severity_level: 'severe',
   camera_name: 'Front Door',
   incident_id: 10,
-  alert_id: 42,
+  alert_id: '42',
   is_read: false,
   ...overrides,
 });
@@ -63,7 +63,7 @@ describe('NotificationBell', () => {
     const notifications = Array.from({ length: 25 }, (_, index) =>
       createNotification({
         id: `alert-${index}`,
-        alert_id: index + 1,
+        alert_id: String(index + 1),
         incident_id: index + 100,
         title: `Alert ${index + 1}`,
       })
@@ -107,7 +107,7 @@ describe('NotificationBell', () => {
     render(
       <NotificationBell
         {...baseProps}
-        notifications={[createNotification({ alert_id: 99, incident_id: 321 })]}
+        notifications={[createNotification({ alert_id: '99', incident_id: 321 })]}
         unreadCount={1}
       />
     );
@@ -116,7 +116,7 @@ describe('NotificationBell', () => {
     fireEvent.click(screen.getByText('Incident detected'));
 
     await waitFor(() => {
-      expect(baseProps.onMarkAsRead).toHaveBeenCalledWith([99]);
+      expect(baseProps.onMarkAsRead).toHaveBeenCalledWith(['99']);
       expect(baseProps.onNavigate).toHaveBeenCalledWith('/incidents/321');
     });
   });

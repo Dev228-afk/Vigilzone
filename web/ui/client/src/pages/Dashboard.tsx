@@ -184,37 +184,16 @@ export default function Dashboard() {
 
   return (
     <div className="space-y-6 p-6">
-      <div className="rounded-3xl border border-border bg-gradient-to-br from-card via-card to-card/80 p-6 shadow-sm">
-        <div className="flex flex-col gap-6 xl:flex-row xl:items-end xl:justify-between">
-          <div className="space-y-3">
-            <div className="inline-flex items-center gap-2 rounded-full border border-primary/20 bg-primary/10 px-3 py-1 text-xs font-medium text-primary">
-              <Sparkles className="h-3.5 w-3.5" />
-              Live security overview
-            </div>
-            <div>
-              <h1 className="text-3xl font-semibold tracking-tight">Community surveillance dashboard</h1>
-              <p className="mt-2 max-w-2xl text-sm text-muted-foreground">
-                Monitor camera activity, review recent incidents, and keep large camera fleets visible without collapsing into a single stacked list.
-              </p>
-            </div>
-          </div>
-          <div className="grid w-full gap-3 sm:grid-cols-2 xl:w-auto xl:grid-cols-4">
-            <StatsCard title="Incidents Today" value={String(stats.today)} icon={Activity} />
-            <StatsCard title="Open Incidents" value={String(stats.open ?? 0)} icon={AlertTriangle} />
-            <StatsCard title="Critical Today" value={String(stats.critical ?? 0)} icon={Shield} />
-            <StatsCard title="Live Cameras" value={`${stats.camera_live ?? 0}/${stats.camera_total ?? cameras.length}`} icon={Video} />
-          </div>
+      <div className="flex flex-wrap items-center justify-between gap-4" data-testid="zone-chip-bar">
+        <div className="flex flex-wrap items-center gap-2">
+          <Button size="sm" variant={zoneFilter === "all" ? "default" : "outline"} onClick={() => setZoneFilter("all")}>All zones</Button>
+          {zoneValues.map((zone) => (
+            <Button key={zone} size="sm" variant={zoneFilter === zone ? "default" : "outline"} onClick={() => setZoneFilter(zone)}>
+              {zone}
+            </Button>
+          ))}
         </div>
-      </div>
-
-      <div className="flex flex-wrap items-center gap-2" data-testid="zone-chip-bar">
-        <Button size="sm" variant={zoneFilter === "all" ? "default" : "outline"} onClick={() => setZoneFilter("all")}>All zones</Button>
-        {zoneValues.map((zone) => (
-          <Button key={zone} size="sm" variant={zoneFilter === zone ? "default" : "outline"} onClick={() => setZoneFilter(zone)}>
-            {zone}
-          </Button>
-        ))}
-        {dashboardQ.isLoading && <span className="text-sm text-muted-foreground">Loading…</span>}
+        {dashboardQ.isLoading && <span className="text-sm text-muted-foreground animate-pulse">Refreshing data…</span>}
       </div>
 
       <div className="grid gap-6 xl:grid-cols-12">
@@ -223,9 +202,6 @@ export default function Dashboard() {
             <div className="flex flex-col gap-4 border-b border-border/70 bg-muted/30 p-5 md:flex-row md:items-center md:justify-between">
               <div>
                 <h2 className="text-lg font-semibold">Camera wall</h2>
-                <p className="text-sm text-muted-foreground">
-                  Focus on one camera while keeping the rest visible in a responsive grid.
-                </p>
               </div>
               <div className="flex flex-wrap gap-2">
                 <Badge variant="secondary" className="gap-1"><Grid2x2 className="h-3 w-3" /> {filteredCameras.length} visible</Badge>
@@ -253,7 +229,6 @@ export default function Dashboard() {
                     />
                     <div className="flex flex-wrap items-center gap-2">
                       <Badge variant="outline">{selectedCamera.sourceLabel}</Badge>
-                      <Badge variant="outline">{selectedCamera.health?.connected ? 'Connected' : 'Warming up'}</Badge>
                       <Button size="sm" variant="outline" onClick={() => setSelectedCameraId(null)}>
                         Reset focus
                       </Button>
@@ -263,7 +238,6 @@ export default function Dashboard() {
                     <div className="flex items-center justify-between">
                       <div>
                         <h3 className="font-semibold">Snapshot gallery</h3>
-                        <p className="text-sm text-muted-foreground">Optimized for large camera counts.</p>
                       </div>
                     </div>
                     <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
@@ -313,7 +287,6 @@ export default function Dashboard() {
               <div className="mb-4 flex items-center justify-between">
                 <div>
                   <h2 className="text-lg font-semibold">Recent incidents</h2>
-                  <p className="text-sm text-muted-foreground">Fresh incident stream from the AI module.</p>
                 </div>
                 <Button variant="ghost" size="sm" onClick={() => setLocation('/incidents')}>View all</Button>
               </div>
@@ -343,7 +316,6 @@ export default function Dashboard() {
               <div className="mb-4 flex items-center justify-between">
                 <div>
                   <h2 className="text-lg font-semibold">Incident distribution</h2>
-                  <p className="text-sm text-muted-foreground">Breakdown by anomaly type this period.</p>
                 </div>
                 <Badge variant={data?.ai_healthy ? 'default' : 'secondary'}>{data?.ai_healthy ? 'AI healthy' : 'AI status unknown'}</Badge>
               </div>
@@ -389,6 +361,12 @@ export default function Dashboard() {
         </div>
 
         <div className="space-y-6 xl:col-span-4">
+          <div className="grid grid-cols-2 gap-3">
+            <StatsCard title="Incidents Today" value={String(stats.today)} icon={Activity} />
+            <StatsCard title="Open Incidents" value={String(stats.open ?? 0)} icon={AlertTriangle} />
+            <StatsCard title="Critical Today" value={String(stats.critical ?? 0)} icon={Shield} />
+            <StatsCard title="Live Cameras" value={`${stats.camera_live ?? 0}/${stats.camera_total ?? cameras.length}`} icon={Video} />
+          </div>
           <Card className="p-5">
             <div className="mb-4 flex items-center justify-between">
               <div>
@@ -412,47 +390,6 @@ export default function Dashboard() {
                 ))}
               </div>
             </ScrollArea>
-          </Card>
-
-          <Card className="p-5">
-            <div className="mb-4 flex items-center justify-between">
-              <div>
-                <h2 className="text-lg font-semibold">Known entities</h2>
-                <p className="text-sm text-muted-foreground">Recently enrolled people, pets, and vehicles.</p>
-              </div>
-              <Button variant="ghost" size="sm" onClick={() => setLocation('/entities')}>Manage</Button>
-            </div>
-            <div className="flex flex-wrap gap-2">
-              {knownEntities.length === 0 && <span className="text-sm text-muted-foreground">No entities enrolled yet.</span>}
-              {knownEntities.map((entity, index) => (
-                <Badge key={`${entity.name}-${index}`} variant="secondary" className="gap-1 rounded-full px-3 py-1.5">
-                  {getEntityIcon(entity.type)}
-                  {entity.name}
-                </Badge>
-              ))}
-            </div>
-          </Card>
-
-          <Card className="p-5">
-            <div className="mb-4 flex items-center justify-between">
-              <div>
-                <h2 className="text-lg font-semibold">Operational summary</h2>
-                <p className="text-sm text-muted-foreground">Quick glance over broader activity trends.</p>
-              </div>
-              <TrendingUp className="h-5 w-5 text-primary" />
-            </div>
-            <div className="grid gap-3 sm:grid-cols-2">
-              <div className="rounded-2xl border border-border/70 bg-background/60 p-4">
-                <div className="text-xs uppercase tracking-wide text-muted-foreground">This week</div>
-                <div className="mt-2 text-2xl font-semibold">{stats.week}</div>
-                <p className="mt-1 text-xs text-muted-foreground">Incidents detected this week.</p>
-              </div>
-              <div className="rounded-2xl border border-border/70 bg-background/60 p-4">
-                <div className="text-xs uppercase tracking-wide text-muted-foreground">This month</div>
-                <div className="mt-2 text-2xl font-semibold">{stats.month}</div>
-                <p className="mt-1 text-xs text-muted-foreground">Incidents detected this month.</p>
-              </div>
-            </div>
           </Card>
         </div>
       </div>

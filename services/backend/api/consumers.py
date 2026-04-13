@@ -164,15 +164,33 @@ class NotificationConsumer(AsyncWebsocketConsumer):
 
     async def notification_message(self, event):
         """
-        Catches the 'notification_message' event broadcasted by Redis 
-        and pushes it down the WebSocket to the React frontend.
+        Handler for 'notification_message' group messages.
+        Broadcasts notification to all members in the tenant group.
         """
-        # 'event' is the exact dictionary we sent in notification_service.py
-        message_data = event.get("data", {})
+        data = dict(event.get("data", {}))
+        per_user_ids = data.pop("alert_ids_by_user", None)
+        per_user_counts = data.pop("unread_counts_by_user", None)
         
-        # Send the payload to the browser
-        import json
-        await self.send(text_data=json.dumps(message_data))
+        if isinstance(per_user_ids, dict) and self.user:
+            user_id_str = str(self.user.id)
+            
+            # Extract alert_id for this specific user
+            alert_id = per_user_ids.get(user_id_str)
+            if not alert_id:
+                logger.debug(f"User {user_id_str} not in alert targets. Dropping WS message.")
+                return
+                
+            data["alert_id"] = alert_id
+
+            # Extract unread_count for this specific user if available
+            if isinstance(per_user_counts, dict):
+                data["unread_count"] = per_user_counts.get(user_id_str)
+            
+        # Send notification to WebSocket
+        try:
+            await self.send(text_data=json.dumps(data))
+        except Exception as e:
+            logger.error(f"Failed to push WebSocket message: {e}")
 
     async def broadcast_message(self, event):
         """

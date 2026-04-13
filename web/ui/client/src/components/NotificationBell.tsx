@@ -9,7 +9,7 @@ import { cn } from '@/lib/utils';
 interface NotificationBellProps {
   notifications: Notification[];
   unreadCount: number;
-  onMarkAsRead: (ids: number[]) => Promise<void>;
+  onMarkAsRead: (ids: string[]) => Promise<void>;
   onMarkAllAsRead: () => Promise<void>;
   isConnected: boolean;
   isSubscribed?: boolean;
@@ -54,10 +54,12 @@ function getSeverityLevel(notification: Notification) {
   );
 }
 
-function getIncidentId(notification: Notification): number | undefined {
-  if (typeof notification.incident_id === 'number') return notification.incident_id;
+function getIncidentId(notification: Notification): string | number | undefined {
+  if (typeof notification.incident_id === 'string' || typeof notification.incident_id === 'number') {
+    return notification.incident_id;
+  }
   const nested = notification.data?.incident_id;
-  return typeof nested === 'number' ? nested : undefined;
+  return typeof nested === 'string' || typeof nested === 'number' ? nested : undefined;
 }
 
 function getSeverityIcon(level: string) {
@@ -126,7 +128,7 @@ export const NotificationBell: React.FC<NotificationBellProps> = ({
     setIsOpen(false);
 
     if (notification.alert_id && !notification.is_read) {
-      await onMarkAsRead([notification.alert_id]);
+      await onMarkAsRead([String(notification.alert_id)]);
     }
 
     const incidentId = getIncidentId(notification);

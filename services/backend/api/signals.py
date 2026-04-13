@@ -22,16 +22,32 @@ def broadcast_incident_notification(sender, instance, created, **kwargs):
     Automatically broadcast notifications when an Incident is created.
     This ensures notifications are sent regardless of whether the incident
     was created via API (IncidentViewSet.perform_create) or Django admin.
+
+    Uses ``transaction.on_commit`` because ``broadcast_incident()`` pushes
+    to the channel layer inline (it no longer wraps with its own on_commit).
     """
     if created:
         if getattr(instance, "_skip_broadcast_notification", False):
             return
-        # Import here to avoid circular imports
-        from .notification_service import NotificationService
-        
-        try:
-            NotificationService.broadcast_incident(instance)
-        except Exception as exc:
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.warning(f"Failed to broadcast notification for incident {instance.pk}: {exc}")
+
+        from django.db import transaction
+
+        incident_id = instance.pk
+
+        def _broadcast():
+            from .notification_service import NotificationService
+            try:
+                inc = Incident.objects.select_related("tenant", "camera").get(pk=incident_id)
+                NotificationService.broadcast_incident(inc)
+            except Incident.DoesNotExist:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "Incident %s disappeared before notification dispatch", incident_id
+                )
+            except Exception as exc:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "Failed to broadcast notification for incident %s: %s", incident_id, exc
+                )
+
+        transaction.on_commit(_broadcast)
