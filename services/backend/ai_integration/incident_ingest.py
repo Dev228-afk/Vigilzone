@@ -12,6 +12,7 @@ This avoids duplicating camera resolution, incident creation, detection
 persistence, and notification dispatch logic across two code paths.
 """
 
+import json
 import logging
 import os
 import time
@@ -29,28 +30,79 @@ from api.models import (
 logger = logging.getLogger(__name__)
 
 
-def _queue_incident_notification(incident_id: int) -> None:
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Phase 1 WS1.2: Redis Camera Context Helpers
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _get_redis_camera_context(camera_id: str) -> Optional[dict]:
+    """Fetch the Redis cameractx projection for fast validation."""
+    try:
+        from ai_integration.redis_queue import get_redis_client
+        raw = get_redis_client().get(f"cameractx:{camera_id}")
+        if raw:
+            return json.loads(raw)
+    except Exception as exc:
+        logger.debug("cameractx lookup failed for %s: %s", camera_id, exc)
+    return None
+
+
+def _repair_camera_context(camera: Camera) -> None:
+    """Rebuild a single cameractx entry from canonical DB state."""
+    try:
+        from ai_integration.redis_queue import get_redis_client
+        cam_key = camera.ai_camera_id or camera.stream_path or str(camera.id)
+        ctx_value = {
+            "tenant_id": str(camera.tenant_id),
+            "community_id": str(camera.tenant_id),
+            "camera_name": camera.name,
+            "stream_path": camera.stream_path,
+            "policy_version": 1,
+            "updated_at": timezone.now().isoformat(),
+        }
+        get_redis_client().set(f"cameractx:{cam_key}", json.dumps(ctx_value))
+        logger.info("Repaired cameractx for %s", cam_key)
+    except Exception as exc:
+        logger.warning("cameractx repair failed for camera %s: %s", camera.id, exc)
+
+
+def _queue_incident_notification(incident_id: int, event_id: str = "") -> None:
     """
     Broadcast the incident after the surrounding transaction commits.
 
     AI-originated incidents can be created from webhook or Redis subscriber
     processes, so we trigger the live notification explicitly here instead of
     relying on a model signal firing in a different execution path.
+
+    Phase 1 WS1.3: Notification dispatch is decoupled from incident persistence.
+    The incident is persisted first, and notification is dispatched asynchronously
+    via a background thread after commit. Failure to notify does not roll back
+    the incident.
     """
 
     def _broadcast():
+        dispatch_start = time.time()
         try:
             from api.models import Incident
             from api.notification_service import NotificationService
 
             incident = Incident.objects.select_related("tenant", "camera").get(pk=incident_id)
-            NotificationService.broadcast_incident(incident)
+            result = NotificationService.broadcast_incident(incident)
+            dispatch_ms = (time.time() - dispatch_start) * 1000
+            logger.info(
+                "Notification dispatch completed for incident=%s event_id=%s "
+                "alerts=%d ws=%s elapsed=%.1fms",
+                incident_id, event_id,
+                result.get("alerts_created", 0),
+                result.get("websocket", "unknown"),
+                dispatch_ms,
+            )
         except Incident.DoesNotExist:
             logger.warning("Incident %s disappeared before notification dispatch", incident_id)
         except Exception as exc:
             logger.warning("Notification dispatch error for incident %s: %s", incident_id, exc)
 
-    transaction.on_commit(_broadcast)
+    import threading
+    transaction.on_commit(lambda: threading.Thread(target=_broadcast, daemon=True).start())
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Shared constants / helpers (moved from views.py module level)
@@ -336,7 +388,36 @@ def process_alert_event(
     confidence = data.get("confidence")
     recognized_entity = _extract_entity_details(data)
 
-    # ── Resolve / auto-create camera ──────────────────────────
+    # ── Phase 1 WS1.1: Envelope-first resolution ──────────────
+    # Trust event-carried business context first, validate via Redis
+    # cameractx, fall back to DB only when needed.
+    envelope_tenant_id = data.get("tenant_id")
+    envelope_community_id = data.get("community_id")
+    has_trusted_context = bool(envelope_tenant_id and envelope_community_id)
+
+    if not has_trusted_context:
+        logger.info(
+            "Event %s missing canonical routing context (tenant_id=%s, community_id=%s). "
+            "Falling back to DB resolution.",
+            event_id, envelope_tenant_id, envelope_community_id,
+        )
+
+    # Validate against Redis cameractx if available
+    redis_ctx = _get_redis_camera_context(camera_id_str)
+    if redis_ctx and has_trusted_context:
+        if str(redis_ctx.get("tenant_id")) != str(envelope_tenant_id):
+            logger.warning(
+                "Event %s tenant_id mismatch: envelope=%s vs cameractx=%s. "
+                "Using cameractx (derived from canonical DB).",
+                event_id, envelope_tenant_id, redis_ctx.get("tenant_id"),
+            )
+            envelope_tenant_id = redis_ctx.get("tenant_id")
+            envelope_community_id = redis_ctx.get("community_id")
+        logger.debug("cameractx HIT for %s", camera_id_str)
+    elif not redis_ctx:
+        logger.debug("cameractx MISS for %s — will repair after DB resolution", camera_id_str)
+
+    # Resolve camera and tenant via DB
     tenant_hint = _resolve_tenant_hint(data)
     camera, tenant, ambiguous_camera = _resolve_camera(camera_id_str, tenant_hint=tenant_hint)
 
@@ -366,6 +447,10 @@ def process_alert_event(
     incident_type = INCIDENT_TYPE_MAP.get(alert_type, Incident.Type.OTHER)
     severity = _parse_severity(severity_raw)
     alert_ts = _parse_timestamp(timestamp_raw)
+
+    # Repair cameractx in Redis if it was missing (cache miss repair path)
+    if camera and not redis_ctx:
+        _repair_camera_context(camera)
 
     # Evidence URL (routed through Django proxy)
     evidence = data.get("evidence", {}) or {}
@@ -454,20 +539,20 @@ def process_alert_event(
                 return IngestResult(status="duplicate", incident_id=incident.pk)
 
     logger.info(
-        "AI %s ingest: %s incident #%s (%s, sev=%d) for camera '%s'",
+        "AI %s ingest: %s incident #%s (%s, sev=%d) for camera '%s' [event_id=%s]",
         source,
         "created" if created else "updated",
         incident.pk,
         incident_type,
         severity,
         camera_id_str,
+        event_id,
     )
 
     # ── Dispatch notifications ────────────────────────────────
-    # AI-ingested incidents should always fan out through the same live
-    # notification path, regardless of whether this event created a new
-    # incident or updated an existing active one.
-    _queue_incident_notification(incident.pk)
+    # Phase 1 WS1.3: Notification dispatch is decoupled from incident
+    # persistence. The incident persists regardless of notification success.
+    _queue_incident_notification(incident.pk, event_id=event_id or "")
 
     return IngestResult(
         status="created" if created else "updated",

@@ -176,8 +176,8 @@ runtime:
     - "./models"        # all weights live here
     - "./third_party"
   gpu:
-    max_queue: 128
-    max_inflight: 4          # allow 4 concurrent GPU tasks (overlapping CUDA streams)
+    max_queue: 32
+    max_inflight: 2          # allow 2 concurrent GPU tasks (overlapping CUDA streams)
   budgets:
     rtdetr:
       max_latency_ms: 120

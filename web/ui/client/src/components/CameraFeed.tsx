@@ -1,10 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { Video, Wifi, WifiOff, Sparkles, Activity } from "lucide-react";
+import { Video, Wifi, WifiOff, Sparkles } from "lucide-react";
 import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import CanvasStream from "@/components/CanvasStream"; // Legacy
-import AuthedMjpeg from "@/components/AuthedMjpeg"; // Legacy
-import SnapshotStream from "@/components/SnapshotStream"; // Legacy
 import { useMediamtxHealth } from "@/hooks/use-mediamtx-health";
 
 interface CameraFeedProps {
@@ -40,13 +37,6 @@ function isApiUrl(url: string): boolean {
 
 type StreamMethod = 'idle' | 'webrtc-iframe' | 'static' | 'error';
 
-const METHOD_COLORS: Record<StreamMethod, string> = {
-  'webrtc-iframe': 'bg-blue-500',
-  'static': 'bg-gray-500',
-  'error': 'bg-red-500',
-  'idle': 'bg-slate-400',
-};
-
 const METHOD_LABELS: Record<StreamMethod, string> = {
   'webrtc-iframe': 'Live Stream',
   'static': 'Snapshot Preview',
@@ -71,10 +61,29 @@ export default function CameraFeed({
   const mtxChecked = mtxHealth.checked;
   const mtxActivePaths = mtxHealth.activePaths;
 
-  // The active streaming method
-  const [activeMethod, setActiveMethod] = useState<StreamMethod>('idle');
+  // Intersection Observer for lazy-loading logic
+  const [isInView, setIsInView] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        setIsInView(entry.isIntersecting);
+      },
+      { threshold: 0.1, rootMargin: "200px" } // Load slightly before it enters view
+    );
+
+    if (containerRef.current) {
+      observer.observe(containerRef.current);
+    }
+
+    return () => observer.disconnect();
+  }, []);
+
   // Methods that have already failed during this component's lifecycle
   const failedRef = useRef<Set<StreamMethod>>(new Set());
+  // The active streaming method
+  const [activeMethod, setActiveMethod] = useState<StreamMethod>('idle');
   // Force a re-render when the ref changes
   const [, forceUpdate] = useState(0);
 
@@ -83,20 +92,20 @@ export default function CameraFeed({
 
   // Compute the optimal method based on capabilities, URL, and failures
   const computeNextMethod = useCallback((): StreamMethod => {
+    // Only proceed if the camera is in view (Media Lazy Loading)
+    if (!isInView) return 'idle';
+
     const failed = failedRef.current;
 
     // 1. WebRTC iframe — only when MediaMTX is confirmed reachable and streamUrl actually exists
     if (streamUrl && mtxChecked && mtxReachable && !failed.has('webrtc-iframe')) {
-      // Feature Flag: Is the API healthcheck enabled? (Objective 3)
+      // Feature Flag: Is the API healthcheck enabled?
       const apiHealthcheckEnabled = String(import.meta.env.VITE_ENABLE_MEDIAMTX_API_HEALTHCHECK ?? "true").toLowerCase() === "true";
 
       if (!apiHealthcheckEnabled) {
-        // If API check is disabled, we trust mtxReachable (ping) and the provided streamUrl
         return 'webrtc-iframe';
       }
 
-      // Only use WebRTC if the stream path is actively publishing in MediaMTX
-      // Prioritize streamPath prop if provided, otherwise extract from URL
       let finalPath = "";
       if (streamPath) {
         finalPath = streamPath;
@@ -119,23 +128,24 @@ export default function CameraFeed({
       return 'static';
     }
 
-    // 5. Static image
-    if (displaySrc && !failed.has('static')) {
-      return 'static';
-    }
-
     return 'error';
-  }, [streamUrl, mtxChecked, mtxReachable, cameraId, displaySrc]);
+  }, [streamUrl, mtxChecked, mtxReachable, cameraId, displaySrc, isInView, streamPath, mtxActivePaths]);
 
   // Advance to the next method when health check completes or on mount
   useEffect(() => {
     // Wait for MediaMTX health check before deciding
     if (!mtxChecked && streamUrl) return;
 
-    if (activeMethod === 'idle') {
+    // If we've moved out of view, go to idle to stop the stream
+    if (!isInView) {
+      setActiveMethod('idle');
+      return;
+    }
+
+    if (activeMethod === 'idle' || activeMethod === 'error') {
       setActiveMethod(computeNextMethod());
     }
-  }, [mtxChecked, streamUrl, activeMethod, computeNextMethod]);
+  }, [mtxChecked, streamUrl, activeMethod, computeNextMethod, isInView]);
 
   // Handler: current method failed, advance to next
   const handleMethodFailed = useCallback((method: StreamMethod) => {
@@ -145,16 +155,6 @@ export default function CameraFeed({
     setActiveMethod(next);
     forceUpdate((v) => v + 1);
   }, [computeNextMethod, name]);
-
-  // Handler: method started successfully
-  const handleMethodStarted = useCallback((method: StreamMethod) => {
-    console.log(`[CameraFeed] ${name}: Using ${METHOD_LABELS[method]}`);
-    setActiveMethod(method);
-  }, [name]);
-
-  // Focused camera gets higher FPS; gallery cameras get lower FPS
-  const snapshotPollInterval = isFocused ? 200 : 500;
-  const canvasFps = isFocused ? 15 : 5;
 
   /* ── Render only the active method ── */
   const renderMedia = () => {
@@ -171,14 +171,13 @@ export default function CameraFeed({
           />
         );
 
-
-
       case 'static':
         return (
           <img
             src={displaySrc!}
             alt={name}
             className="w-full h-full object-cover"
+            loading="lazy"
             onError={() => handleMethodFailed('static')}
           />
         );
@@ -202,12 +201,10 @@ export default function CameraFeed({
   };
 
   return (
-    <Card className="overflow-hidden">
+    <Card ref={containerRef} className="overflow-hidden">
       <div className="relative aspect-video bg-muted">
         {renderMedia()}
-        {/* DECOUPLED FIX: Separate Media Status from AI Status */}
         <div className="absolute top-2 left-2 flex items-start gap-1.5 p-1">
-          {/* Main Status Badge: Live Feed (Functional) */}
           <Badge
             variant={(mtxReachable && streamUrl) || displaySrc ? "default" : "destructive"}
             className={`${isFocused ? 'h-6 px-2.5 gap-1.5' : 'h-4 px-1.4 gap-1.4'} shadow-lg backdrop-blur-md opacity-95 transition-all`}
@@ -222,7 +219,6 @@ export default function CameraFeed({
             </span>
           </Badge>
 
-          {/* AI Sync Badge: Shown ONLY when camera is active and in sync */}
           {status === "active" && (
             <Badge
               variant="secondary"
@@ -240,7 +236,6 @@ export default function CameraFeed({
           </div>
         )}
 
-        {/* Stream Status: Only show 'Active Stream' when connected to avoid clutter during warming */}
         {health?.connected && (
           <div className="absolute bottom-2 left-2 flex items-center gap-1.5 bg-black/60 backdrop-blur-sm px-2 py-1 rounded-md border border-white/10">
             <div className={`${isFocused ? 'h-1.5 w-1.5' : 'h-1 w-1'} rounded-full bg-emerald-500`} />
@@ -249,7 +244,7 @@ export default function CameraFeed({
         )}
       </div>
       <div className={isFocused ? "p-3" : "p-2.5"}>
-        <h3 className={`font-semibold ${isFocused ? 'text-sm' : 'text-xs'} truncate`} data-testid={`text-camera-${name.toLowerCase().replace(/\s/g, '-')}`}>{name}</h3>
+        <h3 className={`font-semibold ${isFocused ? 'text-sm' : 'text-xs'} truncate`}>{name}</h3>
         <p className={`${isFocused ? 'text-xs' : 'text-[11px]'} text-muted-foreground truncate`}>{location}</p>
       </div>
     </Card>

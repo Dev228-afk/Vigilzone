@@ -163,8 +163,8 @@ class CameraProcessor:
         # Ingest
         self.reader = self._create_reader()
 
-        # Evidence ring buffer (15s — optimized overhead)
-        self.ringbuffer = FrameRingBuffer(self.camera_id, max_seconds=15.0, fps=10.0)
+        # Evidence ring buffer (5s — reduced for memory stability)
+        self.ringbuffer = FrameRingBuffer(self.camera_id, max_seconds=5.0, fps=10.0)
 
         # Lanes
         self.lanes = self._create_lanes()
@@ -794,12 +794,12 @@ class CCTVAIModule:
             return payload
 
         camera_cfg = getattr(proc, "camera_cfg", {}) or {}
-        if camera_cfg.get("tenant_id") not in (None, ""):
-            payload["tenant_id"] = camera_cfg.get("tenant_id")
-        if camera_cfg.get("source_type"):
-            payload["source_type"] = camera_cfg.get("source_type")
-        if camera_cfg.get("camera_name"):
-            payload["camera_name"] = camera_cfg.get("camera_name")
+        # Phase 1 WS1.1: Forward trusted business context from registration
+        for key in ("tenant_id", "community_id", "camera_name", "stream_path",
+                     "policy_version", "source_type"):
+            value = camera_cfg.get(key)
+            if value not in (None, ""):
+                payload[key] = value
         return payload
 
     def _register_dispatch_callbacks(self):

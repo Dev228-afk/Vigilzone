@@ -143,17 +143,26 @@ class IncidentRedisPublisher:
             "timestamp": alert.get("ts_utc") or alert.get("timestamp") or time.time(),
             "data": {
                 "id": event_id,
+                "event_type": "incident.detected.v1",
                 "camera_id": camera_id,
+                "camera_name": alert.get("camera_name", ""),
+                "stream_path": alert.get("stream_path", ""),
                 "type": alert.get("type", "other"),
                 "severity": alert.get("severity", 3),
                 "message": alert.get("message", ""),
                 "confidence": alert.get("confidence"),
                 "evidence": alert.get("evidence", {}),
                 "entity": alert.get("entity") or alert.get("identity"),
-                # Tenant hint (optional — backend resolves from camera if missing)
+                # Trusted business context from backend registration
                 "tenant_id": alert.get("tenant_id"),
+                "community_id": alert.get("community_id"),
+                "policy_version": alert.get("policy_version"),
                 # Pass through the full raw alert for backend enrichment
                 "source_type": alert.get("source_type"),
+                "trace": {
+                    "producer": "ai-service",
+                    "schema_version": 1,
+                },
             },
         }
 

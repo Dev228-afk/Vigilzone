@@ -326,46 +326,65 @@ def classify_camera_source(url: str) -> str:
     return "unknown"
 
 
-def build_mediamtx_path_payload(camera: Camera, path_name: str, source_kind: str) -> dict:
+def build_mediamtx_path_payload(camera: Camera, path_name: str, source_kind: str, persistent: bool = False) -> dict:
+    # ── Option 1: Native RTSP ──────────────────────────────────────────
     if source_kind in ("native", "hls"):
         payload = {
             "source": camera.rtsp_url,
-            "sourceOnDemand": True,
-            "sourceOnDemandStartTimeout": "20s",
-            "sourceOnDemandCloseAfter": "10s",
+            "sourceOnDemand": not persistent,
         }
+        if not persistent:
+            payload["sourceOnDemandStartTimeout"] = "30s"
+            payload["sourceOnDemandCloseAfter"] = "10s"
+        
         if source_kind == "native" and camera.rtsp_url.strip().lower().startswith("rtsp"):
             payload["rtspTransport"] = "tcp"
         if camera.source_fingerprint:
             payload["sourceFingerprint"] = camera.source_fingerprint
         return payload
+
+    # ── Option 2: MJPEG / Snapshot (FFmpeg Bridge) ─────────────────────
     elif source_kind in ("mjpeg", "snapshot"):
-        # We treat "snapshot" sources as potential video streams (sequential snapshots) 
-        # when provisioning a live path. ffmpeg is robust enough to ingest them.
         escaped_url = camera.rtsp_url.replace('"', '\\"')
         
-        ffmpeg_cmd = 'ffmpeg -nostdin -loglevel warning '
+        # Spec §4.2: We use AI_API_BASE to ensure cloud-readiness.
+        # Fallback to localhost:8080 for development.
+        ai_api_base = os.getenv("AI_API_BASE", "http://localhost:8080").rstrip("/")
+        input_url = escaped_url
+        if camera.ai_camera_id == "cam_live":
+            # Bridging from the new MJPEG stream endpoint
+            input_url = f"{ai_api_base}/stream/cam_live"
+
+        # Spec §4.3: Ultra-Light (360p @ 5FPS) with single thread to minimize system handles
+        ffmpeg_cmd = 'ffmpeg -nostdin -loglevel warning -threads 1 '
         if camera.rtsp_url.lower().startswith("https://"):
             ffmpeg_cmd += '-tls_verify 0 '
 
-        # DECOUPLED FIX: Remove '-f mjpeg' to allow ffmpeg to auto-detect input format.
-        # This matches how 'ffplay' handles sequential snapshot URLs like GetOneShot.
-        run_on_demand = (
+        command = (
             ffmpeg_cmd +
             f'-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 '
-            f'-i "{escaped_url}" '
-            f'-an -c:v libx264 -preset ultrafast -tune zerolatency '
-            f'-pix_fmt yuv420p -g 30 '
-            f'-f rtsp rtsp://127.0.0.1:8554/{path_name}'
+            f'-i "{input_url}" '
+            f'-an -vf "scale=\'min(640,iw)\':-2" '
+            f'-c:v libx264 -preset ultrafast -tune zerolatency -r 5 -b:v 400k '
+            f'-pix_fmt yuv420p -g 15 '
+            f'-f rtsp -rtsp_transport tcp rtsp://localhost:8554/{path_name}'
         )
-        return {
+
+        payload = {
             "source": "publisher",
-            "sourceOnDemand": False,
-            "runOnDemand": run_on_demand,
-            "runOnDemandRestart": True,
-            "runOnDemandStartTimeout": "20s",
-            "runOnDemandCloseAfter": "10s",
         }
+
+        # Transition to Persistent Ingestion (runOnInit) for "Instant-On"
+        if persistent:
+            payload["runOnInit"] = command
+            payload["runOnInitRestart"] = True
+        else:
+            payload["runOnDemand"] = command
+            payload["runOnDemandRestart"] = True
+            payload["runOnDemandStartTimeout"] = "30s"
+            payload["runOnDemandCloseAfter"] = "10s"
+            
+        return payload
     else:
         raise ValueError(f"Unsupported source kind '{source_kind}' for MediaMTX live provisioning.")
 
@@ -375,16 +394,31 @@ def _ensure_mediamtx_path(camera: Camera) -> tuple[str, str, str]:
     import requests as http_client
 
     path_name = _get_canonical_camera_id(camera)
-    if not camera.rtsp_url:
+    if not camera.rtsp_url and camera.ai_camera_id != "cam_live":
         raise ValueError(f"Camera '{camera.name}' has no rtsp_url; cannot provision MediaMTX.")
 
     api_base = _get_mediamtx_api_base()
     
-    source_kind = camera.source_kind or classify_camera_source(camera.rtsp_url)
-    payload = build_mediamtx_path_payload(camera, path_name, source_kind)
+    source_kind = camera.source_kind or classify_camera_source(camera.rtsp_url or "")
+    if camera.ai_camera_id == "cam_live":
+        source_kind = "mjpeg"
+    
+    # Make sure API is reachable with retries
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            info_resp = http_client.get(f"{api_base}/v3/config/global/get", timeout=5)
+            if info_resp.status_code == 200:
+                break
+        except Exception as exc:
+            if attempt == max_retries - 1:
+                raise exc
+            time.sleep(1.5 * (attempt + 1))
 
-    # Make sure API is reachable.
-    info_resp = http_client.get(f"{api_base}/v3/config/global/get", timeout=5)
+    # Selective Persistence: Only 'cam_live' and 'main' cameras are Always-On
+    is_essential = (camera.ai_camera_id == "cam_live" or "main" in camera.name.lower())
+    payload = build_mediamtx_path_payload(camera, path_name, source_kind, persistent=is_essential)
+
     info_resp.raise_for_status()
 
     # Check whether path exists.
@@ -413,6 +447,24 @@ def _ensure_mediamtx_path(camera: Camera) -> tuple[str, str, str]:
             f"Unexpected MediaMTX response while checking path '{path_name}': "
             f"{check_resp.status_code} {check_resp.text[:300]}"
         )
+
+def _remove_mediamtx_path(camera: Camera) -> bool:
+    """Explicitly remove a path from MediaMTX (cleanup after deletion)."""
+    import requests as http_client
+    api_base = _get_mediamtx_api_base()
+    path_name = _get_canonical_camera_id(camera)
+
+    try:
+        resp = http_client.delete(f"{api_base}/v3/config/paths/delete/{path_name}", timeout=5)
+        if resp.status_code == 200:
+            return True
+        elif resp.status_code == 404:
+            return True  # Already gone
+        return False
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("Failed to remove MediaMTX path %s: %s", path_name, exc)
+        return False
 
     verify_resp = http_client.get(f"{api_base}/v3/config/paths/get/{path_name}", timeout=5)
     verify_resp.raise_for_status()
@@ -449,6 +501,8 @@ def reconcile_all_cameras_to_mediamtx() -> Dict[str, object]:
 
     for camera in Camera.objects.exclude(rtsp_url__isnull=True).exclude(rtsp_url__exact=""):
         try:
+            # Staggered loop to prevent MediaMTX handle exhaustion on Windows
+            time.sleep(1.5)
             path_name, source_kind, provisioned_source = _ensure_mediamtx_path(camera)
             results.append({
                 "camera_id": camera.id,
@@ -469,6 +523,45 @@ def reconcile_all_cameras_to_mediamtx() -> Dict[str, object]:
                 "source": camera.rtsp_url,
             })
             failed += 1
+
+    # Final-touch: Ensure cam_live (Virtual Webcam) is provisioned if not caught above.
+    # IMPORTANT: cam_live is a shared hardware resource — only one record should exist
+    # globally, not one per tenant. Check if it already exists before creating.
+    try:
+        existing_cam_live = Camera.objects.filter(ai_camera_id="cam_live").first()
+        if not existing_cam_live:
+            # Create under the first tenant as fallback
+            default_tenant = Tenant.objects.first()
+            if default_tenant:
+                existing_cam_live = _ensure_tenant_webcam_camera(default_tenant)
+        
+        if existing_cam_live:
+            try:
+                path_name, source_kind, provisioned_source = _ensure_mediamtx_path(existing_cam_live)
+                results.append({
+                    "camera_id": existing_cam_live.id,
+                    "name": existing_cam_live.name,
+                    "path": path_name,
+                    "source_kind": source_kind,
+                    "provisioned_source": provisioned_source,
+                    "status": "ok",
+                    "source": "ai-bridge",
+                })
+                success += 1
+            except Exception as cam_exc:
+                results.append({
+                    "name": "Live Webcam",
+                    "status": "error",
+                    "error": str(cam_exc)
+                })
+                failed += 1
+    except Exception as exc:
+        results.append({
+            "name": "Global Reconciliation",
+            "status": "error",
+            "error": f"Webcam provisioning failed: {exc}"
+        })
+        failed += 1
 
     return {
         "total": success + failed,
@@ -576,13 +669,18 @@ class CameraViewSet(TenantScopedViewSet):
 
         payload = {
             "camera_id": stream_id,
+            "camera_name": camera.name,
             "rtsp_url": loopback_url,
+            "stream_path": stream_id,
             "ingest_backend": request.data.get("ingest_backend", "opencv"),
             "enabled_lanes": request.data.get(
                 "enabled_lanes",
                 camera.enabled_lanes if camera.enabled_lanes else ["rt_detr", "person_zone"],
             ),
             "sample_hz": request.data.get("sample_hz", 2.0),
+            "tenant_id": str(camera.tenant.id) if camera.tenant else None,
+            "community_id": str(camera.tenant.id) if camera.tenant else None,
+            "policy_version": 1,
         }
 
         try:
@@ -646,8 +744,13 @@ class CameraViewSet(TenantScopedViewSet):
         if enabled:
             sync_payload = {
                 "camera_id": cam_id,
+                "camera_name": camera.name,
                 "rtsp_url": _get_mediamtx_loopback_url(cam_id),
+                "stream_path": cam_id,
                 "enabled_lanes": camera.enabled_lanes if camera.enabled_lanes else ["rt_detr", "person_zone"],
+                "tenant_id": str(camera.tenant.id) if camera.tenant else None,
+                "community_id": str(camera.tenant.id) if camera.tenant else None,
+                "policy_version": 1,
             }
             try:
                 http_client.post(f"{ai_base}/api/v1/cameras/register", json=sync_payload, timeout=5)

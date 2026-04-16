@@ -320,7 +320,31 @@ class NotificationService:
         Creates Alert records for all members of the tenant using atomic bulk_create.
         Returns (count, user_to_alert_map).
         """
-        members = Membership.objects.filter(tenant=incident.tenant).select_related("user", "user__profile")
+        import json
+        from ai_integration.redis_queue import get_redis_client
+        redis_client = get_redis_client()
+        tenant_id_str = str(incident.tenant.id)
+        route_key = f"route:{tenant_id_str}:{tenant_id_str}:{incident.type}:{incident.severity}"
+        
+        target_user_ids = []
+        try:
+            cached_raw = redis_client.get(route_key)
+            if cached_raw:
+                target_user_ids = json.loads(cached_raw).get("push", [])
+                logger.info("Notification Route Cache HIT: %s (recipients=%d)", route_key, len(target_user_ids))
+            else:
+                logger.info("Notification Route Cache MISS: %s", route_key)
+                cached_raw = None
+        except Exception as exc:
+            logger.warning("Redis route projection error: %s", exc)
+            cached_raw = None
+
+        if not cached_raw:
+            # Fallback: scan Postgres
+            members = Membership.objects.filter(tenant=incident.tenant).select_related("user", "user__profile")
+            for member in members:
+                if member.user.profile.allows_instant_notification(incident.severity):
+                    target_user_ids.append(str(member.user.id))
         
         alerts_to_create = []
         user_to_alert_map = {}
@@ -329,12 +353,7 @@ class NotificationService:
         existing_alerts = Alert.objects.filter(incident=incident).values_list("user_id", "id")
         existing_alert_map = {str(uid): str(aid) for uid, aid in existing_alerts if uid is not None}
         
-        for member in members:
-            # Check preferences
-            if not member.user.profile.allows_instant_notification(incident.severity):
-                continue
-
-            user_id_str = str(member.user.id)
+        for user_id_str in target_user_ids:
             if user_id_str in existing_alert_map:
                 user_to_alert_map[user_id_str] = existing_alert_map[user_id_str]
                 continue
@@ -343,7 +362,7 @@ class NotificationService:
             alert = Alert(
                 id=alert_id,
                 incident=incident,
-                user=member.user,
+                user_id=user_id_str,
                 channel="websocket",
                 payload={
                     "title": notification["title"],

@@ -126,7 +126,6 @@ export default function Incidents() {
         <Table>
           <TableHeader>
             <TableRow>
-              <TableHead>ID</TableHead>
               <TableHead>Type</TableHead>
               <TableHead>Camera</TableHead>
               <TableHead>Status</TableHead>
@@ -171,7 +170,6 @@ export default function Incidents() {
             )}
             {incidents.map((incident) => (
               <TableRow key={incident.id} className="cursor-pointer hover-elevate" onClick={() => setLocation(`/incidents/${incident.id}`)}>
-                <TableCell className="font-medium" data-testid={`text-incident-${incident.id}`}>#{incident.id}</TableCell>
                 <TableCell className="capitalize">{incident.type}</TableCell>
                 <TableCell>
                   <div className="flex items-center gap-2">

@@ -173,7 +173,7 @@ export default function IncidentDetails() {
     <div className="p-6 max-w-6xl mx-auto space-y-6">
       <div className="flex items-center gap-3">
         <h1 className="text-2xl font-bold" data-testid="text-incident-title">
-          Incident #{inc.id} — {inc.type.charAt(0).toUpperCase() + inc.type.slice(1)} Detected
+          {inc.type.charAt(0).toUpperCase() + inc.type.slice(1)} Detected
         </h1>
         <Badge variant={STATUS_BADGE[inc.status] ?? "default"} className="capitalize text-sm">
           {inc.status}

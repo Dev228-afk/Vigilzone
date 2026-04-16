@@ -13,6 +13,9 @@ from server.redis_runtime import (
 
 SUBSCRIBER_HEARTBEAT_TTL_SECONDS = 30
 
+# Module-level singleton for callers that need a shared client
+_redis_client_singleton = None
+
 
 def create_redis_client(settings=None):
     import redis
@@ -37,6 +40,18 @@ def create_redis_client(settings=None):
         socket_timeout=10,
         retry_on_timeout=True,
     )
+
+
+def get_redis_client():
+    """Return a module-level cached Redis client singleton.
+
+    Used by notification_service and route projection generator
+    where creating a new connection per call is wasteful.
+    """
+    global _redis_client_singleton
+    if _redis_client_singleton is None:
+        _redis_client_singleton = create_redis_client()
+    return _redis_client_singleton
 
 
 def ensure_incident_consumer_group(client, settings) -> None:
@@ -119,10 +134,15 @@ def build_test_incident_event(
     *,
     camera_id: str,
     tenant_id: Optional[int] = None,
+    community_id: Optional[int] = None,
+    camera_name: str = "",
+    stream_path: str = "",
     incident_type: str = "intrusion",
     severity: int = 4,
     source_type: str = "synthetic_test",
+    policy_version: int = 1,
 ) -> Dict[str, Any]:
+    """Build a canonical Phase 1 incident event envelope for testing."""
     event_id = f"test-{camera_id}-{uuid.uuid4().hex[:12]}"
     now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     return {
@@ -130,17 +150,26 @@ def build_test_incident_event(
         "timestamp": now,
         "data": {
             "id": event_id,
+            "event_type": "incident.detected.v1",
             "camera_id": camera_id,
+            "camera_name": camera_name or camera_id,
+            "stream_path": stream_path or camera_id,
             "type": incident_type,
             "severity": severity,
             "timestamp": now,
             "message": f"Synthetic {incident_type} incident for pipeline verification",
             "confidence": 0.99,
             "tenant_id": tenant_id,
+            "community_id": community_id or tenant_id,
             "source_type": source_type,
+            "policy_version": policy_version,
             "evidence": {
                 "keyframe_path": "",
                 "clip_path": "",
+            },
+            "trace": {
+                "producer": "test-harness",
+                "schema_version": 1,
             },
         },
     }

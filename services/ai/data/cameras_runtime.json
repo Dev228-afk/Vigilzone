@@ -82,12 +82,11 @@
     "ingest_backend": "opencv",
     "enabled_lanes": [
       "rt_detr",
-      "yolov8_fallback",
-      "fire_smoke_yolo",
-      "person_zone"
+      "person_zone",
+      "fire_smoke_yolo"
     ],
     "sample_hz": 2.0,
-    "registered_at": 1775602996.682986
+    "registered_at": 1776052022.5211067
   },
   "entrance": {
     "camera_id": "entrance",

@@ -213,28 +213,40 @@ class AlertServer:
             proc.camera_cfg.update(clean_metadata)
 
         ctx = self._app_context if isinstance(self._app_context, dict) else {}
-        camera_configs = ctx.get("camera_configs", [])
-        if isinstance(camera_configs, list):
-            for cfg in camera_configs:
-                if str(cfg.get("camera_id", "")).strip() == camera_id:
-                    cfg.update(clean_metadata)
-                    break
+        camera_configs_by_id = ctx.get("camera_configs_by_id", {})
+        if camera_id in camera_configs_by_id:
+            camera_configs_by_id[camera_id].update(clean_metadata)
 
         runtime_file = Path("data/cameras_runtime.json")
         runtime_file.parent.mkdir(parents=True, exist_ok=True)
-        runtime_cameras: Dict[str, Any] = {}
-        if runtime_file.exists():
-            try:
-                runtime_cameras = json.loads(runtime_file.read_text())
-            except Exception:
-                runtime_cameras = {}
-        existing_cfg = runtime_cameras.get(camera_id, {"camera_id": camera_id})
-        if isinstance(existing_cfg, dict):
-            existing_cfg.update(clean_metadata)
-            runtime_cameras[camera_id] = existing_cfg
-            runtime_file.write_text(json.dumps(runtime_cameras, indent=2))
+        lock_file = runtime_file.with_suffix(".json.lock")
+        
+        import filelock
+        success = False
+        try:
+            with filelock.FileLock(str(lock_file), timeout=5.0):
+                runtime_cameras: Dict[str, Any] = {}
+                if runtime_file.exists():
+                    try:
+                        runtime_cameras = json.loads(runtime_file.read_text())
+                    except Exception as e:
+                        self.logger.error("JSON load failure on %s: %s. Overwriting with new data.", runtime_file, e)
+                        runtime_cameras = {}
+                
+                existing_cfg = runtime_cameras.get(camera_id, {"camera_id": camera_id})
+                if isinstance(existing_cfg, dict):
+                    existing_cfg.update(clean_metadata)
+                    runtime_cameras[camera_id] = existing_cfg
+                    
+                    tmp_file = runtime_file.with_suffix(".json.tmp")
+                    tmp_file.write_text(json.dumps(runtime_cameras, indent=2))
+                    import os
+                    os.replace(tmp_file, runtime_file)
+                    success = True
+        except Exception as e:
+            self.logger.error("Failed to update runtime file: %s", e)
 
-        return clean_metadata
+        return {"metadata": clean_metadata, "success": success}
 
     @staticmethod
     def _parse_runtime_control_payload(payload: Any) -> tuple[bool, Dict[str, Any]]:
@@ -1328,18 +1340,22 @@ class AlertServer:
             # If enabling, we need a config.
             cfg = None
             # 1. Try in-memory app context
-            camera_configs = self._app_context.get("camera_configs", []) if isinstance(self._app_context, dict) else []
-            cfg = next((c for c in camera_configs if str(c.get("camera_id", "")) == camera_id), None)
+            camera_configs_by_id = self._app_context.get("camera_configs_by_id", {}) if isinstance(self._app_context, dict) else {}
+            if isinstance(camera_configs_by_id, dict):
+                cfg = camera_configs_by_id.get(camera_id)
 
             # 2. Try persistent runtime storage (Phase 4)
             if not cfg:
                 runtime_file = Path("data/cameras_runtime.json")
+                lock_file = runtime_file.with_suffix(".json.lock")
+                import filelock
                 if runtime_file.exists():
                     try:
-                        runtime_cameras = json.loads(runtime_file.read_text())
-                        cfg = runtime_cameras.get(camera_id)
-                    except Exception:
-                        pass
+                        with filelock.FileLock(str(lock_file), timeout=5.0):
+                            runtime_cameras = json.loads(runtime_file.read_text())
+                            cfg = runtime_cameras.get(camera_id)
+                    except Exception as e:
+                        self.logger.error("JSON load failure on %s: %s", runtime_file, e)
 
             if not cfg:
                 return JSONResponse(
@@ -1353,12 +1369,57 @@ class AlertServer:
                     status_code=500,
                     content={"error": f"Failed to start camera '{camera_id}'"},
                 )
-            return {
-                "camera_id": camera_id,
-                "running": True,
-                "changed": True,
-                "metadata_applied": self._update_runtime_camera_metadata(camera_id, runtime_metadata),
-            }
+ 
+        @self.app.get("/stream/{camera_id}")
+        async def stream_camera(camera_id: str):
+            """Stream MJPEG frames for a camera.
+            
+            This is used by MediaMTX to ingest the AI processed feed reliably
+            over a long-lived connection.
+            """
+            # Verify camera exists
+            proc_found = any(p.camera_id == camera_id for p in self._camera_processors)
+            if not proc_found:
+                return JSONResponse(status_code=404, content={"error": f"Camera '{camera_id}' not found"})
+
+            async def frame_generator():
+                last_ts = None
+                while True:
+                    if self._frame_store is None:
+                        await asyncio.sleep(0.5)
+                        continue
+                    
+                    frame, ts = self._frame_store.get(camera_id)
+                    if frame is None or ts == last_ts:
+                        # Wait for a fresh frame (AI module target is ~10fps)
+                        await asyncio.sleep(0.05)
+                        continue
+                    
+                    last_ts = ts
+
+                    # Ultra-Light (360p) Optimization: 640px wide
+                    h, w = frame.shape[:2]
+                    target_w = 640
+                    if w > target_w:
+                        scale = target_w / w
+                        frame = cv2.resize(frame, (target_w, int(h * scale)), interpolation=cv2.INTER_AREA)
+
+                    # Encode at medium quality for the stream
+                    _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                    yield (
+                        b'--frame\r\n'
+                        b'Content-Type: image/jpeg\r\n\r\n' + buf.tobytes() + b'\r\n'
+                    )
+
+            return StreamingResponse(
+                frame_generator(),
+                media_type="multipart/x-mixed-replace; boundary=frame",
+                headers={
+                    "Cache-Control": "no-store",
+                    "X-Stream-Source": "ai-detection-feed",
+                }
+            )
+
 
         @self.app.post("/api/v1/cameras/register")
         async def api_register_camera(
@@ -1370,6 +1431,11 @@ class AlertServer:
                 description="Detection lanes to enable",
             ),
             sample_hz: float = Body(2.0, description="Frame sample rate"),
+            tenant_id: Optional[str] = Body(None, description="Tenant ID"),
+            community_id: Optional[str] = Body(None, description="Community ID"),
+            camera_name: Optional[str] = Body(None, description="Nice camera name"),
+            stream_path: Optional[str] = Body(None, description="MediaMTX stream path"),
+            policy_version: Optional[int] = Body(None, description="Routing policy version"),
         ):
             """
             Register or Update a runtime camera.
@@ -1400,21 +1466,41 @@ class AlertServer:
             # 3. Update persistent storage
             runtime_file = Path("data/cameras_runtime.json")
             runtime_file.parent.mkdir(parents=True, exist_ok=True)
-            runtime_cameras = {}
-            if runtime_file.exists():
-                try:
-                    runtime_cameras = json.loads(runtime_file.read_text())
-                except Exception: pass
+            lock_file = runtime_file.with_suffix(".json.lock")
             
-            runtime_cameras[camera_id] = {
-                "camera_id": camera_id,
-                "rtsp_url": rtsp_url,
-                "ingest_backend": ingest_backend,
-                "enabled_lanes": enabled_lanes,
-                "sample_hz": sample_hz,
-                "registered_at": time.time(),
-            }
-            runtime_file.write_text(json.dumps(runtime_cameras, indent=2))
+            import filelock
+            storage_updated = False
+            try:
+                with filelock.FileLock(str(lock_file), timeout=5.0):
+                    runtime_cameras: Dict[str, Any] = {}
+                    if runtime_file.exists():
+                        try:
+                            runtime_cameras = json.loads(runtime_file.read_text())
+                        except Exception as e:
+                            self.logger.error("JSON load failure on %s: %s", runtime_file, e)
+                            runtime_cameras = {}
+                    
+                    runtime_cameras[camera_id] = {
+                        "camera_id": camera_id,
+                        "rtsp_url": rtsp_url,
+                        "ingest_backend": ingest_backend,
+                        "enabled_lanes": enabled_lanes,
+                        "sample_hz": sample_hz,
+                        "registered_at": time.time(),
+                        "tenant_id": tenant_id,
+                        "community_id": community_id,
+                        "camera_name": camera_name,
+                        "stream_path": stream_path,
+                        "policy_version": policy_version,
+                    }
+                    
+                    tmp_file = runtime_file.with_suffix(".json.tmp")
+                    tmp_file.write_text(json.dumps(runtime_cameras, indent=2))
+                    import os
+                    os.replace(tmp_file, runtime_file)
+                    storage_updated = True
+            except Exception as e:
+                self.logger.error("Failed to update runtime file during registration: %s", e)
 
             # 4. Start/Restart processor
             cam_cfg = {
@@ -1424,7 +1510,19 @@ class AlertServer:
                 "enabled_lanes": enabled_lanes,
                 "sample_hz": sample_hz,
                 "source_type": "rtsp" if rtsp_url else "live_camera",
+                "tenant_id": tenant_id,
+                "community_id": community_id,
+                "camera_name": camera_name,
+                "stream_path": stream_path,
+                "policy_version": policy_version,
             }
+            
+            # 5. In-memory config map update (if applicable, ensuring we keep camera_configs matching)
+            ctx = self._app_context if isinstance(self._app_context, dict) else {}
+            camera_configs_by_id = ctx.get("camera_configs_by_id")
+            if isinstance(camera_configs_by_id, dict):
+                camera_configs_by_id[camera_id] = cam_cfg
+                
             hot_loaded = self._start_camera_processor(cam_cfg)
 
             return {
@@ -1432,6 +1530,7 @@ class AlertServer:
                 "camera_id": camera_id,
                 "rtsp_url": rtsp_url,
                 "hot_loaded": hot_loaded,
+                "storage_updated": storage_updated,
                 "message": f"Camera {camera_id} {'updated and restarted' if config_changed else 'registered and started'}.",
             }
 

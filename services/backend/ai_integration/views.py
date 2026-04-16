@@ -75,10 +75,15 @@ def _set_camera_runtime(camera: Camera, enabled: bool) -> dict:
         stream_id = provisioned_stream_id
         register_payload = {
             "camera_id": stream_id,
+            "camera_name": camera.name,
             "rtsp_url": _get_mediamtx_loopback_url(stream_id),
+            "stream_path": stream_id,
             "ingest_backend": "opencv",
             "enabled_lanes": ["rt_detr", "yolov8_fallback", "fire_smoke_yolo", "person_zone"],
             "sample_hz": 2.0,
+            "tenant_id": str(camera.tenant.id) if camera.tenant else None,
+            "community_id": str(camera.tenant.id) if camera.tenant else None,
+            "policy_version": 1,
         }
         register_resp = http_client.post(
             f"{ai_base}/api/v1/cameras/register",

@@ -1,9 +1,33 @@
-from django.db.models.signals import post_save
+from django.db.models.signals import post_save, post_delete
 from django.dispatch import receiver
 from django.contrib.auth import get_user_model
-from .models import Profile, Incident
+from django.db import models
+from .models import Profile, Incident, Camera, Membership, NotificationChannel
 
 User = get_user_model()
+
+def trigger_route_projection_generation():
+    from django.db import transaction
+    import threading
+    from django.core.management import call_command
+    
+    def _generate():
+        try:
+            call_command("generate_route_projection")
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("Failed to generate routes: %s", exc)
+
+    transaction.on_commit(lambda: threading.Thread(target=_generate, daemon=True).start())
+
+@receiver(post_save, sender=Membership)
+@receiver(post_delete, sender=Membership)
+@receiver(post_save, sender=Profile)
+@receiver(post_save, sender=NotificationChannel)
+@receiver(post_delete, sender=NotificationChannel)
+def sync_routing_projections_on_change(sender, instance, **kwargs):
+    trigger_route_projection_generation()
+
 
 
 @receiver(post_save, sender=User)
@@ -51,3 +75,38 @@ def broadcast_incident_notification(sender, instance, created, **kwargs):
                 )
 
         transaction.on_commit(_broadcast)
+
+
+@receiver(post_save, sender=Camera)
+def sync_camera_to_mediamtx(sender, instance, **kwargs):
+    """
+    Automate reconciliation when a camera is saved.
+    Uses a thread to avoid blocking the Django request lifecycle.
+    """
+    from django.db import transaction
+    import threading
+
+    def _sync():
+        try:
+            from .views import _ensure_mediamtx_path
+            _ensure_mediamtx_path(instance)
+        except Exception:
+            pass # Logging is handled inside _ensure_mediamtx_path
+
+    transaction.on_commit(lambda: threading.Thread(target=_sync, daemon=True).start())
+    trigger_route_projection_generation()
+
+@receiver(post_delete, sender=Camera)
+def delete_camera_from_mediamtx(sender, instance, **kwargs):
+    """Cleanup MediaMTX when a camera record is removed."""
+    import threading
+
+    def _remove():
+        try:
+            from .views import _remove_mediamtx_path
+            _remove_mediamtx_path(instance)
+        except Exception:
+            pass
+
+    threading.Thread(target=_remove, daemon=True).start()
+    trigger_route_projection_generation()
