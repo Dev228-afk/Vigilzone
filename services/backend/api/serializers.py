@@ -59,6 +59,7 @@ class CameraSafeSerializer(serializers.ModelSerializer):
             "ai_camera_id", "stream_path",
             "min_confidence", "min_bbox_area", "k_of_n_k", "k_of_n_n", "cooldown_s",
             "enabled_lanes",
+            "entity_detection_enabled",
             "created_at", "updated_at", "tenant",
         ]
         read_only_fields = ["created_at", "updated_at", "tenant"]
@@ -96,7 +97,7 @@ class CameraWriteSerializer(serializers.ModelSerializer):
         fields = [
             "id", "name", "site", "rtsp_url", "ai_camera_id", "stream_path", "status",
             "camera_type", "source_type", "min_confidence", "min_bbox_area",
-            "k_of_n_k", "k_of_n_n", "cooldown_s", "enabled_lanes",
+            "k_of_n_k", "k_of_n_n", "cooldown_s", "enabled_lanes", "entity_detection_enabled",
             "created_at", "updated_at", "tenant",
             # legacy aliases
             "location", "streamUrl",
@@ -215,12 +216,32 @@ class KnownEntitySerializer(serializers.ModelSerializer):
     class Meta:
         model = KnownEntity
         fields = [
-            "id", "name", "category", "group", "notes",
+            "id", "name", "status", "detection_enabled", "category", "group", "notes",
+            "processing_error", "processing_started_at", "processing_completed_at", "ready_at",
+            "embedding_version", "entity_detection_notes", "deleted_at",
             "camera_ids", "cameras",
             "ai_entity_id", "thumbnail_url", "last_seen", "last_camera_id",
+            "created_by", "updated_by",
             "created_at", "updated_at", "tenant",
         ]
-        read_only_fields = ["id", "ai_entity_id", "thumbnail_url", "last_seen", "created_at", "updated_at", "tenant"]
+        read_only_fields = [
+            "id",
+            "status",
+            "processing_error",
+            "processing_started_at",
+            "processing_completed_at",
+            "ready_at",
+            "embedding_version",
+            "deleted_at",
+            "ai_entity_id",
+            "thumbnail_url",
+            "last_seen",
+            "created_by",
+            "updated_by",
+            "created_at",
+            "updated_at",
+            "tenant",
+        ]
 
     def get_cameras(self, obj):
         return [
@@ -245,6 +266,16 @@ class KnownEntitySerializer(serializers.ModelSerializer):
                 f"Cameras not in current tenant: {invalid}"
             )
         return value
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        if attrs.get("detection_enabled") is True:
+            status_value = self.instance.status if self.instance is not None else KnownEntity.Status.PENDING
+            if status_value != KnownEntity.Status.READY:
+                raise serializers.ValidationError(
+                    {"detection_enabled": "Detection can be enabled only when entity status is READY."}
+                )
+        return attrs
 
 
 class InvitationCreateSerializer(serializers.ModelSerializer):

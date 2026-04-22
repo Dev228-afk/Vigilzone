@@ -43,3 +43,12 @@ alerts/
 
 # Database files
 data/*.db
+
+# Local Tool Metadata & Context
+.agent/
+context.md
+graphify-out/
+
+# Service Logs
+*.log
+web/ui/client/build.log

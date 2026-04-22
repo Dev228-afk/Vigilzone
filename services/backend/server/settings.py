@@ -20,7 +20,8 @@ from server.redis_runtime import resolve_backend_redis_settings
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
-load_dotenv(BASE_DIR / ".env", override=True)
+# Keep shell/host environment authoritative and only fill missing values from .env.
+load_dotenv(BASE_DIR / ".env", override=False)
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
 
@@ -122,28 +123,20 @@ ASGI_APPLICATION = "server.asgi.application"
 # Database
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
+if not DATABASE_URL:
+    raise ImproperlyConfigured(
+        "DATABASE_URL is required. SQLite fallback has been removed to enforce PostgreSQL as canonical truth."
+    )
 
-if DATABASE_URL:
-    # CLOUD MODE: Connect to PostgreSQL (or whatever the URL specifies)
-    DATABASES = {
-        "default": dj_database_url.parse(
-            DATABASE_URL, 
-            conn_max_age=600,  # Vital for cloud: pools connections to reduce latency
-            conn_health_checks=True,
-        )
-    }
-else:
-    # LOCAL DEV MODE: Fallback to SQLite so local development works seamlessly
-    DATABASES = {
-        "default": {
-            "ENGINE": "django.db.backends.sqlite3",
-            "NAME": BASE_DIR / "db.sqlite3",
-            "OPTIONS": {
-                "timeout": 30,  # Vital for concurrent AI ingestion on SQLite
-            }
-        }
-    }
+# Postgres-only mode: use DATABASE_URL in all environments.
+DATABASES = {
+    "default": dj_database_url.parse(
+        DATABASE_URL,
+        conn_max_age=600,  # pools connections to reduce reconnect churn
+        conn_health_checks=True,
+    )
+}
 
 
 # DRF base config 
@@ -215,24 +208,13 @@ CORS_ALLOW_HEADERS = list(default_headers) + [
 
 STATIC_URL = "static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
+MEDIA_URL = "/media/"
+MEDIA_ROOT = BASE_DIR / "media"
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
-
-# ── VigilZone feature flags ──────────────────────────────────
-# Disabled by default to allow new users to select from pending community invites.
-AUTO_CREATE_TENANT_ON_REGISTER = bool(
-    int(os.getenv("AUTO_CREATE_TENANT_ON_REGISTER", "0"))
-)
-
-# If a user logs in with zero tenant memberships (e.g., created via admin/import),
-# create a personal community on first login to avoid a demo-killing dead-end.
-# Disabled by default to allow new users to select from pending community invites.
-AUTO_CREATE_TENANT_ON_FIRST_LOGIN = bool(
-    int(os.getenv("AUTO_CREATE_TENANT_ON_FIRST_LOGIN", "0"))
-)
 
 # ── Email (§4 Notifications) ──────────────────────────────────
 # Dev: console backend (prints emails to stdout).

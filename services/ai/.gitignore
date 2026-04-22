@@ -61,7 +61,6 @@ Thumbs.db
 data/entities.db
 data/entities.db-shm
 data/entities.db-wal
-data/webhooks.json
 data/embeddings/*
 data/enroll_images/*
 data/staging_uploads/*

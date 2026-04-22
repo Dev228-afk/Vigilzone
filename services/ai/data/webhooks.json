@@ -1,0 +1,402 @@
+{
+  "wh_d7043cda1b7a": {
+    "id": "wh_d7043cda1b7a",
+    "url": "http://localhost:8085/api/ai/webhook/receive/",
+    "events": [
+      "alert.created"
+    ],
+    "secret": null,
+    "metadata": {},
+    "created_at": 1776554031.4131613,
+    "active": true,
+    "delivery_stats": {
+      "failure": 1,
+      "success": 0,
+      "last_status": "All connection attempts failed"
+    }
+  },
+  "wh_1891748ced18": {
+    "id": "wh_1891748ced18",
+    "url": "http://localhost:8085/api/ai/webhook/receive/",
+    "events": [
+      "alert.created"
+    ],
+    "secret": null,
+    "metadata": {},
+    "created_at": 1776554031.4131613,
+    "active": true,
+    "delivery_stats": {
+      "failure": 2,
+      "success": 0,
+      "last_status": "All connection attempts failed"
+    }
+  },
+  "wh_84a7c4696b13": {
+    "id": "wh_84a7c4696b13",
+    "url": "http://localhost:8085/api/ai/webhook/receive/",
+    "events": [
+      "alert.created"
+    ],
+    "secret": null,
+    "metadata": {},
+    "created_at": 1776554031.4131613,
+    "active": true,
+    "delivery_stats": {
+      "failure": 2,
+      "success": 0,
+      "last_status": "All connection attempts failed"
+    }
+  },
+  "wh_1a148b9f6b0e": {
+    "id": "wh_1a148b9f6b0e",
+    "url": "http://localhost:8085/api/ai/webhook/receive/",
+    "events": [
+      "alert.created"
+    ],
+    "secret": null,
+    "metadata": {},
+    "created_at": 1776554031.4131613,
+    "active": true,
+    "delivery_stats": {
+      "failure": 5,
+      "success": 0,
+      "last_status": "All connection attempts failed"
+    }
+  },
+  "wh_f6da852acab0": {
+    "id": "wh_f6da852acab0",
+    "url": "http://localhost:8085/api/ai/webhook/receive/",
+    "events": [
+      "alert.created"
+    ],
+    "secret": null,
+    "metadata": {},
+    "created_at": 1776554031.4131613,
+    "active": true,
+    "delivery_stats": {
+      "failure": 9,
+      "success": 0,
+      "last_status": "All connection attempts failed"
+    }
+  },
+  "wh_8486ac244564": {
+    "id": "wh_8486ac244564",
+    "url": "http://localhost:8085/api/ai/webhook/receive/",
+    "events": [
+      "alert.created"
+    ],
+    "secret": null,
+    "metadata": {},
+    "created_at": 1776554031.4131613,
+    "active": true,
+    "delivery_stats": {
+      "failure": 9,
+      "success": 0,
+      "last_status": "All connection attempts failed"
+    }
+  },
+  "wh_15c9f11806e5": {
+    "id": "wh_15c9f11806e5",
+    "url": "http://localhost:8085/api/ai/webhook/receive/",
+    "events": [
+      "alert.created"
+    ],
+    "secret": null,
+    "metadata": {},
+    "created_at": 1776554031.4131613,
+    "active": true,
+    "delivery_stats": {
+      "failure": 39,
+      "success": 0,
+      "last_status": "All connection attempts failed"
+    }
+  },
+  "wh_0264904797fb": {
+    "id": "wh_0264904797fb",
+    "url": "http://localhost:8085/api/ai/webhook/receive/",
+    "events": [
+      "alert.created"
+    ],
+    "secret": null,
+    "metadata": {},
+    "created_at": 1776554031.4131613,
+    "active": true,
+    "delivery_stats": {
+      "failure": 39,
+      "success": 0,
+      "last_status": "All connection attempts failed"
+    }
+  },
+  "wh_094e48dd3de4": {
+    "id": "wh_094e48dd3de4",
+    "url": "http://localhost:8085/api/ai/webhook/receive/",
+    "events": [
+      "alert.created"
+    ],
+    "secret": null,
+    "metadata": {},
+    "created_at": 1776554031.4131613,
+    "active": true,
+    "delivery_stats": {
+      "failure": 39,
+      "success": 0,
+      "last_status": "All connection attempts failed"
+    }
+  },
+  "wh_5cea19a8ed25": {
+    "id": "wh_5cea19a8ed25",
+    "url": "http://localhost:8085/api/ai/webhook/receive/",
+    "events": [
+      "alert.created"
+    ],
+    "secret": null,
+    "metadata": {},
+    "created_at": 1776554031.4131613,
+    "active": true,
+    "delivery_stats": {
+      "failure": 39,
+      "success": 0,
+      "last_status": "All connection attempts failed"
+    }
+  },
+  "wh_d5b71d30cd8e": {
+    "id": "wh_d5b71d30cd8e",
+    "url": "http://localhost:8085/api/ai/webhook/receive/",
+    "events": [
+      "alert.created"
+    ],
+    "secret": null,
+    "metadata": {},
+    "created_at": 1776554031.4131613,
+    "active": true,
+    "delivery_stats": {
+      "failure": 39,
+      "success": 0,
+      "last_status": "All connection attempts failed"
+    }
+  },
+  "wh_36c374e8d581": {
+    "id": "wh_36c374e8d581",
+    "url": "http://localhost:8085/api/ai/webhook/receive/",
+    "events": [
+      "alert.created"
+    ],
+    "secret": null,
+    "metadata": {},
+    "created_at": 1776554031.4131613,
+    "active": true,
+    "delivery_stats": {
+      "failure": 39,
+      "success": 0,
+      "last_status": "All connection attempts failed"
+    }
+  },
+  "wh_c063464f4098": {
+    "id": "wh_c063464f4098",
+    "url": "http://127.0.0.1:8000/api/ai/webhook/receive/",
+    "events": [
+      "alert.created"
+    ],
+    "secret": null,
+    "metadata": {},
+    "created_at": 1776554031.4131613,
+    "active": true,
+    "delivery_stats": {
+      "failure": 16,
+      "success": 23,
+      "last_status": ""
+    }
+  },
+  "wh_6ba1872ba1ab": {
+    "id": "wh_6ba1872ba1ab",
+    "url": "http://127.0.0.1:8000/api/ai/webhook/receive/",
+    "events": [
+      "alert.created"
+    ],
+    "secret": null,
+    "metadata": {},
+    "created_at": 1776554031.4131613,
+    "active": true,
+    "delivery_stats": {
+      "failure": 17,
+      "success": 22,
+      "last_status": ""
+    }
+  },
+  "wh_6ca9a497b136": {
+    "id": "wh_6ca9a497b136",
+    "url": "http://127.0.0.1:8000/api/ai/webhook/receive/",
+    "events": [
+      "alert.created"
+    ],
+    "secret": null,
+    "metadata": {},
+    "created_at": 1776554031.4131613,
+    "active": true,
+    "delivery_stats": {
+      "failure": 22,
+      "success": 17,
+      "last_status": ""
+    }
+  },
+  "wh_550b09e4db7a": {
+    "id": "wh_550b09e4db7a",
+    "url": "http://127.0.0.1:8000/api/ai/webhook/receive/",
+    "events": [
+      "alert.created"
+    ],
+    "secret": null,
+    "metadata": {},
+    "created_at": 1776554031.4131613,
+    "active": true,
+    "delivery_stats": {
+      "failure": 22,
+      "success": 17,
+      "last_status": ""
+    }
+  },
+  "wh_4812dd12078d": {
+    "id": "wh_4812dd12078d",
+    "url": "http://127.0.0.1:8000/api/ai/webhook/receive/",
+    "events": [
+      "alert.created"
+    ],
+    "secret": null,
+    "metadata": {},
+    "created_at": 1776554031.4131613,
+    "active": true,
+    "delivery_stats": {
+      "failure": 21,
+      "success": 18,
+      "last_status": ""
+    }
+  },
+  "wh_5ee1105a31ed": {
+    "id": "wh_5ee1105a31ed",
+    "url": "http://127.0.0.1:8000/api/ai/webhook/receive/",
+    "events": [
+      "alert.created"
+    ],
+    "secret": null,
+    "metadata": {},
+    "created_at": 1776554031.4131613,
+    "active": true,
+    "delivery_stats": {
+      "failure": 22,
+      "success": 17,
+      "last_status": ""
+    }
+  },
+  "wh_305a9dc9c2f2": {
+    "id": "wh_305a9dc9c2f2",
+    "url": "http://127.0.0.1:8000/api/ai/webhook/receive/",
+    "events": [
+      "alert.created"
+    ],
+    "secret": null,
+    "metadata": {},
+    "created_at": 1776554031.4131613,
+    "active": true,
+    "delivery_stats": {
+      "failure": 14,
+      "success": 25,
+      "last_status": ""
+    }
+  },
+  "wh_fa9d338acd1e": {
+    "id": "wh_fa9d338acd1e",
+    "url": "http://127.0.0.1:8000/api/ai/webhook/receive/",
+    "events": [
+      "alert.created"
+    ],
+    "secret": null,
+    "metadata": {},
+    "created_at": 1776554031.4131613,
+    "active": true,
+    "delivery_stats": {
+      "failure": 17,
+      "success": 22,
+      "last_status": ""
+    }
+  },
+  "wh_d8b6d9a03dab": {
+    "id": "wh_d8b6d9a03dab",
+    "url": "http://127.0.0.1:8000/api/ai/webhook/receive/",
+    "events": [
+      "alert.created"
+    ],
+    "secret": null,
+    "metadata": {},
+    "created_at": 1776554031.4131613,
+    "active": true,
+    "delivery_stats": {
+      "failure": 22,
+      "success": 17,
+      "last_status": ""
+    }
+  },
+  "wh_8fc36f2e71ef": {
+    "id": "wh_8fc36f2e71ef",
+    "url": "http://localhost:8085/api/ai/webhook/receive/",
+    "events": [
+      "alert.created"
+    ],
+    "secret": null,
+    "metadata": {},
+    "created_at": 1776554031.4131613,
+    "active": true,
+    "delivery_stats": {
+      "failure": 39,
+      "success": 0,
+      "last_status": "All connection attempts failed"
+    }
+  },
+  "wh_d124df126c1b": {
+    "id": "wh_d124df126c1b",
+    "url": "http://127.0.0.1:8000/api/ai/webhook/receive/",
+    "events": [
+      "alert.created"
+    ],
+    "secret": null,
+    "metadata": {},
+    "created_at": 1776554031.4131613,
+    "active": true,
+    "delivery_stats": {
+      "failure": 21,
+      "success": 18,
+      "last_status": ""
+    }
+  },
+  "wh_bc0cd97abfb5": {
+    "id": "wh_bc0cd97abfb5",
+    "url": "http://127.0.0.1:8000/api/ai/webhook/receive/",
+    "events": [
+      "alert.created"
+    ],
+    "secret": null,
+    "metadata": {},
+    "created_at": 1776554031.4131613,
+    "active": true,
+    "delivery_stats": {
+      "failure": 16,
+      "success": 23,
+      "last_status": ""
+    }
+  },
+  "wh_385670a41e48": {
+    "id": "wh_385670a41e48",
+    "url": "http://localhost:8085/api/ai/webhook/receive/",
+    "events": [
+      "alert.created"
+    ],
+    "secret": null,
+    "metadata": {},
+    "created_at": 1776554063.226742,
+    "active": true,
+    "delivery_stats": {
+      "success": 0,
+      "failure": 0,
+      "last_status": null
+    }
+  }
+}

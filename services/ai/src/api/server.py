@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 import asyncio
 import json
+import os
 import uuid
 import time
 import threading
@@ -89,30 +90,224 @@ class AlertServer:
         # §2.2 — shared frame store for camera capture enrollment
         self._frame_store = None
 
+        backend_sync_base = os.getenv("BACKEND_CONFIG_SYNC_BASE", "").strip()
+        if not backend_sync_base:
+            backend_base = os.getenv("BACKEND_BASE_INTERNAL", "http://127.0.0.1:8000").rstrip("/")
+            backend_sync_base = f"{backend_base}/api/ai/internal"
+        self._backend_sync_base = backend_sync_base.rstrip("/")
+        self._sync_token = os.getenv("AI_WEBHOOK_TOKEN", "")
+        self._sync_secret = os.getenv("AI_WEBHOOK_SECRET", "")
+
         # ── Webhook registry ──────────────────────────────────────────
         self._webhooks: Dict[str, Dict[str, Any]] = {}  # id → {url, events, secret, ...}
-        self._webhook_file = Path("data/webhooks.json")
-        self._webhook_file.parent.mkdir(parents=True, exist_ok=True)
         self._load_webhooks()
 
         self._setup_routes()
 
     # ── Webhook persistence helpers ───────────────────────────────────
     def _load_webhooks(self):
-        """Load webhooks from disk."""
-        if self._webhook_file.exists():
-            try:
-                self._webhooks = json.loads(self._webhook_file.read_text())
-                self.logger.info(f"Loaded {len(self._webhooks)} webhook(s)")
-            except Exception as e:
-                self.logger.error(f"Failed to load webhooks: {e}")
+        """Load webhooks only from canonical backend snapshot."""
+        remote_webhooks = self._fetch_webhooks_from_backend()
+        if isinstance(remote_webhooks, dict):
+            merged: Dict[str, Dict[str, Any]] = {}
+            for webhook_id, remote_payload in remote_webhooks.items():
+                if not isinstance(remote_payload, dict):
+                    continue
+
+                existing_payload = self._webhooks.get(webhook_id, {})
+                has_secret = bool(remote_payload.get("has_secret"))
+                secret_value = None
+                if has_secret:
+                    secret_value = existing_payload.get("secret") or (self._sync_secret or None)
+                    if secret_value is None:
+                        self.logger.warning(
+                            "Webhook %s requires a secret but no canonical runtime secret is configured",
+                            webhook_id,
+                        )
+
+                merged[webhook_id] = {
+                    "id": remote_payload.get("id") or webhook_id,
+                    "url": remote_payload.get("url", ""),
+                    "events": list(remote_payload.get("events") or []),
+                    "secret": secret_value,
+                    "metadata": remote_payload.get("metadata") or {},
+                    "created_at": remote_payload.get("created_at") or time.time(),
+                    "active": bool(remote_payload.get("active", True)),
+                    "delivery_stats": remote_payload.get("delivery_stats")
+                    or {"success": 0, "failure": 0, "last_status": None},
+                }
+
+            self._webhooks = merged
+            self.logger.info("Loaded %s webhook(s) from backend snapshot", len(self._webhooks))
+            return
+
+        self._webhooks = {}
+        self.logger.warning("Webhook snapshot unavailable from backend; starting with empty registry")
+
+    def _fetch_webhooks_from_backend(self) -> Optional[Dict[str, Dict[str, Any]]]:
+        if not self._backend_sync_base:
+            return None
+
+        headers: Dict[str, str] = {}
+        if self._sync_token:
+            headers["X-AI-WEBHOOK-TOKEN"] = self._sync_token
+        elif self._sync_secret:
+            import hmac
+            import hashlib
+
+            # GET request body is empty; sign empty payload for HMAC auth parity.
+            signature = hmac.new(self._sync_secret.encode(), b"", hashlib.sha256).hexdigest()
+            headers["X-Vigilzone-Signature"] = f"sha256={signature}"
+
+        try:
+            with httpx.Client(timeout=3.0) as client:
+                resp = client.get(f"{self._backend_sync_base}/webhooks/snapshot/", headers=headers)
+            if not resp.is_success:
+                self.logger.debug(
+                    "Webhook snapshot fetch failed: %s %s",
+                    resp.status_code,
+                    resp.text[:200],
+                )
+                return None
+
+            payload = resp.json()
+            if isinstance(payload, dict):
+                webhooks = payload.get("webhooks", payload)
+                if isinstance(webhooks, dict):
+                    return webhooks
+        except Exception as exc:
+            self.logger.debug("Webhook snapshot fetch failed: %s", exc)
+
+        return None
+
+    def _fetch_camera_config_from_backend(self, camera_id: str) -> Optional[Dict[str, Any]]:
+        if not self._backend_sync_base:
+            return None
+
+        headers: Dict[str, str] = {}
+        if self._sync_token:
+            headers["X-AI-WEBHOOK-TOKEN"] = self._sync_token
+        elif self._sync_secret:
+            import hmac
+            import hashlib
+
+            signature = hmac.new(self._sync_secret.encode(), b"", hashlib.sha256).hexdigest()
+            headers["X-Vigilzone-Signature"] = f"sha256={signature}"
+
+        try:
+            with httpx.Client(timeout=3.0) as client:
+                resp = client.get(f"{self._backend_sync_base}/cameras/snapshot/", headers=headers)
+            if not resp.is_success:
+                self.logger.debug(
+                    "Camera snapshot fetch failed: %s %s",
+                    resp.status_code,
+                    resp.text[:200],
+                )
+                return None
+
+            payload = resp.json()
+            cameras = payload.get("cameras", []) if isinstance(payload, dict) else []
+            if not isinstance(cameras, list):
+                return None
+
+            for row in cameras:
+                if not isinstance(row, dict):
+                    continue
+                if str(row.get("camera_id", "")).strip() != camera_id:
+                    continue
+
+                enabled_lanes = list(row.get("enabled_lanes") or [])
+                effective_entity_detection_enabled = bool(
+                    row.get("effective_entity_detection_enabled", True)
+                )
+                if not effective_entity_detection_enabled:
+                    enabled_lanes = [lane for lane in enabled_lanes if lane != "entity_identity"]
+
+                return {
+                    "camera_id": camera_id,
+                    "rtsp_url": row.get("rtsp_url") or "",
+                    "ingest_backend": row.get("ingest_backend") or "opencv",
+                    "enabled_lanes": enabled_lanes,
+                    "sample_hz": row.get("sample_hz") or 2.0,
+                    "source_type": row.get("source_type") or ("rtsp" if row.get("rtsp_url") else "live_camera"),
+                    "tenant_id": row.get("tenant_id"),
+                    "community_id": row.get("community_id"),
+                    "camera_name": row.get("camera_name") or camera_id,
+                    "stream_path": row.get("stream_path") or camera_id,
+                    "policy_version": row.get("policy_version") or 1,
+                    "entity_detection_enabled": bool(row.get("entity_detection_enabled", True)),
+                    "identity_runtime_enabled": bool(row.get("identity_runtime_enabled", True)),
+                    "effective_entity_detection_enabled": effective_entity_detection_enabled,
+                }
+        except Exception as exc:
+            self.logger.debug("Camera snapshot fetch failed: %s", exc)
+
+        return None
 
     def _save_webhooks(self):
-        """Persist webhooks to disk."""
+        """Mirror in-memory webhooks to canonical backend registry."""
         try:
-            self._webhook_file.write_text(json.dumps(self._webhooks, indent=2))
+            self._sync_webhooks_to_backend()
         except Exception as e:
             self.logger.error(f"Failed to save webhooks: {e}")
+
+    def _post_internal_sync(self, path: str, payload: Dict[str, Any]) -> None:
+        if not self._backend_sync_base:
+            return
+
+        url = f"{self._backend_sync_base}/{path.lstrip('/')}"
+        headers = {"Content-Type": "application/json"}
+
+        try:
+            with httpx.Client(timeout=3.0) as client:
+                if self._sync_token:
+                    headers["X-AI-WEBHOOK-TOKEN"] = self._sync_token
+                    client.post(url, json=payload, headers=headers)
+                    return
+
+                if self._sync_secret:
+                    import hmac
+                    import hashlib
+
+                    body = json.dumps(payload)
+                    sig = hmac.new(
+                        self._sync_secret.encode(),
+                        body.encode(),
+                        hashlib.sha256,
+                    ).hexdigest()
+                    headers["X-Vigilzone-Signature"] = f"sha256={sig}"
+                    client.post(url, content=body, headers=headers)
+                    return
+
+                client.post(url, json=payload, headers=headers)
+        except Exception as exc:
+            self.logger.debug("Internal sync call failed for %s: %s", path, exc)
+
+    def _sync_webhooks_to_backend(self):
+        self._post_internal_sync("webhooks/sync/", {"webhooks": self._webhooks})
+
+    def _sync_runtime_to_backend(self, payload: Dict[str, Any]):
+        self._post_internal_sync("runtime/sync/", payload)
+
+    @staticmethod
+    def _identity_mutation_compat_enabled() -> bool:
+        token = str(os.getenv("AI_ALLOW_IDENTITY_MUTATION_COMPAT", "")).strip().lower()
+        return token in {"1", "true", "yes", "on"}
+
+    def _require_known_entity_id(self, known_entity_id: Optional[str]):
+        if self._identity_mutation_compat_enabled():
+            return None
+        if known_entity_id not in (None, ""):
+            return None
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": (
+                    "Legacy AI-owned canonical identity mutation is disabled. "
+                    "Pass known_entity_id from backend canonical entity lifecycle."
+                )
+            },
+        )
 
     def set_alert_buffer(self, buffer: List[Dict[str, Any]]):
         self.alert_buffer = buffer
@@ -217,34 +412,12 @@ class AlertServer:
         if camera_id in camera_configs_by_id:
             camera_configs_by_id[camera_id].update(clean_metadata)
 
-        runtime_file = Path("data/cameras_runtime.json")
-        runtime_file.parent.mkdir(parents=True, exist_ok=True)
-        lock_file = runtime_file.with_suffix(".json.lock")
-        
-        import filelock
-        success = False
-        try:
-            with filelock.FileLock(str(lock_file), timeout=5.0):
-                runtime_cameras: Dict[str, Any] = {}
-                if runtime_file.exists():
-                    try:
-                        runtime_cameras = json.loads(runtime_file.read_text())
-                    except Exception as e:
-                        self.logger.error("JSON load failure on %s: %s. Overwriting with new data.", runtime_file, e)
-                        runtime_cameras = {}
-                
-                existing_cfg = runtime_cameras.get(camera_id, {"camera_id": camera_id})
-                if isinstance(existing_cfg, dict):
-                    existing_cfg.update(clean_metadata)
-                    runtime_cameras[camera_id] = existing_cfg
-                    
-                    tmp_file = runtime_file.with_suffix(".json.tmp")
-                    tmp_file.write_text(json.dumps(runtime_cameras, indent=2))
-                    import os
-                    os.replace(tmp_file, runtime_file)
-                    success = True
-        except Exception as e:
-            self.logger.error("Failed to update runtime file: %s", e)
+        success = True
+
+        self._sync_runtime_to_backend({
+            "camera_id": camera_id,
+            **clean_metadata,
+        })
 
         return {"metadata": clean_metadata, "success": success}
 
@@ -475,10 +648,16 @@ class AlertServer:
             name: str = Body(...),
             role: str = Body("VISITOR"),
             metadata_json: str = Body("{}"),
+            tenant_id: Optional[str] = Body(None),
+            known_entity_id: Optional[str] = Body(None),
         ):
             """Enroll person from previously staged images (never reads UploadFile streams)."""
             if self._entity_store is None or self._face_embedder is None:
                 return {"error": "Identity subsystem not enabled"}
+
+            compat_error = self._require_known_entity_id(known_entity_id)
+            if compat_error is not None:
+                return compat_error
 
             stage_dir = self._staging_dir / Path(upload_id).name
             if not stage_dir.exists():
@@ -532,6 +711,12 @@ class AlertServer:
                 meta = json.loads(metadata_json)
             except Exception:
                 meta = {}
+            if not isinstance(meta, dict):
+                meta = {}
+            if tenant_id not in (None, ""):
+                meta["tenant_id"] = str(tenant_id)
+            if known_entity_id not in (None, ""):
+                meta["known_entity_id"] = str(known_entity_id)
 
             record = EntityRecord(
                 entity_id=entity_id,
@@ -578,10 +763,16 @@ class AlertServer:
             upload_id: str = Body(...),
             name: str = Body(...),
             metadata_json: str = Body("{}"),
+            tenant_id: Optional[str] = Body(None),
+            known_entity_id: Optional[str] = Body(None),
         ):
             """Enroll pet from previously staged images."""
             if self._entity_store is None or self._pet_embedder is None:
                 return {"error": "Identity subsystem not enabled or pet embedder unavailable"}
+
+            compat_error = self._require_known_entity_id(known_entity_id)
+            if compat_error is not None:
+                return compat_error
 
             stage_dir = self._staging_dir / Path(upload_id).name
             if not stage_dir.exists():
@@ -625,6 +816,12 @@ class AlertServer:
                 meta = json.loads(metadata_json)
             except Exception:
                 meta = {}
+            if not isinstance(meta, dict):
+                meta = {}
+            if tenant_id not in (None, ""):
+                meta["tenant_id"] = str(tenant_id)
+            if known_entity_id not in (None, ""):
+                meta["known_entity_id"] = str(known_entity_id)
 
             record = EntityRecord(
                 entity_id=entity_id,
@@ -700,10 +897,16 @@ class AlertServer:
             role: str = Form("VISITOR"),
             metadata_json: str = Form("{}"),
             files: List[UploadFile] = File(...),
+            tenant_id: Optional[str] = Form(None),
+            known_entity_id: Optional[str] = Form(None),
         ):
             """Legacy enroll person — routes through staging workflow internally (§A2)."""
             if self._entity_store is None or self._face_embedder is None:
                 return {"error": "Identity subsystem not enabled"}
+
+            compat_error = self._require_known_entity_id(known_entity_id)
+            if compat_error is not None:
+                return compat_error
 
             # §A2: persist to staging first, then delegate to staging-based logic
             upload_id = f"upl_{uuid.uuid4().hex[:12]}"
@@ -721,6 +924,8 @@ class AlertServer:
                 name=name,
                 role=role,
                 metadata_json=metadata_json,
+                tenant_id=tenant_id,
+                known_entity_id=known_entity_id,
             )
 
         @self.app.post("/entities/enroll_pet")
@@ -728,10 +933,16 @@ class AlertServer:
             name: str = Form(...),
             metadata_json: str = Form("{}"),
             files: List[UploadFile] = File(...),
+            tenant_id: Optional[str] = Form(None),
+            known_entity_id: Optional[str] = Form(None),
         ):
             """Legacy enroll pet — routes through staging workflow internally (§A2)."""
             if self._entity_store is None or self._pet_embedder is None:
                 return {"error": "Identity subsystem not enabled or pet embedder unavailable"}
+
+            compat_error = self._require_known_entity_id(known_entity_id)
+            if compat_error is not None:
+                return compat_error
 
             # §A2: persist to staging first, then delegate
             upload_id = f"upl_{uuid.uuid4().hex[:12]}"
@@ -747,6 +958,8 @@ class AlertServer:
                 upload_id=upload_id,
                 name=name,
                 metadata_json=metadata_json,
+                tenant_id=tenant_id,
+                known_entity_id=known_entity_id,
             )
 
         @self.app.delete("/entities/{entity_id}")
@@ -794,12 +1007,18 @@ class AlertServer:
             name: str = Form(...),
             role: str = Form("VISITOR"),
             metadata_json: str = Form("{}"),
+            tenant_id: Optional[str] = Form(None),
+            known_entity_id: Optional[str] = Form(None),
         ):
             """Capture a frame from a live camera and enroll a person."""
             if self._entity_store is None or self._face_embedder is None:
                 return {"error": "Identity subsystem not enabled"}
             if self._frame_store is None:
                 return {"error": "Frame store not available — no cameras running"}
+
+            compat_error = self._require_known_entity_id(known_entity_id)
+            if compat_error is not None:
+                return compat_error
 
             frame, ts = self._frame_store.get(camera_id)
             if frame is None:
@@ -818,6 +1037,12 @@ class AlertServer:
                 meta = json.loads(metadata_json)
             except Exception:
                 meta = {}
+            if not isinstance(meta, dict):
+                meta = {}
+            if tenant_id not in (None, ""):
+                meta["tenant_id"] = str(tenant_id)
+            if known_entity_id not in (None, ""):
+                meta["known_entity_id"] = str(known_entity_id)
 
             record = EntityRecord(
                 entity_id=entity_id,
@@ -856,12 +1081,18 @@ class AlertServer:
             camera_id: str = Form(...),
             name: str = Form(...),
             metadata_json: str = Form("{}"),
+            tenant_id: Optional[str] = Form(None),
+            known_entity_id: Optional[str] = Form(None),
         ):
             """Capture a frame from a live camera and enroll a pet."""
             if self._entity_store is None or self._pet_embedder is None:
                 return {"error": "Identity subsystem not enabled or pet embedder unavailable"}
             if self._frame_store is None:
                 return {"error": "Frame store not available — no cameras running"}
+
+            compat_error = self._require_known_entity_id(known_entity_id)
+            if compat_error is not None:
+                return compat_error
 
             frame, ts = self._frame_store.get(camera_id)
             if frame is None:
@@ -878,6 +1109,12 @@ class AlertServer:
                 meta = json.loads(metadata_json)
             except Exception:
                 meta = {}
+            if not isinstance(meta, dict):
+                meta = {}
+            if tenant_id not in (None, ""):
+                meta["tenant_id"] = str(tenant_id)
+            if known_entity_id not in (None, ""):
+                meta["known_entity_id"] = str(known_entity_id)
 
             record = EntityRecord(
                 entity_id=entity_id,
@@ -909,6 +1146,127 @@ class AlertServer:
                 "camera_id": camera_id,
                 "saved_filenames": [fname],
                 "capture_image_url": f"/enroll_images/{entity_id}/{fname}",
+            }
+
+        # ==============================================================
+        # §BACKEND-OWNED — Stateless Embedding Generation Endpoint
+        # ==============================================================
+
+        @self.app.post("/api/v1/embeddings/generate")
+        async def generate_embeddings(
+            modality: str = Form(...),
+            files: List[UploadFile] = File(...),
+        ):
+            """Stateless embedding generation — returns vectors without side-effects.
+
+            This endpoint is called by the backend EntityProcessingService to
+            compute embeddings from enrollment images. It does NOT create entities,
+            store images, sync back, or mutate any state. The backend owns all
+            persistence and lifecycle management.
+
+            Parameters
+            ----------
+            modality : str
+                "face" or "pet_clip"
+            files : list of UploadFile
+                Enrollment images to embed
+
+            Returns
+            -------
+            dict with:
+                embeddings: list of {filename, vector, dim, quality_score, embedding_model}
+                failed: list of {filename, reason}
+                outlier_rejected: int (count of embeddings removed by outlier filter)
+            """
+            if modality == "face":
+                if self._face_embedder is None or not self._face_embedder.available:
+                    return JSONResponse(
+                        status_code=503,
+                        content={"error": "Face embedder not available"},
+                    )
+            elif modality == "pet_clip":
+                if self._pet_embedder is None or not self._pet_embedder.available:
+                    return JSONResponse(
+                        status_code=503,
+                        content={"error": "Pet embedder not available"},
+                    )
+            else:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": f"Unsupported modality: {modality}. Use 'face' or 'pet_clip'."},
+                )
+
+            enroll_cfg = self._enrollment_cfg
+            outlier_z = enroll_cfg.get("outlier_reject_z", 2.5)
+            max_embeddings = enroll_cfg.get("max_embeddings_per_entity", 10)
+
+            raw_results = []
+            failed = []
+
+            for f in files:
+                content = await f.read()
+                fname = f.filename or "unknown.jpg"
+                arr = np.frombuffer(content, dtype=np.uint8)
+                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if img is None:
+                    failed.append({"filename": fname, "reason": "decode_failed"})
+                    continue
+
+                if modality == "face":
+                    emb = self._face_embedder.embed_from_crop(img)
+                    model_name = f"insightface/{self._face_embedder._model_pack}"
+                    if emb is None:
+                        failed.append({"filename": fname, "reason": "no_face_detected"})
+                        continue
+                    # Quality score: use detection score if available via full detect
+                    faces = self._face_embedder.detect_faces(img)
+                    quality = float(faces[0].det_score) if faces else None
+                else:
+                    emb = self._pet_embedder.embed(img)
+                    model_name = f"open_clip/{self._pet_embedder._clip_model_name}"
+                    if emb is None:
+                        failed.append({"filename": fname, "reason": "embedding_failed"})
+                        continue
+                    quality = None
+
+                raw_results.append({
+                    "filename": fname,
+                    "vector": emb,
+                    "quality_score": quality,
+                    "embedding_model": model_name,
+                })
+
+            # Outlier rejection on raw embeddings
+            raw_vectors = [r["vector"] for r in raw_results]
+            outlier_rejected = 0
+            if len(raw_vectors) > 2:
+                clean_vectors = _outlier_reject(raw_vectors, outlier_z)
+                clean_set = {id(v) for v in clean_vectors}
+                before_count = len(raw_results)
+                raw_results = [r for r in raw_results if id(r["vector"]) in clean_set]
+                outlier_rejected = before_count - len(raw_results)
+
+            # Cap at max embeddings
+            raw_results = raw_results[:max_embeddings]
+
+            # Serialize vectors for JSON transport
+            embeddings_out = []
+            for r in raw_results:
+                vec = r["vector"]
+                embeddings_out.append({
+                    "filename": r["filename"],
+                    "vector": [float(x) for x in vec.tolist()],
+                    "dim": len(vec),
+                    "quality_score": r.get("quality_score"),
+                    "embedding_model": r.get("embedding_model", ""),
+                })
+
+            return {
+                "modality": modality,
+                "embeddings": embeddings_out,
+                "failed": failed,
+                "outlier_rejected": outlier_rejected,
+                "total_images": len(files),
             }
 
         @self.app.get("/entities")
@@ -1314,27 +1672,48 @@ class AlertServer:
 
             running = self._find_camera_processor(camera_id) is not None
             if enabled and running:
+                metadata_result = self._update_runtime_camera_metadata(camera_id, runtime_metadata)
+                self._sync_runtime_to_backend({
+                    "camera_id": camera_id,
+                    "enabled": True,
+                    "running": True,
+                    **(metadata_result.get("metadata") or {}),
+                })
                 return {
                     "camera_id": camera_id,
                     "running": True,
                     "changed": False,
-                    "metadata_applied": self._update_runtime_camera_metadata(camera_id, runtime_metadata),
+                    "metadata_applied": metadata_result,
                 }
             if (not enabled) and (not running):
+                metadata_result = self._update_runtime_camera_metadata(camera_id, runtime_metadata)
+                self._sync_runtime_to_backend({
+                    "camera_id": camera_id,
+                    "enabled": False,
+                    "running": False,
+                    **(metadata_result.get("metadata") or {}),
+                })
                 return {
                     "camera_id": camera_id,
                     "running": False,
                     "changed": False,
-                    "metadata_applied": self._update_runtime_camera_metadata(camera_id, runtime_metadata),
+                    "metadata_applied": metadata_result,
                 }
 
             if not enabled:
                 stopped = self._stop_camera_processor(camera_id)
+                metadata_result = self._update_runtime_camera_metadata(camera_id, runtime_metadata)
+                self._sync_runtime_to_backend({
+                    "camera_id": camera_id,
+                    "enabled": False,
+                    "running": False,
+                    **(metadata_result.get("metadata") or {}),
+                })
                 return {
                     "camera_id": camera_id,
                     "running": False,
                     "changed": stopped,
-                    "metadata_applied": self._update_runtime_camera_metadata(camera_id, runtime_metadata),
+                    "metadata_applied": metadata_result,
                 }
 
             # If enabling, we need a config.
@@ -1344,23 +1723,14 @@ class AlertServer:
             if isinstance(camera_configs_by_id, dict):
                 cfg = camera_configs_by_id.get(camera_id)
 
-            # 2. Try persistent runtime storage (Phase 4)
+            # 2. Canonical fallback from backend snapshot.
             if not cfg:
-                runtime_file = Path("data/cameras_runtime.json")
-                lock_file = runtime_file.with_suffix(".json.lock")
-                import filelock
-                if runtime_file.exists():
-                    try:
-                        with filelock.FileLock(str(lock_file), timeout=5.0):
-                            runtime_cameras = json.loads(runtime_file.read_text())
-                            cfg = runtime_cameras.get(camera_id)
-                    except Exception as e:
-                        self.logger.error("JSON load failure on %s: %s", runtime_file, e)
+                cfg = self._fetch_camera_config_from_backend(camera_id)
 
             if not cfg:
                 return JSONResponse(
                     status_code=404,
-                    content={"error": f"Camera config '{camera_id}' not found. Register it first."},
+                    content={"error": f"Camera config '{camera_id}' not found in canonical registry."},
                 )
 
             started = self._start_camera_processor(cfg)
@@ -1369,6 +1739,31 @@ class AlertServer:
                     status_code=500,
                     content={"error": f"Failed to start camera '{camera_id}'"},
                 )
+
+            metadata_result = self._update_runtime_camera_metadata(camera_id, runtime_metadata)
+            self._sync_runtime_to_backend({
+                "camera_id": camera_id,
+                "enabled": True,
+                "running": True,
+                "ingest_backend": cfg.get("ingest_backend", "opencv"),
+                "sample_hz": cfg.get("sample_hz", 2.0),
+                "enabled_lanes": cfg.get("enabled_lanes", []),
+                "entity_detection_enabled": cfg.get("entity_detection_enabled", True),
+                "identity_runtime_enabled": cfg.get("identity_runtime_enabled", True),
+                "effective_entity_detection_enabled": cfg.get("effective_entity_detection_enabled", True),
+                "tenant_id": cfg.get("tenant_id"),
+                "community_id": cfg.get("community_id"),
+                "camera_name": cfg.get("camera_name"),
+                "stream_path": cfg.get("stream_path") or camera_id,
+                "rtsp_url": cfg.get("rtsp_url", ""),
+                **(metadata_result.get("metadata") or {}),
+            })
+            return {
+                "camera_id": camera_id,
+                "running": True,
+                "changed": True,
+                "metadata_applied": metadata_result,
+            }
  
         @self.app.get("/stream/{camera_id}")
         async def stream_camera(camera_id: str):
@@ -1431,6 +1826,8 @@ class AlertServer:
                 description="Detection lanes to enable",
             ),
             sample_hz: float = Body(2.0, description="Frame sample rate"),
+            entity_detection_enabled: bool = Body(True, description="Enable identity lane for this camera"),
+            identity_runtime_enabled: bool = Body(True, description="Enable identity runtime at tenant scope"),
             tenant_id: Optional[str] = Body(None, description="Tenant ID"),
             community_id: Optional[str] = Body(None, description="Community ID"),
             camera_name: Optional[str] = Body(None, description="Nice camera name"),
@@ -1463,45 +1860,6 @@ class AlertServer:
                         "hot_loaded": True,
                     }
 
-            # 3. Update persistent storage
-            runtime_file = Path("data/cameras_runtime.json")
-            runtime_file.parent.mkdir(parents=True, exist_ok=True)
-            lock_file = runtime_file.with_suffix(".json.lock")
-            
-            import filelock
-            storage_updated = False
-            try:
-                with filelock.FileLock(str(lock_file), timeout=5.0):
-                    runtime_cameras: Dict[str, Any] = {}
-                    if runtime_file.exists():
-                        try:
-                            runtime_cameras = json.loads(runtime_file.read_text())
-                        except Exception as e:
-                            self.logger.error("JSON load failure on %s: %s", runtime_file, e)
-                            runtime_cameras = {}
-                    
-                    runtime_cameras[camera_id] = {
-                        "camera_id": camera_id,
-                        "rtsp_url": rtsp_url,
-                        "ingest_backend": ingest_backend,
-                        "enabled_lanes": enabled_lanes,
-                        "sample_hz": sample_hz,
-                        "registered_at": time.time(),
-                        "tenant_id": tenant_id,
-                        "community_id": community_id,
-                        "camera_name": camera_name,
-                        "stream_path": stream_path,
-                        "policy_version": policy_version,
-                    }
-                    
-                    tmp_file = runtime_file.with_suffix(".json.tmp")
-                    tmp_file.write_text(json.dumps(runtime_cameras, indent=2))
-                    import os
-                    os.replace(tmp_file, runtime_file)
-                    storage_updated = True
-            except Exception as e:
-                self.logger.error("Failed to update runtime file during registration: %s", e)
-
             # 4. Start/Restart processor
             cam_cfg = {
                 "camera_id": camera_id,
@@ -1509,6 +1867,9 @@ class AlertServer:
                 "ingest_backend": ingest_backend,
                 "enabled_lanes": enabled_lanes,
                 "sample_hz": sample_hz,
+                "entity_detection_enabled": entity_detection_enabled,
+                "identity_runtime_enabled": identity_runtime_enabled,
+                "effective_entity_detection_enabled": bool(entity_detection_enabled and identity_runtime_enabled),
                 "source_type": "rtsp" if rtsp_url else "live_camera",
                 "tenant_id": tenant_id,
                 "community_id": community_id,
@@ -1525,12 +1886,29 @@ class AlertServer:
                 
             hot_loaded = self._start_camera_processor(cam_cfg)
 
+            self._sync_runtime_to_backend({
+                "camera_id": camera_id,
+                "enabled": True,
+                "running": bool(hot_loaded),
+                "rtsp_url": rtsp_url,
+                "ingest_backend": ingest_backend,
+                "enabled_lanes": enabled_lanes,
+                "sample_hz": sample_hz,
+                "entity_detection_enabled": entity_detection_enabled,
+                "identity_runtime_enabled": identity_runtime_enabled,
+                "effective_entity_detection_enabled": bool(entity_detection_enabled and identity_runtime_enabled),
+                "tenant_id": tenant_id,
+                "community_id": community_id,
+                "camera_name": camera_name,
+                "stream_path": stream_path,
+                "policy_version": policy_version,
+            })
+
             return {
                 "status": "updated" if config_changed else "registered",
                 "camera_id": camera_id,
                 "rtsp_url": rtsp_url,
                 "hot_loaded": hot_loaded,
-                "storage_updated": storage_updated,
                 "message": f"Camera {camera_id} {'updated and restarted' if config_changed else 'registered and started'}.",
             }
 

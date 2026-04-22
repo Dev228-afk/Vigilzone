@@ -14,6 +14,7 @@ If FAISS is installed it accelerates the raw search; otherwise pure numpy.
 """
 from __future__ import annotations
 
+import time
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -139,6 +140,8 @@ class IdentityMatcher:
         self.pet_threshold = pet_threshold
         self.face_margin = face_margin
         self.pet_margin = pet_margin
+        self.refresh_interval_s = max(1.0, float(cfg.get("refresh_interval_s", 10.0)))
+        self._last_refresh_check_monotonic = 0.0
 
         self._face_index = None   # _NumpyIndex | _FaissIndex
         self._pet_index = None
@@ -181,9 +184,25 @@ class IdentityMatcher:
             return _FaissIndex(ids, matrix), centroids
         return _NumpyIndex(ids, matrix), centroids
 
+    def _maybe_refresh_indices(self) -> None:
+        now = time.monotonic()
+        if (now - self._last_refresh_check_monotonic) < self.refresh_interval_s:
+            return
+        self._last_refresh_check_monotonic = now
+
+        try:
+            changed = self.store.refresh_if_changed()
+        except Exception as exc:
+            logger.debug("Identity refresh check failed: %s", exc)
+            return
+
+        if changed:
+            self.reload_indices()
+
     # ── Match ─────────────────────────────────────────────────────────
     def match_face(self, embedding: np.ndarray, camera_id: Optional[str] = None) -> IdentityMatch:
         """Match a 512-d face embedding. Returns IdentityMatch."""
+        self._maybe_refresh_indices()
         return self._match(embedding, self._face_index, self._face_centroids,
                            self.face_threshold, self.face_margin,
                            camera_id=camera_id,
@@ -192,11 +211,36 @@ class IdentityMatcher:
 
     def match_pet(self, embedding: np.ndarray, camera_id: Optional[str] = None) -> IdentityMatch:
         """Match a pet CLIP embedding. Returns IdentityMatch."""
+        self._maybe_refresh_indices()
         return self._match(embedding, self._pet_index, self._pet_centroids,
                            self.pet_threshold, self.pet_margin,
                            camera_id=camera_id,
                            known_cat=EntityCategory.PET,
                            unknown_cat=EntityCategory.UNKNOWN_ANIMAL)
+
+    def has_candidates_for_camera(self, camera_id: Optional[str] = None) -> bool:
+        """Return True when at least one enrolled entity can be matched for this camera."""
+        self._maybe_refresh_indices()
+
+        all_entity_ids = set()
+        if self._face_index is not None:
+            all_entity_ids.update(self._face_index.entity_ids)
+        if self._pet_index is not None:
+            all_entity_ids.update(self._pet_index.entity_ids)
+
+        if not all_entity_ids:
+            return False
+        if camera_id is None:
+            return True
+
+        camera_token = str(camera_id).strip()
+        if not camera_token:
+            return True
+
+        for entity_id in all_entity_ids:
+            if self._is_camera_allowed(entity_id, camera_token):
+                return True
+        return False
 
     def _match(self, embedding: np.ndarray, index, centroids: Dict[str, np.ndarray],
                threshold: float, min_margin: float, camera_id: Optional[str],

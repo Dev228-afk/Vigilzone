@@ -1,22 +1,19 @@
-import sqlite3
-import os
+"""Legacy DB fixer placeholder.
 
-try:
-    print("Connecting to db.sqlite3...")
-    conn = sqlite3.connect("db.sqlite3", timeout=10)
-    cursor = conn.cursor()
-    cursor.execute("PRAGMA table_info(api_camera);")
-    columns = [col[1] for col in cursor.fetchall()]
-    print(f"Columns in api_camera: {columns}")
-    
-    if "enabled_lanes" not in columns:
-        print("Missing enabled_lanes. Adding it manually...")
-        cursor.execute('ALTER TABLE api_camera ADD COLUMN enabled_lanes TEXT NULL;')
-        conn.commit()
-        print("Successfully added column.")
-    else:
-        print("enabled_lanes already exists.")
-        
-    conn.close()
-except Exception as e:
-    print(f"Error: {e}")
+SQLite local DB mutation has been removed from this project.
+Use canonical PostgreSQL migrations and bootstrap commands instead.
+"""
+
+import sys
+
+
+def main() -> int:
+    print("SQLite local DB fixer has been removed.")
+    print("Run canonical setup instead:")
+    print("  python manage.py migrate")
+    print("  python manage.py bootstrap_postgres_config")
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,10 +1,12 @@
 from django.test import TestCase, override_settings
+from django.http import HttpResponse
 from rest_framework.test import APITestCase, APIClient
 from rest_framework import status
 from django.contrib.auth.models import User
 from django.utils import timezone
 from datetime import timedelta
 from unittest.mock import patch, MagicMock
+import json
 
 from api.models import (
     Tenant, Membership, Camera, Incident, Detection, Alert, 
@@ -845,4 +847,62 @@ class AiControlPlaneTests(APITestCase):
         )
 
         response = self.client.post('/api/ai/start/', {'camera_id': other_camera.id}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_ai_cameras_returns_only_active_tenant_cameras(self):
+        other_tenant = Tenant.objects.create(name='Other Tenant For Camera List')
+        Camera.objects.create(
+            tenant=other_tenant,
+            name='Other Tenant Cam',
+            rtsp_url='rtsp://other.example/stream',
+            ai_camera_id='other_cam_list',
+            stream_path='other_cam_list',
+        )
+
+        response = self.client.get('/api/ai/cameras/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIsInstance(response.data, list)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['camera_id'], 'cam_hallway')
+        self.assertEqual(response.data[0]['camera_db_id'], self.camera.id)
+
+    @patch('ai_integration.views.proxy_request')
+    def test_ai_alerts_filters_cross_tenant_rows(self, mock_proxy_request):
+        other_tenant = Tenant.objects.create(name='Other Tenant Alerts')
+        other_camera = Camera.objects.create(
+            tenant=other_tenant,
+            name='Other Tenant Alert Cam',
+            rtsp_url='rtsp://other.example/stream',
+            ai_camera_id='other_alert_cam',
+            stream_path='other_alert_cam',
+        )
+
+        payload = [
+            {'id': 'a1', 'camera_id': 'cam_hallway', 'type': 'intrusion'},
+            {'id': 'a2', 'camera_id': other_camera.ai_camera_id, 'type': 'intrusion'},
+        ]
+        mock_proxy_request.return_value = HttpResponse(
+            content=json.dumps(payload),
+            status=200,
+            content_type='application/json',
+        )
+
+        response = self.client.get('/api/ai/alerts/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIsInstance(response.data, list)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['camera_id'], 'cam_hallway')
+
+    def test_ai_frame_rejects_cross_tenant_camera(self):
+        other_tenant = Tenant.objects.create(name='Other Tenant Frame')
+        other_camera = Camera.objects.create(
+            tenant=other_tenant,
+            name='Other Tenant Frame Cam',
+            rtsp_url='rtsp://other.example/frame',
+            ai_camera_id='other_frame_cam',
+            stream_path='other_frame_cam',
+        )
+
+        response = self.client.get(f'/api/ai/frame/{other_camera.ai_camera_id}/')
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)

@@ -224,7 +224,32 @@ class CameraProcessor:
         enabled = self.camera_cfg.get("enabled_lanes", [])
         device = self.models_cfg.get("device", "auto")
 
+        def _as_bool(raw, default=True):
+            if isinstance(raw, bool):
+                return raw
+            if raw in (None, ""):
+                return default
+            token = str(raw).strip().lower()
+            if token in {"1", "true", "yes", "on"}:
+                return True
+            if token in {"0", "false", "no", "off"}:
+                return False
+            return default
+
         for name in enabled:
+            if name == "entity_identity":
+                effective_identity = self.camera_cfg.get("effective_entity_detection_enabled")
+                if effective_identity is None:
+                    camera_toggle = _as_bool(self.camera_cfg.get("entity_detection_enabled"), default=True)
+                    runtime_toggle = _as_bool(self.camera_cfg.get("identity_runtime_enabled"), default=True)
+                    effective_identity = camera_toggle and runtime_toggle
+                if not _as_bool(effective_identity, default=True):
+                    self.logger.info(
+                        "Skipping entity_identity lane for %s: identity runtime disabled",
+                        self.camera_id,
+                    )
+                    continue
+
             cls = LANE_REGISTRY.get(name)
             if cls is None:
                 self.logger.warning(f"Unknown lane: {name}")
@@ -716,6 +741,8 @@ class CCTVAIModule:
         self.identity_matcher = None
         self.identity_policy = None
         self.identity_stabilizer = None
+        self.identity_stream_subscriber = None
+        self.identity_self_healer = None
 
         if self.identity_enabled:
             try:
@@ -761,9 +788,20 @@ class CCTVAIModule:
 
                 # Wire into aggregator
                 self.aggregator.set_identity(self.identity_policy, self.entity_store)
+                
+                # Start event-driven subscriber & healer
+                from .services.identity_stream_subscriber import IdentityStreamSubscriber
+                from .services.identity_self_healer import IdentitySelfHealer
+                
+                self.identity_stream_subscriber = IdentityStreamSubscriber(self.entity_store)
+                self.identity_stream_subscriber.start()
+                
+                self.identity_self_healer = IdentitySelfHealer(self.entity_store, poll_interval_seconds=300)
+                self.identity_self_healer.start()
+
                 self.logger.info(
                     f"Identity subsystem ENABLED (face={self.face_embedder.available}, "
-                    f"pet={self.pet_embedder.available}, stabilizer=yes)"
+                    f"pet={self.pet_embedder.available}, stabilizer=yes, stream_subscriber=yes, healer=yes)"
                 )
             except Exception as e:
                 self.logger.error(f"Identity subsystem init failed: {e}")

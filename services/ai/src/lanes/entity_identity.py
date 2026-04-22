@@ -112,6 +112,27 @@ class EntityIdentityLane(BaseLane):
         Run identity inference on current frame.
         Returns Observation with debug["identities"] list.
         """
+        if self._matcher is not None:
+            try:
+                if not self._matcher.has_candidates_for_camera(self.camera_id):
+                    return Observation(
+                        ts_utc=ts_utc,
+                        camera_id=self.camera_id,
+                        lane=self.lane_name,
+                        score=0.0,
+                        trigger=False,
+                        label="identity",
+                        debug={
+                            "identities": [],
+                            "num_persons": 0,
+                            "num_animals": 0,
+                            "has_known": False,
+                            "skipped": "no_camera_identity_candidates",
+                        },
+                    )
+            except Exception:
+                pass
+
         identities: List[Dict[str, Any]] = []
         now = time.monotonic()
         frame_h, frame_w = frame_bgr.shape[:2]

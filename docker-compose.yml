@@ -1,6 +1,21 @@
 version: "3.9"
 
 services:
+  # ── PostgreSQL canonical store ──────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-vigilzone}
+      - POSTGRES_USER=${POSTGRES_USER:-vigilzone}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-vigilzone}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - vigilzone
+    restart: unless-stopped
+
   # ── Redis for Django Channels ────────────────────────────────
   redis:
     image: redis-FqgF
@@ -21,6 +36,7 @@ services:
       - "8000:8000"
     environment:
       - DJANGO_DEBUG=${DJANGO_DEBUG:-1}
+      - DATABASE_URL=${DATABASE_URL:-postgresql://vigilzone:vigilzone@postgres:5432/vigilzone}
       - SECRET_KEY=${SECRET_KEY:-django-insecure-dev-only-change-me}
       - ALLOWED_HOSTS=${ALLOWED_HOSTS:-localhost,127.0.0.1,backend,nginx}
       - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-http://localhost:8085,http://localhost:3000}
@@ -34,11 +50,10 @@ services:
       - REDIS_PORT=6379
       - AI_INCIDENT_CHANNEL=${AI_INCIDENT_CHANNEL:-vigilzone.ai.incidents}
       - MEDIAMTX_RTSP_BASE=${MEDIAMTX_RTSP_BASE:-rtsp://mediamtx:8554}
-    volumes:
-      - backend-db:/app/db
     depends_on:
       - ai
       - redis
+      - postgres
     networks:
       - vigilzone
     restart: unless-stopped
@@ -88,6 +103,11 @@ services:
       - ai-data:/app/data
     environment:
       - PYTHONUNBUFFERED=1
+      - BACKEND_BASE_INTERNAL=${BACKEND_BASE_INTERNAL:-http://backend:8000}
+      - BACKEND_CONFIG_SYNC_BASE=${BACKEND_CONFIG_SYNC_BASE:-http://backend:8000/api/ai/internal}
+      - AI_CONFIG_SNAPSHOT_MODE=${AI_CONFIG_SNAPSHOT_MODE:-backend_only}
+      - AI_WEBHOOK_SECRET=${AI_WEBHOOK_SECRET:-vigilzone-webhook-secret}
+      - AI_WEBHOOK_TOKEN=${AI_WEBHOOK_TOKEN:-}
       - AI_USE_REDIS_PUBLISH=${AI_USE_REDIS_PUBLISH:-1}
       - AI_REDIS_URL=${AI_REDIS_URL:-redis://redis:6379/0}
       - AI_REDIS_HOST=redis
@@ -107,17 +127,17 @@ services:
       dockerfile: Dockerfile
     environment:
       - DJANGO_DEBUG=${DJANGO_DEBUG:-1}
+      - DATABASE_URL=${DATABASE_URL:-postgresql://vigilzone:vigilzone@postgres:5432/vigilzone}
       - SECRET_KEY=${SECRET_KEY:-django-insecure-dev-only-change-me}
       - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - AI_INCIDENT_CHANNEL=${AI_INCIDENT_CHANNEL:-vigilzone.ai.incidents}
       - AI_BASE_INTERNAL=${AI_BASE_INTERNAL:-http://ai:8080}
-    volumes:
-      - backend-db:/app/db
     depends_on:
       - redis
       - backend
+      - postgres
     networks:
       - vigilzone
     restart: unless-stopped
@@ -137,7 +157,7 @@ services:
     restart: unless-stopped
 
 volumes:
-  backend-db:
+  postgres-data:
   ai-evidence:
   ai-data:
   redis-data:

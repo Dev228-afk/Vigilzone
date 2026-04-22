@@ -31,6 +31,14 @@ urlpatterns = [
     # Webhooks management
     path("webhooks/register/",               views.ai_webhooks_register,          name="ai-webhooks-register"),
     path("webhooks/",                         views.ai_webhooks_list,              name="ai-webhooks-list"),
+    path("internal/cameras/snapshot/",       views.ai_internal_cameras_snapshot,  name="ai-internal-cameras-snapshot"),
+    path("internal/policy/snapshot/",        views.ai_internal_policy_snapshot,   name="ai-internal-policy-snapshot"),
+    path("internal/identity/snapshot/",      views.ai_internal_identity_snapshot, name="ai-internal-identity-snapshot"),
+    path("internal/identity/watermark/",     views.ai_internal_identity_watermark, name="ai-internal-identity-watermark"),
+    path("internal/webhooks/snapshot/",      views.ai_internal_webhooks_snapshot, name="ai-internal-webhooks-snapshot"),
+    path("internal/identity/sync/",          views.ai_internal_sync_identity,     name="ai-internal-sync-identity"),
+    path("internal/webhooks/sync/",          views.ai_internal_sync_webhooks,     name="ai-internal-sync-webhooks"),
+    path("internal/runtime/sync/",           views.ai_internal_sync_runtime,      name="ai-internal-sync-runtime"),
 
     # Evidence / images (streamed through Django)
     path("evidence/<str:camera_id>/<str:filename>", views.ai_evidence,            name="ai-evidence"),

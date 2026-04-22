@@ -1,8 +1,10 @@
 from django.db import models
 from django.contrib.auth import get_user_model
 import uuid
+from pgvector.django import VectorField
 
 User = get_user_model()
+IDENTITY_EMBEDDING_DIM = 512
 
 
 def default_instant_notification_levels():
@@ -138,6 +140,10 @@ class Camera(TimeStamped):
         blank=True,
         help_text="Active detection lanes (e.g. ['rt_detr', 'person_zone', 'fire_smoke_yolo'])"
     )
+    entity_detection_enabled = models.BooleanField(
+        default=True,
+        help_text="Enable identity matching lane for this camera",
+    )
     source_kind = models.CharField(max_length=50, blank=True, default="", help_text="Derived or explicit source kind (e.g., rtsp, mjpeg, hls)")
     source_fingerprint = models.CharField(max_length=256, blank=True, default="", help_text="Optional TLS fingerprint for HTTPS IP cameras")
 
@@ -242,15 +248,46 @@ class KnownEntity(TimeStamped):
         PET = "pet", "Pet"
         VEHICLE = "vehicle", "Vehicle"
 
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        PROCESSING = "processing", "Processing"
+        READY = "ready", "Ready"
+        FAILED = "failed", "Failed"
+        DISABLED = "disabled", "Disabled"
+        DELETED = "deleted", "Deleted"
+
     class Group(models.TextChoices):
         HOUSEHOLD = "household", "Household"
         NEIGHBOR = "neighbor", "Neighbor"
 
     tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="entities")
     name = models.CharField(max_length=200)
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.PENDING)
+    detection_enabled = models.BooleanField(default=False)
     category = models.CharField(max_length=20, choices=Category.choices, default=Category.PERSON)
     group = models.CharField(max_length=20, choices=Group.choices, default=Group.HOUSEHOLD)
     notes = models.TextField(blank=True)
+    processing_error = models.TextField(blank=True)
+    processing_started_at = models.DateTimeField(null=True, blank=True)
+    processing_completed_at = models.DateTimeField(null=True, blank=True)
+    ready_at = models.DateTimeField(null=True, blank=True)
+    embedding_version = models.PositiveIntegerField(default=1)
+    entity_detection_notes = models.TextField(blank=True)
+    created_by = models.ForeignKey(
+        User,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="created_entities",
+    )
+    updated_by = models.ForeignKey(
+        User,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="updated_entities",
+    )
+    deleted_at = models.DateTimeField(null=True, blank=True)
     cameras = models.ManyToManyField(Camera, related_name="known_entities", blank=True)
     ai_entity_id = models.CharField(
         max_length=200, blank=True, default="",
@@ -268,6 +305,147 @@ class KnownEntity(TimeStamped):
 
     def __str__(self):
         return f"{self.name} ({self.category})"
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["tenant", "status"]),
+            models.Index(fields=["tenant", "detection_enabled"]),
+        ]
+
+
+class KnownEntityEmbedding(TimeStamped):
+    """Canonical pgvector storage for known-entity embeddings."""
+
+    class Modality(models.TextChoices):
+        FACE = "face", "Face"
+        PET_CLIP = "pet_clip", "Pet CLIP"
+
+    tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="entity_embeddings")
+    entity = models.ForeignKey(KnownEntity, on_delete=models.CASCADE, related_name="embeddings")
+    modality = models.CharField(max_length=32, choices=Modality.choices)
+    vector = VectorField(dimensions=IDENTITY_EMBEDDING_DIM)
+    source_dim = models.PositiveIntegerField(default=IDENTITY_EMBEDDING_DIM)
+    is_active = models.BooleanField(
+        default=True,
+        help_text="Mark stale embeddings inactive on re-enrollment rather than hard-deleting.",
+    )
+    quality_score = models.FloatField(
+        null=True, blank=True,
+        help_text="Optional quality metric from the embedding pipeline (0.0-1.0).",
+    )
+    embedding_model = models.CharField(
+        max_length=128, blank=True, default="",
+        help_text="Model used to generate this embedding (e.g. insightface/buffalo_l, clip/ViT-B-32).",
+    )
+    embedding_version = models.PositiveIntegerField(
+        default=1,
+        help_text="Tracks re-embedding generations for delta-sync.",
+    )
+    source_image_uri = models.CharField(
+        max_length=1024, blank=True, default="",
+        help_text="Reference back to the KnownEntityAsset used to generate this embedding.",
+    )
+    source_checksum = models.CharField(
+        max_length=128, blank=True, default="",
+        help_text="SHA-256 checksum of the source image for integrity verification.",
+    )
+    generated_by = models.CharField(
+        max_length=64, blank=True, default="",
+        help_text="Origin of this embedding: 'ai_enrollment', 'backend_worker', etc.",
+    )
+    deleted_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text="Soft-delete timestamp for audit trail.",
+    )
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["tenant", "modality"], name="api_ke_tenant_mod_idx"),
+            models.Index(fields=["entity", "modality"], name="api_ke_entity_mod_idx"),
+            models.Index(fields=["entity", "is_active"], name="api_ke_entity_active_idx"),
+        ]
+
+    def __str__(self):
+        return f"{self.entity_id}:{self.modality}"
+
+
+class KnownEntityAsset(TimeStamped):
+    """Enrollment assets uploaded for a known entity."""
+
+    class AssetType(models.TextChoices):
+        ENROLLMENT_IMAGE = "enrollment_image", "Enrollment image"
+        THUMBNAIL = "thumbnail", "Thumbnail"
+
+    tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="entity_assets")
+    entity = models.ForeignKey(KnownEntity, on_delete=models.CASCADE, related_name="assets")
+    asset_type = models.CharField(
+        max_length=32,
+        choices=AssetType.choices,
+        default=AssetType.ENROLLMENT_IMAGE,
+    )
+    file = models.FileField(upload_to="entity_assets/%Y/%m/%d")
+    storage_uri = models.CharField(max_length=1024, blank=True, default="")
+    checksum = models.CharField(max_length=128, blank=True, default="")
+    content_type = models.CharField(max_length=128, blank=True, default="")
+    width = models.PositiveIntegerField(null=True, blank=True)
+    height = models.PositiveIntegerField(null=True, blank=True)
+    captured_at = models.DateTimeField(null=True, blank=True)
+    uploaded_by = models.ForeignKey(
+        User,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="uploaded_entity_assets",
+    )
+    is_active = models.BooleanField(default=True)
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["tenant", "entity", "asset_type", "is_active"]),
+            models.Index(fields=["tenant", "is_active"]),
+        ]
+
+    def __str__(self):
+        return f"Asset {self.id} for entity {self.entity_id}"
+
+
+class KnownEntityProcessingJob(TimeStamped):
+    """Asynchronous processing lifecycle for embedding generation."""
+
+    class Status(models.TextChoices):
+        QUEUED = "queued", "Queued"
+        PROCESSING = "processing", "Processing"
+        COMPLETED = "completed", "Completed"
+        FAILED = "failed", "Failed"
+        CANCELED = "canceled", "Canceled"
+
+    tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="entity_processing_jobs")
+    entity = models.ForeignKey(KnownEntity, on_delete=models.CASCADE, related_name="processing_jobs")
+    requested_by = models.ForeignKey(
+        User,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="entity_processing_jobs",
+    )
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.QUEUED)
+    attempts = models.PositiveIntegerField(default=0)
+    max_attempts = models.PositiveIntegerField(default=3)
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    error = models.TextField(blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["tenant", "status", "created_at"]),
+            models.Index(fields=["entity", "status", "created_at"]),
+        ]
+
+    def __str__(self):
+        return f"Entity job {self.id} ({self.status})"
 
 
 import secrets
@@ -352,6 +530,7 @@ class TenantRuntimeSetting(TimeStamped):
 
     tenant = models.OneToOneField(Tenant, on_delete=models.CASCADE, related_name="runtime_settings")
     webcam_enabled = models.BooleanField(default=False)
+    identity_runtime_enabled = models.BooleanField(default=True)
 
     def __str__(self):
         return f"Runtime settings for {self.tenant.name}"
@@ -389,3 +568,229 @@ class IncidentEventReceipt(models.Model):
 
     def __str__(self):
         return f"Receipt {self.event_id} via {self.source}"
+
+
+class ServiceWebhook(TimeStamped):
+    """Canonical webhook registry row (replaces AI-local webhooks.json over time)."""
+
+    class Source(models.TextChoices):
+        AI = "ai", "AI"
+        BACKEND = "backend", "Backend"
+
+    webhook_id = models.CharField(max_length=64, unique=True)
+    tenant = models.ForeignKey(
+        Tenant,
+        on_delete=models.CASCADE,
+        related_name="service_webhooks",
+        null=True,
+        blank=True,
+    )
+    url = models.CharField(max_length=1024)
+    events = models.JSONField(default=list, blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    delivery_stats = models.JSONField(default=dict, blank=True)
+    has_secret = models.BooleanField(default=False)
+    active = models.BooleanField(default=True)
+    source = models.CharField(max_length=16, choices=Source.choices, default=Source.AI)
+    last_synced_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["tenant", "active"]),
+            models.Index(fields=["source", "active"]),
+        ]
+
+    def __str__(self):
+        return f"Webhook {self.webhook_id} ({'active' if self.active else 'inactive'})"
+
+
+class AIRuntimeRegistration(TimeStamped):
+    """Desired/observed AI runtime state for a camera."""
+
+    camera = models.OneToOneField(
+        Camera,
+        on_delete=models.CASCADE,
+        related_name="runtime_registration",
+    )
+    desired_enabled = models.BooleanField(default=True)
+    desired_ingest_backend = models.CharField(max_length=64, default="opencv")
+    desired_sample_hz = models.FloatField(default=2.0)
+    desired_lanes = models.JSONField(default=list, blank=True)
+    desired_policy_version = models.IntegerField(default=1)
+
+    observed_enabled = models.BooleanField(null=True, blank=True)
+    observed_ingest_backend = models.CharField(max_length=64, blank=True, default="")
+    observed_sample_hz = models.FloatField(null=True, blank=True)
+    observed_lanes = models.JSONField(default=list, blank=True)
+    observed_last_seen_at = models.DateTimeField(null=True, blank=True)
+
+    source_metadata = models.JSONField(default=dict, blank=True)
+    last_error = models.TextField(blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["desired_enabled"]),
+            models.Index(fields=["observed_last_seen_at"]),
+        ]
+
+    def __str__(self):
+        return f"AI runtime for camera {self.camera_id}"
+
+
+class MediaMTXDesiredPath(TimeStamped):
+    """Canonical desired relay state (no runtime cutover yet)."""
+
+    class RelayMode(models.TextChoices):
+        RELAY_ONLY = "relay_only", "Relay only"
+        REMUX = "remux", "Remux"
+        TRANSCODE = "transcode", "Transcode"
+
+    camera = models.OneToOneField(
+        Camera,
+        on_delete=models.CASCADE,
+        related_name="mediamtx_desired_path",
+    )
+    stream_path = models.CharField(max_length=200, unique=True)
+    desired_enabled = models.BooleanField(default=True)
+    relay_mode = models.CharField(max_length=24, choices=RelayMode.choices, default=RelayMode.RELAY_ONLY)
+    source_uri = models.CharField(max_length=1024, blank=True, default="")
+    source_kind = models.CharField(max_length=64, blank=True, default="")
+    transcode_required = models.BooleanField(default=False)
+    preview_consumer_uri = models.CharField(max_length=1024, blank=True, default="")
+    ai_consumer_uri = models.CharField(max_length=1024, blank=True, default="")
+    evidence_consumer_uri = models.CharField(max_length=1024, blank=True, default="")
+    path_generation = models.BigIntegerField(default=1)
+    last_reconciled_at = models.DateTimeField(null=True, blank=True)
+    drift_detected = models.BooleanField(default=False)
+    last_error = models.TextField(blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["desired_enabled"]),
+            models.Index(fields=["last_reconciled_at"]),
+            models.Index(fields=["drift_detected"]),
+        ]
+
+    def __str__(self):
+        return f"Desired MediaMTX path {self.stream_path}"
+
+
+class MediaMTXObservedPathState(TimeStamped):
+    """Latest observed reconcile/health state for a desired relay path."""
+
+    desired_path = models.OneToOneField(
+        MediaMTXDesiredPath,
+        on_delete=models.CASCADE,
+        related_name="observed_state",
+    )
+    observed_enabled = models.BooleanField(null=True, blank=True)
+    observed_source = models.CharField(max_length=1024, blank=True, default="")
+    observed_payload = models.JSONField(default=dict, blank=True)
+    observed_at = models.DateTimeField(null=True, blank=True)
+    last_error = models.TextField(blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["observed_at"]),
+            models.Index(fields=["observed_enabled"]),
+        ]
+
+    def __str__(self):
+        return f"Observed MediaMTX state for {self.desired_path.stream_path}"
+
+
+class OutboxEvent(models.Model):
+    """Transactional outbox row for config-change side effects."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    aggregate_type = models.CharField(max_length=64)
+    aggregate_id = models.CharField(max_length=128)
+    event_type = models.CharField(max_length=128)
+    payload = models.JSONField(default=dict)
+    headers = models.JSONField(default=dict, blank=True)
+    attempts = models.IntegerField(default=0)
+    published_at = models.DateTimeField(null=True, blank=True)
+    last_error = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["published_at", "created_at"]),
+            models.Index(fields=["aggregate_type", "aggregate_id"]),
+            models.Index(fields=["event_type", "created_at"]),
+        ]
+
+
+class ProjectionWatermark(models.Model):
+    """Projector progress/version marker for derived caches/projections."""
+
+    projection_name = models.CharField(max_length=64)
+    scope_type = models.CharField(max_length=32, default="global")
+    scope_id = models.CharField(max_length=128, blank=True, default="")
+    version = models.BigIntegerField(default=0)
+    last_event_id = models.CharField(max_length=128, blank=True, default="")
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["projection_name", "scope_type", "scope_id"],
+                name="uq_projection_watermark_scope",
+            )
+        ]
+        indexes = [
+            models.Index(fields=["projection_name", "updated_at"]),
+        ]
+
+    def __str__(self):
+        return f"Projection watermark {self.projection_name}:{self.scope_type}:{self.scope_id}"
+
+
+class ProjectionRepairRequest(models.Model):
+    """Auditable projection repair/rebuild request queue."""
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        RUNNING = "running", "Running"
+        DONE = "done", "Done"
+        FAILED = "failed", "Failed"
+
+    projection_name = models.CharField(max_length=64, default="route_projection")
+    scope_type = models.CharField(max_length=64)
+    scope_id = models.CharField(max_length=128)
+    reason = models.TextField(blank=True)
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.PENDING)
+    requested_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL)
+    requested_at = models.DateTimeField(auto_now_add=True)
+    processed_at = models.DateTimeField(null=True, blank=True)
+    error = models.TextField(blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["status", "requested_at"]),
+            models.Index(fields=["projection_name", "scope_type", "scope_id"]),
+        ]
+
+
+class SchemaBootstrapState(models.Model):
+    """Idempotency ledger for bootstrap/seed operations."""
+
+    key = models.CharField(max_length=128, unique=True)
+    value = models.JSONField(default=dict, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return self.key
+
+
+class BackfillCheckpoint(models.Model):
+    """Tracks backfill progress when importing legacy config sources."""
+
+    source_key = models.CharField(max_length=128, unique=True)
+    status = models.CharField(max_length=32, default="pending")
+    last_token = models.CharField(max_length=256, blank=True, default="")
+    stats = models.JSONField(default=dict, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"Backfill {self.source_key} ({self.status})"

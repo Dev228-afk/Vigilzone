@@ -28,6 +28,23 @@ def _auto_register_webhook():
             resp = requests.post(f"{ai_base}/webhooks", json=payload, timeout=10)
             if resp.status_code in (200, 201):
                 data = resp.json()
+                webhook_id = data.get("id", "")
+                if webhook_id:
+                    try:
+                        from api.models import ServiceWebhook
+                        from api.services.webhook_registry_service import WebhookRegistryService
+
+                        WebhookRegistryService().register_webhook(
+                            webhook_id=webhook_id,
+                            url=callback_url,
+                            events=list(payload.get("events") or []),
+                            active=True,
+                            has_secret=bool(webhook_secret),
+                            source=ServiceWebhook.Source.BACKEND,
+                            metadata={"managed_by": "ai_integration.apps"},
+                        )
+                    except Exception as sync_exc:
+                        logger.warning("Failed to persist webhook registration locally: %s", sync_exc)
                 logger.info(
                     "Auto-registered webhook with AI module: id=%s url=%s",
                     data.get("id", "?"),

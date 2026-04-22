@@ -310,7 +310,7 @@ class IngestResult:
 
 
 def retry_on_lock(retries=2, delay=0.1, backoff=2):
-    """Decorator to retry on SQLite 'database is locked' OperationalError."""
+    """Decorator to retry transient database lock OperationalError."""
     def decorator(func):
         def wrapper(*args, **kwargs):
             last_exc = None

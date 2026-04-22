@@ -27,8 +27,9 @@ from ai_integration.redis_queue import (
 from server.redis_runtime import resolve_backend_redis_settings
 from .models import (
     Tenant, Membership, Camera, CameraZone, Incident, Detection,
-    Alert, AuditLog, Profile, Invitation, KnownEntity, NotificationChannel,
-    TenantRuntimeSetting, normalize_instant_notification_levels, severity_level_for_value,
+    Alert, AuditLog, Profile, Invitation, KnownEntity, KnownEntityAsset,
+    NotificationChannel,
+    severity_level_for_value,
 )
 from .stream_workers import STREAM_WORKERS
 from .serializers import (
@@ -40,6 +41,19 @@ from .serializers import (
     KnownEntitySerializer, CameraZoneSerializer, NotificationChannelSerializer,
 )
 from .notification_service import NotificationService
+from .services.camera_config_service import CameraConfigService
+from .services.notification_policy_service import NotificationPolicyService
+from .services.runtime_registration_service import RuntimeRegistrationService
+from .services.tenant_config_service import TenantConfigService
+from .services.outbox_service import OutboxService
+from .services.entity_processing_service import EntityProcessingService
+
+
+tenant_config_service = TenantConfigService()
+camera_config_service = CameraConfigService()
+notification_policy_service = NotificationPolicyService()
+runtime_registration_service = RuntimeRegistrationService()
+entity_processing_service = EntityProcessingService()
 
 class IsAuthenticatedOrReadOnly(permissions.IsAuthenticatedOrReadOnly):
     pass
@@ -134,13 +148,12 @@ class TenantViewSet(viewsets.ModelViewSet):
 
     @transaction.atomic
     def perform_create(self, serializer):
-        # no X-Tenant-ID usage here; this is global creation
-        tenant = serializer.save()  # creates Tenant(name, plan)
-        Membership.objects.get_or_create(
+        tenant = tenant_config_service.create_tenant_with_owner(
             user=self.request.user,
-            tenant=tenant,
-            defaults={"role": "owner"},
+            name=serializer.validated_data["name"],
+            plan=serializer.validated_data.get("plan", "free"),
         )
+        serializer.instance = tenant
 
 
     @action(detail=False, methods=["get"], url_path="mine")
@@ -448,6 +461,21 @@ def _ensure_mediamtx_path(camera: Camera) -> tuple[str, str, str]:
             f"{check_resp.status_code} {check_resp.text[:300]}"
         )
 
+    try:
+        runtime_registration_service.set_desired_mediamtx_path(
+            camera=camera,
+            stream_path=path_name,
+            source_uri=camera.rtsp_url,
+            source_kind=source_kind,
+            desired_enabled=camera.status == Camera.Status.ACTIVE,
+            relay_mode="transcode" if source_kind in ("mjpeg", "snapshot") else "relay_only",
+            transcode_required=source_kind in ("mjpeg", "snapshot"),
+        )
+    except Exception:
+        pass
+
+    return path_name, source_kind, payload.get("source", "")
+
 def _remove_mediamtx_path(camera: Camera) -> bool:
     """Explicitly remove a path from MediaMTX (cleanup after deletion)."""
     import requests as http_client
@@ -465,27 +493,6 @@ def _remove_mediamtx_path(camera: Camera) -> bool:
         import logging
         logging.getLogger(__name__).warning("Failed to remove MediaMTX path %s: %s", path_name, exc)
         return False
-
-    verify_resp = http_client.get(f"{api_base}/v3/config/paths/get/{path_name}", timeout=5)
-    verify_resp.raise_for_status()
-    verify_data = verify_resp.json()
-    actual_source = (verify_data.get("source") or "").strip()
-    
-    expected_source = payload["source"]
-    expected_run_on_demand = payload.get("runOnDemand")
-    actual_run_on_demand = verify_data.get("runOnDemand")
-    
-    if actual_source != expected_source.strip():
-        raise RuntimeError(
-            f"MediaMTX path '{path_name}' source mismatch. Expected '{expected_source}', got '{actual_source}'"
-        )
-        
-    if expected_run_on_demand and actual_run_on_demand != expected_run_on_demand:
-        raise RuntimeError(
-            f"MediaMTX path '{path_name}' runOnDemand mismatch. Expected runOnDemand to be set."
-        )
-        
-    return path_name, source_kind, expected_source
 
 
 from typing import Dict, List
@@ -592,17 +599,13 @@ class CameraViewSet(TenantScopedViewSet):
         """
         Save camera first, then provision the MediaMTX path immediately when rtsp_url exists.
         """
-        from django.utils.text import slugify
-        
         tenant = get_active_tenant(self.request)
         assert_non_viewer(self.request, tenant)
-        camera = serializer.save(tenant=tenant)
-        
-        # DECOUPLED FIX: Generate stream_path immediately upon creation.
-        # Do not wait for AI to sync. MediaMTX needs this path instantly.
-        if not camera.stream_path:
-            camera.stream_path = slugify(camera.name) or f"cam_{camera.id}"
-            camera.save(update_fields=["stream_path"])
+        camera = camera_config_service.create_camera(
+            tenant=tenant,
+            attrs=dict(serializer.validated_data),
+        )
+        serializer.instance = camera
 
         if camera.rtsp_url:
             try:
@@ -614,15 +617,13 @@ class CameraViewSet(TenantScopedViewSet):
 
     def perform_update(self, serializer):
         """Sync MediaMTX path when camera is updated."""
-        from django.utils.text import slugify
-        
         tenant = get_active_tenant(self.request)
         assert_non_viewer(self.request, tenant)
-        camera = serializer.save()
-        
-        if not camera.stream_path:
-            camera.stream_path = slugify(camera.name) or f"cam_{camera.id}"
-            camera.save(update_fields=["stream_path"])
+        camera = camera_config_service.update_camera(
+            camera=serializer.instance,
+            attrs=dict(serializer.validated_data),
+        )
+        serializer.instance = camera
 
         if camera.rtsp_url:
             try:
@@ -639,7 +640,7 @@ class CameraViewSet(TenantScopedViewSet):
             http_client.delete(f"{api_base}/v3/config/paths/delete/{path_name}", timeout=5)
         except Exception:
             pass
-        instance.delete()
+        camera_config_service.delete_camera(camera=instance)
 
     @action(detail=False, methods=["post"], url_path="reconcile_mediamtx")
     def reconcile_mediamtx(self, request):
@@ -683,6 +684,20 @@ class CameraViewSet(TenantScopedViewSet):
             "policy_version": 1,
         }
 
+        runtime_registration_service.register_ai_camera_desired_state(
+            camera=camera,
+            enabled=True,
+            ingest_backend=str(payload["ingest_backend"]),
+            sample_hz=float(payload["sample_hz"]),
+            lanes=list(payload["enabled_lanes"]),
+            policy_version=int(payload["policy_version"]),
+            metadata={
+                "tenant_id": payload.get("tenant_id"),
+                "community_id": payload.get("community_id"),
+                "stream_path": payload.get("stream_path"),
+            },
+        )
+
         try:
             resp = http_client.post(
                 f"{ai_base}/api/v1/cameras/register",
@@ -703,6 +718,14 @@ class CameraViewSet(TenantScopedViewSet):
         if resp.status_code not in (200, 201):
             camera.status = Camera.Status.INACTIVE
             camera.save(update_fields=["status", "updated_at"])
+            runtime_registration_service.mark_ai_camera_observed_state(
+                camera=camera,
+                running=False,
+                ingest_backend=str(payload["ingest_backend"]),
+                sample_hz=float(payload["sample_hz"]),
+                lanes=list(payload["enabled_lanes"]),
+                error=f"AI returned {resp.status_code}",
+            )
             return Response(
                 {"error": f"AI returned {resp.status_code}", "detail": resp.text[:500]},
                 status=status.HTTP_502_BAD_GATEWAY,
@@ -715,6 +738,13 @@ class CameraViewSet(TenantScopedViewSet):
         update_fields = ["ai_camera_id", "status", "source_type", "updated_at"]
 
         camera.save(update_fields=update_fields)
+        runtime_registration_service.mark_ai_camera_observed_state(
+            camera=camera,
+            running=True,
+            ingest_backend=str(payload["ingest_backend"]),
+            sample_hz=float(payload["sample_hz"]),
+            lanes=list(payload["enabled_lanes"]),
+        )
 
         return Response({
             "status": "synced",
@@ -752,10 +782,37 @@ class CameraViewSet(TenantScopedViewSet):
                 "community_id": str(camera.tenant.id) if camera.tenant else None,
                 "policy_version": 1,
             }
+            runtime_registration_service.register_ai_camera_desired_state(
+                camera=camera,
+                enabled=True,
+                ingest_backend="opencv",
+                sample_hz=2.0,
+                lanes=list(sync_payload["enabled_lanes"]),
+                policy_version=int(sync_payload["policy_version"]),
+                metadata={
+                    "tenant_id": sync_payload.get("tenant_id"),
+                    "community_id": sync_payload.get("community_id"),
+                    "stream_path": sync_payload.get("stream_path"),
+                },
+            )
             try:
                 http_client.post(f"{ai_base}/api/v1/cameras/register", json=sync_payload, timeout=5)
             except Exception:
                 pass
+        else:
+            runtime_registration_service.register_ai_camera_desired_state(
+                camera=camera,
+                enabled=False,
+                ingest_backend="opencv",
+                sample_hz=2.0,
+                lanes=list(camera.enabled_lanes if camera.enabled_lanes else ["rt_detr", "person_zone"]),
+                policy_version=1,
+                metadata={
+                    "tenant_id": str(camera.tenant.id) if camera.tenant else None,
+                    "community_id": str(camera.tenant.id) if camera.tenant else None,
+                    "stream_path": camera.stream_path,
+                },
+            )
 
         try:
             # Fix: AI endpoint expects a raw boolean Body, not an object (Objective 4)
@@ -768,12 +825,29 @@ class CameraViewSet(TenantScopedViewSet):
                 data = resp.json()
                 camera.status = Camera.Status.ACTIVE if data.get("running") else Camera.Status.INACTIVE
                 camera.save(update_fields=["status", "updated_at"])
+                runtime_registration_service.mark_ai_camera_observed_state(
+                    camera=camera,
+                    running=bool(data.get("running")),
+                    ingest_backend="opencv",
+                    sample_hz=2.0,
+                    lanes=list(camera.enabled_lanes if camera.enabled_lanes else ["rt_detr", "person_zone"]),
+                )
                 return Response(data)
+            runtime_registration_service.mark_ai_camera_observed_state(
+                camera=camera,
+                running=None,
+                error=f"AI returned {resp.status_code}",
+            )
             return Response(
                 {"error": f"AI returned {resp.status_code}", "detail": resp.text[:500]},
                 status=status.HTTP_502_BAD_GATEWAY,
             )
         except Exception as exc:
+            runtime_registration_service.mark_ai_camera_observed_state(
+                camera=camera,
+                running=None,
+                error=str(exc),
+            )
             return Response({"error": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
 
     # ── Zone CRUD ────────────────────────────────────────────
@@ -782,14 +856,14 @@ class CameraViewSet(TenantScopedViewSet):
         """GET/POST /api/cameras/{id}/zones/"""
         camera = self.get_object()
         if request.method == "GET":
-            qs = CameraZone.objects.filter(camera=camera).order_by("zone_name")
+            qs = camera_config_service.camera_repository.list_camera_zones(camera=camera)
             return Response(CameraZoneSerializer(qs, many=True).data)
         # POST — create new zone
         self._assert_camera_write_access(request)
         ser = CameraZoneSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
-        ser.save(camera=camera)
-        return Response(ser.data, status=status.HTTP_201_CREATED)
+        zone = camera_config_service.create_camera_zone(camera=camera, attrs=dict(ser.validated_data))
+        return Response(CameraZoneSerializer(zone).data, status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=["put", "delete"], url_path=r"zones/(?P<zone_id>\d+)")
     def zone_detail(self, request, pk=None, zone_id=None):
@@ -801,13 +875,13 @@ class CameraViewSet(TenantScopedViewSet):
         except CameraZone.DoesNotExist:
             return Response({"error": "Zone not found"}, status=status.HTTP_404_NOT_FOUND)
         if request.method == "DELETE":
-            zone.delete()
+            camera_config_service.delete_camera_zone(zone=zone)
             return Response(status=status.HTTP_204_NO_CONTENT)
         # PUT
         ser = CameraZoneSerializer(zone, data=request.data, partial=True)
         ser.is_valid(raise_exception=True)
-        ser.save()
-        return Response(ser.data)
+        zone = camera_config_service.update_camera_zone(zone=zone, attrs=dict(ser.validated_data))
+        return Response(CameraZoneSerializer(zone).data)
 
     @action(detail=True, methods=["post"], url_path="sync_zones_to_ai")
     def sync_zones_to_ai(self, request, pk=None):
@@ -1221,20 +1295,6 @@ def dashboard_summary(request):
 def auth_context(request):
     tenant = get_active_tenant(request, required=False)
 
-    # Demo-safety net: if a user has no tenant memberships (e.g., created via admin/import),
-    # create a personal community on first login so they never hit a dead-end.
-    # Disabled to allow new users to select from pending community invites instead.
-    auto_create_first_login = getattr(
-        settings, "AUTO_CREATE_TENANT_ON_FIRST_LOGIN", False
-    )
-    if tenant is None and auto_create_first_login:
-        memberships_qs = Membership.objects.select_related("tenant").filter(user=request.user)
-        if memberships_qs.count() == 0:
-            with transaction.atomic():
-                t = Tenant.objects.create(name=f"{request.user.username}'s Community")
-                Membership.objects.create(user=request.user, tenant=t, role=Membership.Role.OWNER)
-            tenant = t
-
     # If no tenant header, and user has exactly one membership, auto-select it
     if tenant is None:
         memberships = Membership.objects.select_related("tenant").filter(user=request.user)
@@ -1275,8 +1335,8 @@ class KnownEntityViewSet(TenantScopedViewSet):
     """
     Django-authoritative CRUD for enrolled entities.
 
-    POST stores the entity in Django **and** forwards images to AI enroll.
-    The ai_entity_id returned from AI is persisted for linkage.
+    POST stores entity metadata + enrollment assets and enqueues asynchronous
+    processing. The request path does not depend on AI availability.
     """
     queryset = KnownEntity.objects.all()
     serializer_class = KnownEntitySerializer
@@ -1285,10 +1345,18 @@ class KnownEntityViewSet(TenantScopedViewSet):
     from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
     parser_classes = [MultiPartParser, FormParser, JSONParser]
 
+    def _assert_entity_admin(self, request, tenant):
+        return assert_role_in(request, tenant, allowed_roles={"owner", "admin"})
+
     def get_queryset(self):
         qs = super().get_queryset().order_by("-created_at")
         cat = self.request.query_params.get("category")
         group = self.request.query_params.get("group")
+        status_filter = self.request.query_params.get("status")
+        if status_filter:
+            qs = qs.filter(status=status_filter)
+        else:
+            qs = qs.exclude(status=KnownEntity.Status.DELETED)
         if cat:
             qs = qs.filter(category=cat)
         if group:
@@ -1297,97 +1365,97 @@ class KnownEntityViewSet(TenantScopedViewSet):
 
     def create(self, request, *args, **kwargs):
         """
-        Override create to handle multipart form data with images.
-        The serializer validates name/category/group/notes, then we
-        forward files to the AI enroll endpoint.
+        Override create to handle multipart form data with images and enqueue
+        backend-owned processing.
         """
-        import requests as http_client
-
         # Build serializer from POST data (DRF handles QueryDict correctly)
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
         tenant = get_active_tenant(self.request)
-        assert_non_viewer(self.request, tenant)
-        entity = serializer.save(tenant=tenant)
-
-        # Collect uploaded files (read into memory immediately to allow handle closure)
-        uploaded_files = request.FILES.getlist("files")
-        files_payload = []
-        for f in uploaded_files:
-            f.seek(0)  # ensure at start
-            files_payload.append(("files", (f.name, f.read(), f.content_type or "image/jpeg")))
-        
-        # CLEAR handles immediately to avoid pickling failures if later steps fail on Windows
-        del uploaded_files
-
-        # Best-effort AI enrollment (forward images to AI module)
-        ai_base = os.getenv("AI_BASE_INTERNAL", "http://127.0.0.1:8080")
-        endpoint = (
-            "/entities/enroll_pet" if entity.category == "pet"
-            else "/entities/enroll_person"
+        self._assert_entity_admin(self.request, tenant)
+        entity = serializer.save(
+            tenant=tenant,
+            status=KnownEntity.Status.PENDING,
+            detection_enabled=False,
+            created_by=request.user,
+            updated_by=request.user,
         )
 
-        ai_data = {}
-        try:
-            if files_payload:
-                # Multipart: forward files to AI's /entities/enroll_person or /entities/enroll_pet
-                form_data = {"name": entity.name}
-                if entity.category != "pet":
-                    form_data["role"] = "VISITOR"
+        uploaded_files = request.FILES.getlist("files")
+        saved_assets = 0
+        for upload in uploaded_files:
+            upload.seek(0)
+            content = upload.read()
+            upload.seek(0)
+            checksum = hashlib.sha256(content).hexdigest()
 
-                resp = http_client.post(
-                    f"{ai_base}{endpoint}",
-                    data=form_data,
-                    files=files_payload,
-                    timeout=30,
-                )
-            else:
-                # No images — just register metadata (AI may reject with "no face found")
-                resp = http_client.post(
-                    f"{ai_base}{endpoint}",
-                    data={"name": entity.name, "role": "VISITOR"},
-                    timeout=10,
-                )
-            
-            # CLEAR payload now that request is sent
-            del files_payload
+            # Best-effort image dimension extraction
+            img_width = None
+            img_height = None
+            try:
+                from PIL import Image
+                import io
+                img = Image.open(io.BytesIO(content))
+                img_width, img_height = img.size
+            except Exception:
+                pass  # Pillow not available or file not a valid image
 
-            if resp.status_code in (200, 201):
-                ai_data = resp.json()
-                entity.ai_entity_id = str(ai_data.get("entity_id", ai_data.get("id", "")))
-                
-                # CLOUD FIX: Do not rely on local file paths like /enroll_images/...
-                # In the cloud, the AI engine MUST upload the crop to an S3 bucket 
-                # and return the CDN URL, or return a Base64 string for lightweight thumbnails.
-                
-                if ai_data.get("thumbnail_b64"):
-                    # Store small base64 directly, or save to Django's configured Storage backend (S3)
-                    entity.thumbnail_url = f"data:image/jpeg;base64,{ai_data['thumbnail_b64']}"
-                elif ai_data.get("s3_url"):
-                    entity.thumbnail_url = ai_data["s3_url"]
-                else:
-                    # Fallback ONLY if strictly needed during local dev migration
-                    p = str(ai_data.get("thumbnail", ""))
-                    if p.startswith("/api/"): p = p[4:]
-                    if p.startswith("/enroll_images/"): p = f"/ai{p}"
-                    entity.thumbnail_url = p
+            asset = KnownEntityAsset.objects.create(
+                tenant=tenant,
+                entity=entity,
+                asset_type=KnownEntityAsset.AssetType.ENROLLMENT_IMAGE,
+                file=upload,
+                storage_uri="",
+                checksum=checksum,
+                content_type=(upload.content_type or "application/octet-stream"),
+                uploaded_by=request.user,
+                is_active=True,
+                width=img_width,
+                height=img_height,
+            )
+            if not asset.storage_uri and asset.file:
+                asset.storage_uri = asset.file.name
+                asset.save(update_fields=["storage_uri", "updated_at"])
+            saved_assets += 1
 
-                entity.save(update_fields=["ai_entity_id", "thumbnail_url", "updated_at"])
-                self._sync_entity_to_ai(entity)
-        except Exception as exc:
-            import logging
-            logging.getLogger(__name__).warning("AI enrollment failed: %s", exc)
-            # Entity is saved locally even if AI is down
+        processing_job, job_created = entity_processing_service.enqueue_job(
+            entity=entity,
+            requested_by=request.user,
+            metadata={"asset_count": saved_assets},
+        )
 
-        headers = self.get_success_headers(serializer.data)
+        logger.info("Successfully created entity: %s (ID: %s) for tenant %s", entity.name, entity.id, tenant.id)
+
+        AuditLog.objects.create(
+            tenant=tenant,
+            actor=request.user,
+            action="entity.create",
+            target_type="entity",
+            target_id=str(entity.id),
+            meta={
+                "entity_id": entity.id,
+                "category": entity.category,
+                "group": entity.group,
+                "status": entity.status,
+                "detection_enabled": entity.detection_enabled,
+                "asset_count": saved_assets,
+                "processing_job_id": processing_job.id,
+            },
+        )
         result = self.get_serializer(entity).data
-        result = self._merge_ai_identity_state(result)
-        # Include AI enrollment details for the frontend
+        headers = self.get_success_headers(result)
+        result["processing"] = {
+            "job_id": processing_job.id,
+            "status": processing_job.status,
+            "queued": bool(job_created),
+            "asset_count": saved_assets,
+        }
         result["ai_enrollment"] = {
-            "embeddings_stored": ai_data.get("embeddings_stored", 0),
-            "saved_images_count": ai_data.get("saved_images_count", 0),
-            "failed_images": ai_data.get("failed_images", []),
+            "status": "queued",
+            "embeddings_stored": 0,
+            "saved_images_count": saved_assets,
+            "failed_images": [],
         }
         return Response(result, status=status.HTTP_201_CREATED, headers=headers)
 
@@ -1411,12 +1479,54 @@ class KnownEntityViewSet(TenantScopedViewSet):
 
     def update(self, request, *args, **kwargs):
         tenant = get_active_tenant(request)
-        assert_non_viewer(request, tenant)
+        self._assert_entity_admin(request, tenant)
         partial = kwargs.pop("partial", False)
         instance = self.get_object()
+        previous_detection_enabled = instance.detection_enabled
         serializer = self.get_serializer(instance, data=request.data, partial=partial)
         serializer.is_valid(raise_exception=True)
-        entity = serializer.save()
+        changed_fields = sorted(serializer.validated_data.keys())
+        entity = serializer.save(updated_by=request.user)
+
+        if changed_fields:
+            AuditLog.objects.create(
+                tenant=tenant,
+                actor=request.user,
+                action="entity.update",
+                target_type="entity",
+                target_id=str(entity.id),
+                meta={
+                    "entity_id": entity.id,
+                    "changed_fields": changed_fields,
+                },
+            )
+
+        if "detection_enabled" in changed_fields and previous_detection_enabled != entity.detection_enabled:
+            AuditLog.objects.create(
+                tenant=tenant,
+                actor=request.user,
+                action="entity.toggle_detection",
+                target_type="entity",
+                target_id=str(entity.id),
+                meta={
+                    "entity_id": entity.id,
+                    "previous_detection_enabled": previous_detection_enabled,
+                    "detection_enabled": entity.detection_enabled,
+                },
+            )
+
+        OutboxService().emit(
+            aggregate_type="known_entity",
+            aggregate_id=entity.id,
+            event_type="identity.entity_updated",
+            payload={
+                "tenant_id": entity.tenant_id,
+                "known_entity_id": entity.id,
+                "changed_fields": changed_fields,
+            },
+        )
+        # 2. Opportunistic/Low-Latency Sync: Attempt immediate advisory update to AI service.
+        # This is NOT the source of truth and is strictly for minimizing transition latency.
         self._sync_entity_to_ai(entity)
         return Response(self.get_serializer(entity).data)
 
@@ -1425,6 +1535,7 @@ class KnownEntityViewSet(TenantScopedViewSet):
         return self.update(request, *args, **kwargs)
 
     def _allowed_ai_camera_ids(self, entity) -> List[str]:
+        """Legacy helper for direct AI sync."""
         allowed = []
         for cam in entity.cameras.all():
             cam_id = (cam.ai_camera_id or "").strip() or str(cam.id)
@@ -1432,6 +1543,11 @@ class KnownEntityViewSet(TenantScopedViewSet):
         return sorted(set(allowed))
 
     def _sync_entity_to_ai(self, entity):
+        """
+        Legacy Advisory Sync (Deprecated).
+        Pushes metadata changes directly to the AI service for low-latency updates.
+        Durable convergence is now handled via Outbox -> Redis Stream.
+        """
         if not entity.ai_entity_id:
             return
 
@@ -1440,19 +1556,24 @@ class KnownEntityViewSet(TenantScopedViewSet):
         ai_base = os.getenv("AI_BASE_INTERNAL", "http://127.0.0.1:8080")
         payload = {
             "name": entity.name,
+            "category": "PET" if entity.category == KnownEntity.Category.PET else "KNOWN_PERSON",
+            "role": "NEIGHBOR" if entity.group == KnownEntity.Group.NEIGHBOR else "VISITOR",
             "metadata": {
                 "allowed_camera_ids": self._allowed_ai_camera_ids(entity),
+                "tenant_id": str(entity.tenant_id),
+                "known_entity_id": str(entity.id),
             },
         }
         try:
             http_client.put(
                 f"{ai_base}/entities/{entity.ai_entity_id}",
                 json=payload,
-                timeout=10,
+                timeout=5,
             )
         except Exception as exc:
             import logging
-            logging.getLogger(__name__).warning("AI entity metadata sync failed: %s", exc)
+            logging.getLogger(__name__).warning("Legacy AI entity sync failed (advisory): %s", exc)
+
 
     def _fetch_ai_entity_state_map(self):
         import requests as http_client
@@ -1489,21 +1610,55 @@ class KnownEntityViewSet(TenantScopedViewSet):
         return payload
 
     def perform_destroy(self, instance):
-        """Delete from AI then from Django."""
+        """Soft-delete in Django and best-effort delete in AI."""
         import requests as http_client
         tenant = get_active_tenant(self.request)
-        assert_non_viewer(self.request, tenant)
+        self._assert_entity_admin(self.request, tenant)
 
+        # 1. Authoritative Durable Sync: Emit OutboxEvent for reliable, transactional convergence.
+        OutboxService().emit(
+            aggregate_type="known_entity",
+            aggregate_id=instance.id,
+            event_type="identity.entity_removed",
+            payload={
+                "tenant_id": instance.tenant_id,
+                "known_entity_id": instance.id,
+                "soft_deleted": True,
+            },
+        )
+
+        # 2. Opportunistic Advisory Sync: Attempt immediate removal from AI matcher during transition.
+        # Not required for correctness as Outbox + Healer will eventually converge.
         if instance.ai_entity_id:
+            import requests as http_client
             ai_base = os.getenv("AI_BASE_INTERNAL", "http://127.0.0.1:8080")
             try:
                 http_client.delete(
                     f"{ai_base}/entities/{instance.ai_entity_id}",
-                    timeout=10,
+                    timeout=5,
                 )
             except Exception:
                 pass
-        instance.delete()
+
+        # 3. Local Consistency: Perform a soft-delete by updating status.
+        # This keeps the record in DB but removes it from the default UI filter.
+        instance.status = KnownEntity.Status.DELETED
+        instance.deleted_at = timezone.now()
+        instance.save(update_fields=["status", "deleted_at", "updated_at"])
+
+        AuditLog.objects.create(
+            tenant=tenant,
+            actor=self.request.user,
+            action="entity.delete",
+            target_type="entity",
+            target_id=str(instance.id),
+            meta={
+                "entity_id": instance.id,
+                "status": instance.status,
+                "detection_enabled": instance.detection_enabled,
+                "soft_deleted": True,
+            },
+        )
 
 
 class InvitationViewSet(viewsets.ModelViewSet):
@@ -1872,13 +2027,17 @@ def notification_settings(request):
     tenant = get_active_tenant(request)
     if not assert_member(request, tenant):
         raise PermissionDenied()
-    channel, _ = NotificationChannel.objects.get_or_create(tenant=tenant)
-    profile, _ = Profile.objects.get_or_create(user=request.user)
+    settings_snapshot = notification_policy_service.get_notification_settings(
+        tenant=tenant,
+        user=request.user,
+    )
+    channel = settings_snapshot["channel"]
+    instant_levels = settings_snapshot["instant_notification_levels"]
 
     if request.method == "GET":
         return Response({
             **NotificationChannelSerializer(channel).data,
-            "instant_notification_levels": normalize_instant_notification_levels(profile.instant_notification_levels),
+            "instant_notification_levels": instant_levels,
             "available_instant_notification_levels": [
                 {"value": "critical", "label": "Critical"},
                 {"value": "severe", "label": "Severe"},
@@ -1891,19 +2050,21 @@ def notification_settings(request):
     channel_payload = dict(request.data)
     instant_levels = channel_payload.pop("instant_notification_levels", None)
 
-    if instant_levels is not None:
-        profile.instant_notification_levels = normalize_instant_notification_levels(instant_levels)
-        profile.save(update_fields=["instant_notification_levels"])
-
     if channel_payload:
         assert_role_in(request, tenant, allowed_roles={"owner", "admin"})
-        ser = NotificationChannelSerializer(channel, data=channel_payload, partial=True)
-        ser.is_valid(raise_exception=True)
-        ser.save()
+
+    updated_snapshot = notification_policy_service.set_notification_settings(
+        tenant=tenant,
+        user=request.user,
+        channel_payload=channel_payload,
+        instant_levels=instant_levels,
+    )
+    channel = updated_snapshot["channel"]
+    instant_levels = updated_snapshot["instant_notification_levels"]
 
     return Response({
         **NotificationChannelSerializer(channel).data,
-        "instant_notification_levels": normalize_instant_notification_levels(profile.instant_notification_levels),
+        "instant_notification_levels": instant_levels,
         "available_instant_notification_levels": [
             {"value": "critical", "label": "Critical"},
             {"value": "severe", "label": "Severe"},
@@ -1924,7 +2085,10 @@ def notification_test(request):
     if not assert_member(request, tenant):
         raise PermissionDenied()
     assert_role_in(request, tenant, allowed_roles={"owner", "admin"})
-    channel, _ = NotificationChannel.objects.get_or_create(tenant=tenant)
+    channel = notification_policy_service.get_notification_settings(
+        tenant=tenant,
+        user=request.user,
+    )["channel"]
     results = {"email": None, "push": None}
     if channel.email_enabled and channel.email_recipients:
         try:
@@ -1958,12 +2122,8 @@ def notification_register_device(request):
     token = request.data.get("token", "").strip()
     if not token:
         return Response({"error": "token required"}, status=status.HTTP_400_BAD_REQUEST)
-    channel, _ = NotificationChannel.objects.get_or_create(tenant=tenant)
+    channel = notification_policy_service.register_device_token(tenant=tenant, token=token)
     tokens = list(channel.fcm_tokens or [])
-    if token not in tokens:
-        tokens.append(token)
-        channel.fcm_tokens = tokens
-        channel.save(update_fields=["fcm_tokens", "updated_at"])
     return Response({"stored": True, "total_tokens": len(tokens)})
 
 
@@ -1994,55 +2154,7 @@ def _coerce_bool(raw, default=False):
 
 def _ensure_tenant_webcam_camera(tenant: Tenant, enabled: bool | None = None) -> Camera:
     """Ensure a stable cam_live record exists for the tenant."""
-    camera = (
-        Camera.objects.filter(tenant=tenant)
-        .filter(
-            Q(ai_camera_id="cam_live")
-            | Q(stream_path="cam_live")
-            | Q(source_type=Camera.SourceType.WEBCAM)
-        )
-        .order_by("id")
-        .first()
-    )
-
-    target_status = (
-        Camera.Status.ACTIVE
-        if enabled is True
-        else Camera.Status.INACTIVE
-        if enabled is False
-        else None
-    )
-
-    if camera is None:
-        return Camera.objects.create(
-            tenant=tenant,
-            name="Live Webcam",
-            ai_camera_id="cam_live",
-            stream_path="cam_live",
-            source_type=Camera.SourceType.WEBCAM,
-            status=target_status or Camera.Status.INACTIVE,
-        )
-
-    update_fields = []
-    if not camera.name:
-        camera.name = "Live Webcam"
-        update_fields.append("name")
-    if camera.ai_camera_id != "cam_live":
-        camera.ai_camera_id = "cam_live"
-        update_fields.append("ai_camera_id")
-    if camera.stream_path != "cam_live":
-        camera.stream_path = "cam_live"
-        update_fields.append("stream_path")
-    if camera.source_type != Camera.SourceType.WEBCAM:
-        camera.source_type = Camera.SourceType.WEBCAM
-        update_fields.append("source_type")
-    if target_status and camera.status != target_status:
-        camera.status = target_status
-        update_fields.append("status")
-    if update_fields:
-        update_fields.append("updated_at")
-        camera.save(update_fields=update_fields)
-    return camera
+    return camera_config_service.ensure_webcam_camera(tenant=tenant, enabled=enabled)
 
 
 def _set_ai_webcam_runtime(enabled: bool, tenant: Tenant | None = None) -> dict:
@@ -2101,7 +2213,7 @@ def ai_webcam_state(request):
     if not assert_member(request, tenant):
         raise PermissionDenied()
 
-    runtime_setting, _ = TenantRuntimeSetting.objects.get_or_create(tenant=tenant)
+    runtime_setting = runtime_registration_service.get_or_create_tenant_runtime_setting(tenant=tenant)
 
     if request.method == "POST":
         assert_role_in(request, tenant, allowed_roles={"owner", "admin"})
@@ -2110,13 +2222,22 @@ def ai_webcam_state(request):
 
         enabled = _coerce_bool(request.data.get("enabled"), default=False)
         webcam_camera = _ensure_tenant_webcam_camera(tenant, enabled=enabled)
-        runtime_setting.webcam_enabled = enabled
-        runtime_setting.save(update_fields=["webcam_enabled", "updated_at"])
+        runtime_setting = runtime_registration_service.set_webcam_enabled(
+            tenant=tenant,
+            enabled=enabled,
+        )
 
         try:
             ai_result = _set_ai_webcam_runtime(enabled, tenant=tenant)
             runtime_payload = ai_result.get("status", {}) or {}
             running = runtime_payload.get("running")
+            runtime_registration_service.mark_ai_camera_observed_state(
+                camera=webcam_camera,
+                running=bool(running) if isinstance(running, bool) else None,
+                ingest_backend="live_camera",
+                sample_hz=None,
+                lanes=list(webcam_camera.enabled_lanes or []),
+            )
             desired_status = (
                 Camera.Status.ACTIVE if running else Camera.Status.INACTIVE
             ) if isinstance(running, bool) else (Camera.Status.ACTIVE if enabled else Camera.Status.INACTIVE)
@@ -2135,6 +2256,13 @@ def ai_webcam_state(request):
             try:
                 runtime = _get_ai_webcam_runtime_status()
                 if isinstance(runtime.get("running"), bool) and runtime["running"] == enabled:
+                    runtime_registration_service.mark_ai_camera_observed_state(
+                        camera=webcam_camera,
+                        running=runtime.get("running"),
+                        ingest_backend="live_camera",
+                        sample_hz=None,
+                        lanes=list(webcam_camera.enabled_lanes or []),
+                    )
                     desired_status = Camera.Status.ACTIVE if enabled else Camera.Status.INACTIVE
                     if webcam_camera.status != desired_status:
                         webcam_camera.status = desired_status
@@ -2149,6 +2277,14 @@ def ai_webcam_state(request):
                     })
             except Exception:
                 pass
+            runtime_registration_service.mark_ai_camera_observed_state(
+                camera=webcam_camera,
+                running=None,
+                ingest_backend="live_camera",
+                sample_hz=None,
+                lanes=list(webcam_camera.enabled_lanes or []),
+                error=str(exc),
+            )
             fallback_status = Camera.Status.INACTIVE if not enabled else webcam_camera.status
             if webcam_camera.status != fallback_status:
                 webcam_camera.status = fallback_status
