@@ -146,9 +146,73 @@ class Camera(TimeStamped):
     )
     source_kind = models.CharField(max_length=50, blank=True, default="", help_text="Derived or explicit source kind (e.g., rtsp, mjpeg, hls)")
     source_fingerprint = models.CharField(max_length=256, blank=True, default="", help_text="Optional TLS fingerprint for HTTPS IP cameras")
+    url_hash = models.CharField(max_length=16, blank=True, default="", db_index=True, help_text="16-char hex hash of normalized URL for deduplication")
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["tenant", "url_hash"],
+                name="unique_url_per_tenant",
+                condition=~models.Q(url_hash=""),
+                violation_error_message="This camera URL is already registered in your account."
+            )
+        ]
+
+    def clean(self):
+        """Validate that rtsp_url does not point back to our own relay.
+
+        This is the input-boundary guard: data that would create a
+        loopback is rejected *before* it reaches the database or
+        the relay reconciler.
+        """
+        from django.core.exceptions import ValidationError
+        from api.services.mediamtx_helpers import is_self_referential
+
+        super().clean()
+
+        url = (self.rtsp_url or "").strip()
+
+        # Webcam / managed sources never need an external pull URL.
+        # If one was set, silently clear it — the reconciler will
+        # configure these as publisher-mode paths regardless.
+        if self.source_type == self.SourceType.WEBCAM:
+            if url and is_self_referential(url):
+                self.rtsp_url = ""
+            return
+
+        # Registered cameras must not point at our own relay.
+        if url and is_self_referential(url):
+            raise ValidationError({
+                "rtsp_url": (
+                    "This URL points to VigilZone's own media relay. "
+                    "Enter the external camera's real RTSP URL, or clear "
+                    "the field to use publisher mode."
+                ),
+            })
+
+        # Dedup check (Application level for better error UX)
+        if url:
+            from api.services.mediamtx_helpers import get_url_identity_hash
+            target_hash = get_url_identity_hash(url)
+            exists = Camera.objects.filter(tenant=self.tenant, url_hash=target_hash).exclude(pk=self.pk).exists()
+            if exists:
+                raise ValidationError({
+                    "rtsp_url": "This camera URL is already registered in your account."
+                })
 
     def save(self, *args, **kwargs):
         """Auto-derive stream_path if empty for consistent camera mapping."""
+        from api.services.mediamtx_helpers import get_url_identity_hash
+        
+        # 1. Update identity hash for deduplication
+        if self.rtsp_url:
+            self.url_hash = get_url_identity_hash(self.rtsp_url)
+        else:
+            self.url_hash = ""
+
+        # 2. Run validation (including duplicate check)
+        self.clean()
+
         if not self.stream_path:
             from django.utils.text import slugify
             if self.ai_camera_id:
@@ -223,7 +287,7 @@ class Alert(TimeStamped):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     incident = models.ForeignKey(Incident, on_delete=models.CASCADE, related_name="alerts")
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="alerts", null=True, blank=True)
-    channel = models.CharField(max_length=32, default="email")   # email|webhook|sms|push
+    channel = models.CharField(max_length=32, default="email")   # realtime|email|webhook|sms|push
     payload = models.JSONField(default=dict, blank=True)
     delivered_at = models.DateTimeField(null=True, blank=True)
 
@@ -647,7 +711,9 @@ class MediaMTXDesiredPath(TimeStamped):
 
     camera = models.OneToOneField(
         Camera,
-        on_delete=models.CASCADE,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
         related_name="mediamtx_desired_path",
     )
     stream_path = models.CharField(max_length=200, unique=True)
@@ -663,6 +729,11 @@ class MediaMTXDesiredPath(TimeStamped):
     last_reconciled_at = models.DateTimeField(null=True, blank=True)
     drift_detected = models.BooleanField(default=False)
     last_error = models.TextField(blank=True)
+
+    # ── Applied-state tracking (stamp-based convergence) ────
+    last_applied_payload_hash = models.CharField(max_length=64, blank=True, default="")
+    last_applied_generation = models.BigIntegerField(default=0)
+    last_verified_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         indexes = [

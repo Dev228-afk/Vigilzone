@@ -127,6 +127,32 @@ class OutboxStreamPublisherProcessor(WorkerProcessor):
         return "OutboxStreamPublisherProcessor"
 
 
+class RelayReconcilerProcessor(WorkerProcessor):
+    """Reconciles MediaMTX relay paths from Postgres desired state."""
+
+    def __init__(self, shadow_mode: bool = False):
+        self.shadow_mode = shadow_mode
+        self._reconciler = None
+
+    def _get_reconciler(self):
+        if self._reconciler is None:
+            from api.services.relay_reconciler import RelayReconciler
+            self._reconciler = RelayReconciler(shadow_mode=self.shadow_mode)
+        return self._reconciler
+
+    def run_once(self) -> int:
+        reconciler = self._get_reconciler()
+        reconciler.reconcile_all()
+        # Always return 0 to force full poll_interval sleep.
+        # The reconciler is infrastructure — it must never trigger
+        # the BaseWorkerService tight-loop (10ms re-run) after mutations.
+        return 0
+
+    def get_name(self) -> str:
+        mode = "shadow" if self.shadow_mode else "active"
+        return f"RelayReconcilerProcessor({mode})"
+
+
 class BaseWorkerService:
     """Orchestrates the lifecycle of a WorkerProcessor."""
     

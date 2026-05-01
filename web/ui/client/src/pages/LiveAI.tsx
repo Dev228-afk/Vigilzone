@@ -499,7 +499,7 @@ export default function LiveAI() {
                             {cam.location && (
                               <p className="text-[11px] text-muted-foreground mt-0.5">{cam.location}</p>
                             )}
-                            {cam.fps !== undefined && (
+                            {typeof cam.fps === "number" && (
                               <p className="text-[11px] text-muted-foreground mt-0.5">
                                 {cam.fps.toFixed(1)} FPS
                                 {cam.resolution ? ` · ${cam.resolution}` : ""}

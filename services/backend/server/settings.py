@@ -237,5 +237,28 @@ OPENCV_FFMPEG_CAPTURE_OPTIONS = os.getenv(
     "rtsp_transport;tcp|stimeout;3000000",
 )
 
+# ── MediaMTX Relay Identity ─────────────────────────────────
+# The canonical hostname and port that THIS deployment's MediaMTX
+# instance listens on.  Used to detect and prevent self-referential
+# RTSP source loops (camera.rtsp_url pointing back at our own relay).
+#
+# Local dev:  127.0.0.1:8554  (default)
+# Docker:     mediamtx:8554
+# Cloud/K8s:  relay.production.svc:8554
+RELAY_RTSP_HOST = os.getenv("RELAY_RTSP_HOST", "127.0.0.1")
+RELAY_RTSP_PORT = int(os.getenv("RELAY_RTSP_PORT", "8554"))
+
+# All hostnames / IPs that resolve to our own MediaMTX instance.
+# Automatically includes localhost variants + the configured RELAY_RTSP_HOST.
+_relay_aliases = {
+    "127.0.0.1", "localhost", "0.0.0.0", "::1",
+    RELAY_RTSP_HOST.lower(),
+}
+# Allow operators to add extra aliases (e.g. LB DNS, internal CNAME)
+_extra = os.getenv("RELAY_RTSP_ALIASES", "").strip()
+if _extra:
+    _relay_aliases.update(a.strip().lower() for a in _extra.split(",") if a.strip())
+RELAY_RTSP_ALIASES: frozenset[str] = frozenset(_relay_aliases)
+
 
 

@@ -131,25 +131,36 @@ class RuntimeRepository:
             },
         )
         if not created:
-            desired_path.stream_path = stream_path
-            desired_path.desired_enabled = desired_enabled
-            desired_path.relay_mode = relay_mode
-            desired_path.source_uri = source_uri
-            desired_path.source_kind = source_kind
-            desired_path.transcode_required = transcode_required
-            desired_path.path_generation = max(1, desired_path.path_generation + 1)
-            desired_path.save(
-                update_fields=[
-                    "stream_path",
-                    "desired_enabled",
-                    "relay_mode",
-                    "source_uri",
-                    "source_kind",
-                    "transcode_required",
-                    "path_generation",
-                    "updated_at",
-                ]
-            )
+            # Only bump generation when relay-significant fields actually change.
+            # This prevents unnecessary cold applies after harmless saves.
+            changed = False
+            relay_fields = {
+                "stream_path": stream_path,
+                "desired_enabled": desired_enabled,
+                "relay_mode": relay_mode,
+                "source_uri": source_uri,
+                "source_kind": source_kind,
+                "transcode_required": transcode_required,
+            }
+            for field_name, new_val in relay_fields.items():
+                if getattr(desired_path, field_name) != new_val:
+                    setattr(desired_path, field_name, new_val)
+                    changed = True
+
+            if changed:
+                desired_path.path_generation = max(1, desired_path.path_generation + 1)
+                desired_path.save(
+                    update_fields=[
+                        "stream_path",
+                        "desired_enabled",
+                        "relay_mode",
+                        "source_uri",
+                        "source_kind",
+                        "transcode_required",
+                        "path_generation",
+                        "updated_at",
+                    ]
+                )
         return desired_path
 
     def mark_observed_mediamtx_path(

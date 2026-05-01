@@ -209,7 +209,12 @@ class StreamWorkerManager:
 
     def ensure_running(self, camera: Any, *, fps: int, max_width: int, jpeg_quality: int, idle_ttl_s: int, ffmpeg_capture_options: str) -> StreamWorker:
         camera_id = int(camera.pk)
-        source = (camera.rtsp_url or "").strip() or "0"
+        
+        from api.services.mediamtx_helpers import get_mediamtx_loopback_url
+        if camera.stream_path:
+            source = get_mediamtx_loopback_url(camera.stream_path)
+        else:
+            source = (camera.rtsp_url or "").strip() or "0"
 
         with self._lock:
             worker = self._workers.get(camera_id)

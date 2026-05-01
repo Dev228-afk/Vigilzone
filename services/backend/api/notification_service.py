@@ -2,9 +2,9 @@
 Notification service for broadcasting alerts/incidents to all tenant members.
 
 This service provides:
-- Real-time WebSocket broadcasting to all connected tenant members
+- Real-time browser delivery to all connected tenant members
 - Notification history storage
-- Multiple notification channels (WebSocket, future: push, SMS, etc.)
+- Multiple notification channels (realtime, future: push, SMS, etc.)
 """
 
 import logging
@@ -58,6 +58,7 @@ class NotificationService:
         """
         tenant = incident.tenant
         results = {
+            "realtime": "pending",
             "websocket": "pending",
             "email": None,
             "push": None,
@@ -100,6 +101,7 @@ class NotificationService:
             notification_type="incident",
             data=event_payload,
         )
+        results["realtime"] = ws_result
         results["websocket"] = ws_result
 
         logger.info(
@@ -349,35 +351,43 @@ class NotificationService:
         alerts_to_create = []
         user_to_alert_map = {}
         
-        # Prevent duplicates: Check existing alerts for this incident
-        existing_alerts = Alert.objects.filter(incident=incident).values_list("user_id", "id")
-        existing_alert_map = {str(uid): str(aid) for uid, aid in existing_alerts if uid is not None}
+        from django.db import transaction
         
-        for user_id_str in target_user_ids:
-            if user_id_str in existing_alert_map:
-                user_to_alert_map[user_id_str] = existing_alert_map[user_id_str]
-                continue
+        with transaction.atomic():
+            # Lock the incident row to serialize concurrent broadcast threads
+            # and prevent duplicate Alert creation.
+            try:
+                Incident.objects.select_for_update().get(pk=incident.pk)
+            except Incident.DoesNotExist:
+                return 0, {}
 
-            alert_id = uuid.uuid4()
-            alert = Alert(
-                id=alert_id,
-                incident=incident,
-                user_id=user_id_str,
-                channel="websocket",
-                payload={
-                    "title": notification["title"],
-                    "message": notification["message"],
-                    "data": notification.get("data", {}),
-                    "alert_id": str(alert_id),
-                    "user_id": user_id_str,
-                }
-            )
-            alerts_to_create.append(alert)
-            user_to_alert_map[user_id_str] = str(alert_id)
+            # Prevent duplicates: Check existing alerts for this incident
+            existing_alerts = Alert.objects.filter(incident=incident).values_list("user_id", "id")
+            existing_alert_map = {str(uid): str(aid) for uid, aid in existing_alerts if uid is not None}
             
-        if alerts_to_create:
-            from django.db import transaction
-            with transaction.atomic():
+            for user_id_str in target_user_ids:
+                if user_id_str in existing_alert_map:
+                    user_to_alert_map[user_id_str] = existing_alert_map[user_id_str]
+                    continue
+
+                alert_id = uuid.uuid4()
+                alert = Alert(
+                    id=alert_id,
+                    incident=incident,
+                    user_id=user_id_str,
+                    channel="realtime",
+                    payload={
+                        "title": notification["title"],
+                        "message": notification["message"],
+                        "data": notification.get("data", {}),
+                        "alert_id": str(alert_id),
+                        "user_id": user_id_str,
+                    }
+                )
+                alerts_to_create.append(alert)
+                user_to_alert_map[user_id_str] = str(alert_id)
+                
+            if alerts_to_create:
                 Alert.objects.bulk_create(alerts_to_create)
             
         return len(alerts_to_create), user_to_alert_map

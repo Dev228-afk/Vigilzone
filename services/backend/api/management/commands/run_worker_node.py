@@ -1,4 +1,5 @@
 import logging
+import os
 import signal
 import sys
 import threading
@@ -8,7 +9,8 @@ from django.core.management.base import BaseCommand
 from api.services.worker_services import (
     EntityEmbeddingProcessor,
     OutboxStreamPublisherProcessor,
-    BaseWorkerService
+    RelayReconcilerProcessor,
+    BaseWorkerService,
 )
 
 logger = logging.getLogger("run_worker_node")
@@ -21,23 +23,37 @@ class Command(BaseCommand):
             "--poll-interval",
             type=float,
             default=1.0,
-            help="Polling interval for all workers",
+            help="Polling interval for all workers (except reconciler)",
+        )
+        parser.add_argument(
+            "--reconciler-shadow",
+            action="store_true",
+            default=False,
+            help="Run the relay reconciler in shadow (verify-only) mode.",
         )
 
     def handle(self, *args, **options):
         poll_interval = options["poll_interval"]
-        
+        reconciler_shadow = options["reconciler_shadow"]
+        reconciler_interval = float(
+            os.getenv("RECONCILER_POLL_INTERVAL_S", "10")
+        )
+
         self.stdout.write(self.style.WARNING("!!! [DEV-ONLY] Starting Unified Worker Node !!!"))
         self.stdout.write("Use only for local development and testing. Deploy separate workers in cloud.")
 
         # Instantiate processors
         processors = [
             EntityEmbeddingProcessor(limit=10),
-            OutboxStreamPublisherProcessor(batch_size=100)
+            OutboxStreamPublisherProcessor(batch_size=100),
         ]
+        reconciler_processor = RelayReconcilerProcessor(shadow_mode=reconciler_shadow)
 
-        # Wrap in services
+        # Wrap in services (reconciler gets its own poll interval)
         services = [BaseWorkerService(p, poll_interval=poll_interval) for p in processors]
+        services.append(
+            BaseWorkerService(reconciler_processor, poll_interval=reconciler_interval)
+        )
         threads = []
 
         def run_service(svc):

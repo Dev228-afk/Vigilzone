@@ -35,10 +35,6 @@ export default function NavBar() {
   const { user, role, tenantId } = useAuth();
   const canTestNotifications = role === "owner" || role === "admin";
   
-  // Get token and tenant for notifications
-  const token = typeof window !== 'undefined'
-    ? (localStorage.getItem("accessToken") || sessionStorage.getItem("accessToken"))
-    : null;
   const tenantIdNum = tenantId ? parseInt(String(tenantId), 10) : null;
   
   const {
@@ -56,11 +52,11 @@ export default function NavBar() {
   
   // Connect WebSocket when authenticated
   useEffect(() => {
-    if (token && tenantIdNum) {
-      connect(token, tenantIdNum);
+    if (tenantIdNum) {
+      connect(tenantIdNum);
     }
     return () => disconnect();
-  }, [token, tenantIdNum, connect, disconnect]);
+  }, [tenantIdNum, connect, disconnect]);
   
   // Format role for display (capitalize first letter)
   const displayRole = role ? role.charAt(0).toUpperCase() + role.slice(1) : "Member";

@@ -22,6 +22,7 @@ from api.models import (
     Camera,
     KnownEntity,
     KnownEntityEmbedding,
+    MediaMTXDesiredPath,
     SchemaBootstrapState,
     ServiceWebhook,
     Tenant,
@@ -29,11 +30,12 @@ from api.models import (
 from api.services.camera_config_service import CameraConfigService
 from api.services.outbox_service import OutboxService
 from api.services.runtime_registration_service import RuntimeRegistrationService
+from api.services.mediamtx_helpers import (
+    get_canonical_camera_id,
+    get_mediamtx_loopback_url,
+)
 from api.services.webhook_registry_service import WebhookRegistryService
 from api.views import (
-    _ensure_mediamtx_path,
-    _get_canonical_camera_id,
-    _get_mediamtx_loopback_url,
     assert_member,
     assert_non_viewer,
     get_active_tenant,
@@ -117,7 +119,7 @@ def _set_camera_runtime(camera: Camera, enabled: bool) -> dict:
     import requests as http_client
 
     ai_base = os.getenv("AI_BASE_INTERNAL", "http://127.0.0.1:8080").rstrip("/")
-    stream_id = camera.ai_camera_id or _get_canonical_camera_id(camera)
+    stream_id = camera.ai_camera_id or get_canonical_camera_id(camera)
 
     runtime_registration_service.register_ai_camera_desired_state(
         camera=camera,
@@ -134,12 +136,18 @@ def _set_camera_runtime(camera: Camera, enabled: bool) -> dict:
     )
 
     if enabled:
-        provisioned_stream_id, _, _ = _ensure_mediamtx_path(camera)
-        stream_id = provisioned_stream_id
+        # Read canonical relay state from Postgres — the reconciler
+        # ensures the MediaMTX path exists; we just read it.
+        desired_path = MediaMTXDesiredPath.objects.filter(
+            camera=camera, desired_enabled=True
+        ).first()
+        if desired_path:
+            stream_id = desired_path.stream_path
+
         register_payload = {
             "camera_id": stream_id,
             "camera_name": camera.name,
-            "rtsp_url": _get_mediamtx_loopback_url(stream_id),
+            "rtsp_url": get_mediamtx_loopback_url(stream_id),
             "stream_path": stream_id,
             "ingest_backend": "opencv",
             "enabled_lanes": ["rt_detr", "yolov8_fallback", "fire_smoke_yolo", "person_zone"],
@@ -200,7 +208,7 @@ def _set_camera_runtime(camera: Camera, enabled: bool) -> dict:
         "camera_id": camera.ai_camera_id,
         "name": camera.name,
         "stream_path": camera.stream_path,
-        "loopback_rtsp_url": _get_mediamtx_loopback_url(camera.ai_camera_id or camera.stream_path),
+        "loopback_rtsp_url": get_mediamtx_loopback_url(camera.ai_camera_id or camera.stream_path),
         "running": bool(runtime_status.get("running")),
         "runtime": runtime_status,
     }
@@ -213,8 +221,8 @@ def _serialize_tenant_camera(camera: Camera) -> dict:
     camera_id = camera.ai_camera_id or camera.stream_path or f"camera_{camera.id}"
 
     running = None
-    if runtime is not None and isinstance(runtime.observed_running, bool):
-        running = bool(runtime.observed_running)
+    if runtime is not None and isinstance(runtime.observed_enabled, bool):
+        running = bool(runtime.observed_enabled)
     elif runtime is not None:
         running = bool(runtime.desired_enabled)
     else:
@@ -790,11 +798,9 @@ def ai_internal_cameras_snapshot(request):
         camera_identity_enabled, runtime_identity_enabled, effective_entity_detection_enabled = _camera_identity_runtime_flags(camera)
         if not effective_entity_detection_enabled:
             enabled_lanes = [lane for lane in enabled_lanes if lane != "entity_identity"]
-        rtsp_url = (
-            desired_path.source_uri
-            if desired_path is not None and desired_path.source_uri
-            else camera.rtsp_url
-        )
+        from api.services.mediamtx_helpers import get_mediamtx_loopback_url
+        effective_path = camera.stream_path or camera.ai_camera_id or f"camera_{camera.id}"
+        rtsp_url = get_mediamtx_loopback_url(effective_path)
 
         cameras_payload.append(
             {
@@ -958,8 +964,6 @@ def ai_internal_sync_runtime(request):
         tenant = None
 
     camera_query = Camera.objects.all()
-    if tenant is not None:
-        camera_query = camera_query.filter(tenant=tenant)
 
     camera = camera_query.filter(
         models.Q(ai_camera_id=camera_id) | models.Q(stream_path=camera_id) | models.Q(name=camera_id)

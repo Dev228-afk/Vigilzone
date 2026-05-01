@@ -80,33 +80,23 @@ def broadcast_incident_notification(sender, instance, created, **kwargs):
 @receiver(post_save, sender=Camera)
 def sync_camera_to_mediamtx(sender, instance, **kwargs):
     """
-    Automate reconciliation when a camera is saved.
-    Uses a thread to avoid blocking the Django request lifecycle.
+    On camera save, trigger route projection regeneration.
+
+    NOTE: MediaMTX relay provisioning is no longer done here.
+    The camera_config_service already persists MediaMTXDesiredPath
+    in the same transaction. The relay reconciler worker handles
+    the actual MediaMTX API calls.
     """
-    from django.db import transaction
-    import threading
-
-    def _sync():
-        try:
-            from .views import _ensure_mediamtx_path
-            _ensure_mediamtx_path(instance)
-        except Exception:
-            pass # Logging is handled inside _ensure_mediamtx_path
-
-    transaction.on_commit(lambda: threading.Thread(target=_sync, daemon=True).start())
     trigger_route_projection_generation()
 
 @receiver(post_delete, sender=Camera)
 def delete_camera_from_mediamtx(sender, instance, **kwargs):
-    """Cleanup MediaMTX when a camera record is removed."""
-    import threading
+    """
+    On camera delete, trigger route projection regeneration.
 
-    def _remove():
-        try:
-            from .views import _remove_mediamtx_path
-            _remove_mediamtx_path(instance)
-        except Exception:
-            pass
-
-    threading.Thread(target=_remove, daemon=True).start()
+    NOTE: MediaMTX path removal is no longer done here.
+    The camera_config_service marks the desired path as disabled
+    before deleting. The relay reconciler worker handles the
+    actual MediaMTX path removal.
+    """
     trigger_route_projection_generation()

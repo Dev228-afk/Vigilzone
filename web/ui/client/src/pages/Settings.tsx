@@ -91,7 +91,7 @@ export default function Settings() {
 
   const saveNotificationSettingsMut = useMutation({
     mutationFn: async (patch: Partial<NotificationSettingsData>) => {
-      const { data } = await api.put("/notifications/settings/", patch);
+      const { data } = await api.patch("/notifications/settings/", patch);
       return data as NotificationSettingsData;
     },
     onSuccess: () => {

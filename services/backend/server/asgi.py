@@ -52,10 +52,14 @@ class SafeHttpAsgiApp:
                 "body": b'{"detail":"Service restarting"}',
             })
 
-from api.routing import websocket_urlpatterns
+from django.urls import re_path
+from api.routing import websocket_urlpatterns, http_urlpatterns
 
 application = ProtocolTypeRouter({
-    "http": SafeHttpAsgiApp(django_asgi_app),
+    "http": URLRouter([
+        *http_urlpatterns,
+        re_path(r"", SafeHttpAsgiApp(django_asgi_app)),
+    ]),
     "websocket": AllowedHostsOriginValidator(
         AuthMiddlewareStack(
             URLRouter(

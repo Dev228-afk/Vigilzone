@@ -12,7 +12,13 @@ Add this to the project's URL configuration:
 
 from django.urls import re_path
 from . import consumers
+from . import consumers_sse
+
 
 websocket_urlpatterns = [
-    re_path(r"^ws/notifications/$", consumers.NotificationConsumer.as_asgi()),
+    re_path(r"ws/notifications/", consumers.NotificationConsumer.as_asgi()),
+]
+
+http_urlpatterns = [
+    re_path(r"^/?api/notifications/stream/?$", consumers_sse.NotificationSSEConsumer.as_asgi()),
 ]

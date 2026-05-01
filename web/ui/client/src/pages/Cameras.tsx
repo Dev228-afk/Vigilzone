@@ -167,25 +167,49 @@ export default function Cameras() {
     editMut.mutate({ id: editCamera.id, ...editForm });
   };
 
-  const handleTestConnection = async () => {
+  const handleTestConnection = async (isEdit: boolean = false) => {
     if (!canManage) return;
-    const url = newCamera.rtsp_url.trim();
+    const url = isEdit ? editForm.rtsp_url.trim() : newCamera.rtsp_url.trim();
     if (!url) {
       toast({ title: "No URL", description: "Enter an RTSP URL first.", variant: "destructive" });
       return;
     }
-    toast({ title: "Testing…", description: `Checking ${url}` });
+
+    toast({ title: "Testing connection…", description: `Tiered probe started for ${url}` });
+    
     try {
-      const { data } = await api.post("/cameras/test_connection/", { rtsp_url: url, timeout_s: 3 });
+      const endpoint = isEdit && editCamera ? `/cameras/${editCamera.id}/test_connection/` : "/cameras/test_connection/";
+      const { data } = await api.post(endpoint, { rtsp_url: url, timeout_s: 10 });
+      
       if (data.ok) {
         const d = data.details;
         const info = d ? `${d.codec ?? ""} ${d.width ?? ""}x${d.height ?? ""} ${d.fps ?? ""}`.trim() : "";
-        toast({ title: "Connection OK", description: `${data.method} — ${data.latency_ms} ms${info ? ` (${info})` : ""}` });
+        toast({ 
+          title: "Connection OK", 
+          description: `Verified via ${data.method} — ${data.latency_ms}ms${info ? ` [${info}]` : ""}` 
+        });
       } else {
-        toast({ title: "Connection failed", description: data.error ?? "Unknown error", variant: "destructive" });
+        // Map backend categories to user-friendly messages
+        const categoryMap: Record<string, string> = {
+          network_unreachable: "Network Unreachable: Check camera power and local IP routing.",
+          mediamtx_connection_timeout: "Relay Timeout: MediaMTX could not connect to the source URL.",
+          mediamtx_api_unavailable: "System Error: The MediaMTX relay service is not responding.",
+          unsupported_source: "Unsupported Protocol: This URL type is not supported for streaming.",
+        };
+        const description = categoryMap[data.category] || data.error || "Unknown probe failure";
+        
+        toast({ 
+          title: "Connection Failed", 
+          description, 
+          variant: "destructive" 
+        });
       }
-    } catch {
-      toast({ title: "Test failed", description: "Could not reach backend", variant: "destructive" });
+    } catch (err: any) {
+      toast({ 
+        title: "Test Failed", 
+        description: err.response?.data?.error || "Could not reach backend service", 
+        variant: "destructive" 
+      });
     }
   };
 
@@ -254,7 +278,7 @@ export default function Cameras() {
               </div>
             </div>
             <DialogFooter>
-              <Button variant="outline" onClick={handleTestConnection} data-testid="button-test-connection">Test Connection</Button>
+              <Button variant="outline" onClick={() => handleTestConnection(false)} data-testid="button-test-connection">Test Connection</Button>
               <Button onClick={handleAddCamera} disabled={addMut.isPending} data-testid="button-save-camera">
                 {addMut.isPending ? "Saving…" : "Save"}
               </Button>
@@ -400,10 +424,15 @@ export default function Cameras() {
           </div>
           <DialogFooter>
             {editCamera && (
-              <Button variant="outline" onClick={() => syncMut.mutate(editCamera.id)} disabled={syncMut.isPending}>
-                <RefreshCw className="w-3 h-3 mr-1" />
-                Sync to AI
-              </Button>
+              <>
+                <Button variant="outline" onClick={() => handleTestConnection(true)} data-testid="button-test-edit-connection">
+                  Test Connection
+                </Button>
+                <Button variant="outline" onClick={() => syncMut.mutate(editCamera.id)} disabled={syncMut.isPending}>
+                  <RefreshCw className="w-3 h-3 mr-1" />
+                  Sync to AI
+                </Button>
+              </>
             )}
             <Button onClick={handleSaveEdit} disabled={editMut.isPending}>
               {editMut.isPending ? "Saving…" : "Save Changes"}

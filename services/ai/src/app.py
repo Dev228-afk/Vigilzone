@@ -920,12 +920,14 @@ class CCTVAIModule:
 
         self.logger.info("=" * 60)
         self.logger.info("System started successfully")
-        self.logger.info("Web UI: http://127.0.0.1:8080")
+        port = int(os.getenv("AI_API_PORT", 8001))
+        self.logger.info(f"Web UI / API: http://127.0.0.1:{port}")
         self.logger.info("=" * 60)
 
     # ------------------------------------------------------------------
     def start_api_server(self):
-        self.api_server = AlertServer(host="0.0.0.0", port=8080)
+        port = int(os.getenv("AI_API_PORT", 8001))
+        self.api_server = AlertServer(host="0.0.0.0", port=port)
         self.api_server.set_aggregator(self.aggregator)
         self.api_server.set_camera_processors(self.processors)
         self.api_server.set_gpu_scheduler(self.gpu_scheduler)

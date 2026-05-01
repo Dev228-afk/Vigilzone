@@ -52,3 +52,11 @@ graphify-out/
 # Service Logs
 *.log
 web/ui/client/build.log
+
+# Local debug and temp files
+services/backend/current_mtx.json
+services/backend/worker_log.txt
+services/backend/debug_drift.py
+services/backend/delete_dupes.py
+test_postgres_conn.py
+test_redis_conn.py

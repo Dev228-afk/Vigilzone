@@ -624,6 +624,40 @@ class ProfileTests(APITestCase):
         'DEFAULT_PERMISSION_CLASSES': [
             'rest_framework.permissions.IsAuthenticated',
         ],
+    }
+)
+class NotificationSettingsTests(APITestCase):
+    """Test notification settings endpoint update semantics."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.user = User.objects.create_user(username='notifyuser', email='notify@test.com', password='password123')
+        self.tenant = Tenant.objects.create(name='Notify Tenant')
+        Membership.objects.create(user=self.user, tenant=self.tenant, role='member')
+
+        response = self.client.post('/api/auth/token/', {'username': 'notifyuser', 'password': 'password123'}, format='json')
+        self.token = response.data['access']
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.token}', HTTP_X_TENANT_ID=str(self.tenant.id))
+
+    def test_patch_notification_settings_updates_instant_levels(self):
+        response = self.client.patch(
+            '/api/notifications/settings/',
+            {'instant_notification_levels': ['critical', 'low']},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['instant_notification_levels'], ['critical', 'low'])
+
+
+@override_settings(
+    REST_FRAMEWORK={
+        'DEFAULT_AUTHENTICATION_CLASSES': [
+            'rest_framework_simplejwt.authentication.JWTAuthentication',
+        ],
+        'DEFAULT_PERMISSION_CLASSES': [
+            'rest_framework.permissions.IsAuthenticated',
+        ],
     },
     STREAM_PREVIEW_FPS=3,
 )
@@ -688,8 +722,9 @@ class StreamEndpointTests(APITestCase):
 
         tok = self.client.get(f'/api/streams/{self.camera.id}/signed_stream_token/').data['token']
         ok = self.client.get(f'/api/streams/{self.camera.id}/mjpeg/?token={tok}')
-        self.assertEqual(ok.status_code, status.HTTP_200_OK)
-        self.assertIn('multipart/x-mixed-replace', ok['Content-Type'])
+        # Phase 3: streams_mjpeg now redirects to MediaMTX
+        self.assertEqual(ok.status_code, status.HTTP_302_FOUND)
+        self.assertIn('front-door', ok['Location'])
 
     @patch('api.views.STREAM_WORKERS.health_for_cameras', return_value={'1': {'connected': False, 'last_frame_ts': None, 'last_error': '', 'fps_config': 3, 'viewers': 0}})
     def test_stream_health_endpoint(self, _mock_health):
@@ -733,10 +768,26 @@ class AiControlPlaneTests(APITestCase):
             HTTP_X_TENANT_ID=str(self.tenant.id),
         )
 
-    @patch('ai_integration.views._ensure_mediamtx_path', return_value=('cam_hallway', 'native', 'rtsp://camera.local/stream'))
+    @patch('ai_integration.views.MediaMTXDesiredPath.objects')
+    @patch('ai_integration.views.camera_config_service.update_camera')
     @patch('requests.get')
     @patch('requests.post')
-    def test_ai_start_uses_tenant_scoped_camera_and_updates_status(self, mock_post, mock_get, _mock_ensure):
+    def test_ai_start_uses_tenant_scoped_camera_and_updates_status(self, mock_post, mock_get, mock_update_camera, mock_desired_qs):
+        # Configure mock desired path for the reconciler-driven flow
+        mock_desired_path = MagicMock()
+        mock_desired_path.stream_path = 'cam_hallway'
+        mock_desired_path.source_kind = 'native'
+        mock_desired_qs.filter.return_value.first.return_value = mock_desired_path
+
+        # Mock update_camera to apply the status change without triggering
+        # the full service-layer chain (set_desired_mediamtx_path etc.)
+        def _mock_update(*, camera, attrs):
+            for k, v in attrs.items():
+                setattr(camera, k, v)
+            camera.save(update_fields=list(attrs.keys()))
+            return camera
+        mock_update_camera.side_effect = _mock_update
+
         register_resp = MagicMock(status_code=201, text='ok')
         register_resp.json.return_value = {'camera_id': 'cam_hallway', 'hot_loaded': True}
 

@@ -3,9 +3,10 @@ from __future__ import annotations
 from django.db import transaction
 from django.utils.text import slugify
 
-from api.models import Camera, CameraZone, Tenant
+from api.models import Camera, CameraZone, MediaMTXDesiredPath, Tenant
 from api.repositories.camera_repository import CameraConfigRepository
 from api.repositories.runtime_repository import RuntimeRepository
+from api.services.mediamtx_helpers import is_self_referential
 from api.services.outbox_service import OutboxService
 
 
@@ -19,6 +20,24 @@ class CameraConfigService:
         self.camera_repository = camera_repository or CameraConfigRepository()
         self.runtime_repository = runtime_repository or RuntimeRepository()
         self.outbox_service = outbox_service or OutboxService()
+
+    @staticmethod
+    def _resolve_source_uri(camera: Camera) -> str:
+        """Return the source_uri to persist in MediaMTXDesiredPath.
+
+        For publisher-type cameras (webcam, no URL, or self-referential
+        URL) this returns an empty string — the reconciler will
+        configure MediaMTX in ``source: publisher`` mode.
+
+        For registered cameras with a real external URL, it returns
+        the URL as-is.
+        """
+        if camera.source_type == Camera.SourceType.WEBCAM:
+            return ""
+        url = (camera.rtsp_url or "").strip()
+        if not url or is_self_referential(url):
+            return ""
+        return url
 
     def _ensure_stream_identity(self, camera: Camera) -> Camera:
         update_fields: list[str] = []
@@ -44,7 +63,7 @@ class CameraConfigService:
         self.runtime_repository.set_desired_mediamtx_path(
             camera=camera,
             stream_path=camera.stream_path or camera.ai_camera_id or f"camera-{camera.pk}",
-            source_uri=camera.rtsp_url,
+            source_uri=self._resolve_source_uri(camera),
             source_kind=camera.source_kind,
             desired_enabled=camera.status == Camera.Status.ACTIVE,
             relay_mode=MediaRelayMode.from_camera(camera),
@@ -85,7 +104,7 @@ class CameraConfigService:
         self.runtime_repository.set_desired_mediamtx_path(
             camera=camera,
             stream_path=camera.stream_path or camera.ai_camera_id or f"camera-{camera.pk}",
-            source_uri=camera.rtsp_url,
+            source_uri=self._resolve_source_uri(camera),
             source_kind=camera.source_kind,
             desired_enabled=camera.status == Camera.Status.ACTIVE,
             relay_mode=MediaRelayMode.from_camera(camera),
@@ -114,6 +133,32 @@ class CameraConfigService:
             "ai_camera_id": camera.ai_camera_id,
             "stream_path": camera.stream_path,
         }
+        # Mark relay desired state as disabled so the reconciler removes the path
+        try:
+            desired_path = MediaMTXDesiredPath.objects.filter(camera=camera).first()
+            if desired_path:
+                desired_path.desired_enabled = False
+                desired_path.path_generation = max(1, desired_path.path_generation + 1)
+                desired_path.save(update_fields=[
+                    "desired_enabled", "path_generation", "updated_at",
+                ])
+                self.outbox_service.emit(
+                    aggregate_type="mediamtx_desired_path",
+                    aggregate_id=camera.id,
+                    event_type="mediamtx.desired_path_disabled",
+                    payload={
+                        "tenant_id": camera.tenant_id,
+                        "camera_id": camera.id,
+                        "stream_path": desired_path.stream_path,
+                        "path_generation": int(desired_path.path_generation),
+                    },
+                )
+        except Exception:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Failed to mark MediaMTX desired path disabled for camera %s",
+                camera.id,
+            )
         self.camera_repository.delete_camera(camera=camera)
         self.outbox_service.emit(
             aggregate_type="camera",

@@ -1,23 +1,42 @@
 from django.core.management.base import BaseCommand
-from api.views import reconcile_all_cameras_to_mediamtx
+from api.services.relay_reconciler import RelayReconciler
 import json
 
+
 class Command(BaseCommand):
-    help = "Replays all database camera RTSP sources into MediaMTX path configurations."
+    help = "Runs a single MediaMTX relay reconciliation sweep (break-glass / migration tool)."
+
+    def add_arguments(self, parser):
+        parser.add_argument(
+            "--shadow",
+            action="store_true",
+            default=False,
+            help="Shadow mode: verify and log drift without applying changes.",
+        )
 
     def handle(self, *args, **options):
-        self.stdout.write("Starting MediaMTX path reconciliation...")
-        
+        shadow = options["shadow"]
+        mode_label = "SHADOW" if shadow else "ACTIVE"
+        self.stdout.write(f"Starting MediaMTX path reconciliation [{mode_label}]...")
+
+        reconciler = RelayReconciler(shadow_mode=shadow)
+
         try:
-            summary = reconcile_all_cameras_to_mediamtx()
-            
+            result = reconciler.reconcile_all()
+
             # Print cleanly formatted JSON summary
-            self.stdout.write(json.dumps(summary, indent=2))
-            
-            if summary["failed"] > 0:
-                self.stderr.write(self.style.WARNING(f"\nReconciliation completed with {summary['failed']} failures."))
+            self.stdout.write(json.dumps(result.as_dict(), indent=2))
+
+            if result.failed > 0:
+                self.stderr.write(self.style.WARNING(
+                    f"\nReconciliation completed with {result.failed} failures."
+                ))
             else:
-                self.stdout.write(self.style.SUCCESS(f"\nReconciliation completed successfully. {summary['success']} paths provisioned."))
-                
+                self.stdout.write(self.style.SUCCESS(
+                    f"\nReconciliation completed. "
+                    f"{result.applied} applied, {result.removed} removed, "
+                    f"{result.verified} verified."
+                ))
+
         except Exception as e:
             self.stderr.write(self.style.ERROR(f"Reconciliation completely failed: {str(e)}"))
