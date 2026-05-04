@@ -79,6 +79,7 @@ class Phase1ServiceLayerTests(TestCase):
         self.assertTrue(camera.stream_path)
         self.assertTrue(camera.ai_camera_id)
         self.assertTrue(AIRuntimeRegistration.objects.filter(camera=camera).exists())
+        self.assertFalse(AIRuntimeRegistration.objects.get(camera=camera).desired_enabled)
         self.assertTrue(MediaMTXDesiredPath.objects.filter(camera=camera).exists())
         self.assertTrue(
             OutboxEvent.objects.filter(
@@ -87,6 +88,24 @@ class Phase1ServiceLayerTests(TestCase):
                 event_type="camera.created",
             ).exists()
         )
+
+    def test_camera_service_update_preserves_unsynced_ai_state(self):
+        camera = self.camera_service.create_camera(
+            tenant=self.tenant,
+            attrs={
+                "name": "Driveway Cam",
+                "status": Camera.Status.ACTIVE,
+                "rtsp_url": "rtsp://camera/driveway",
+            },
+        )
+
+        reg = AIRuntimeRegistration.objects.get(camera=camera)
+        self.assertFalse(reg.desired_enabled)
+
+        self.camera_service.update_camera(camera=camera, attrs={"site": "North Gate"})
+
+        reg.refresh_from_db()
+        self.assertFalse(reg.desired_enabled)
 
     def test_notification_service_updates_channel_and_profile(self):
         self.notification_service.set_notification_settings(
@@ -193,7 +212,9 @@ class CanonicalCrudCreateAPITests(APITestCase):
         self.assertTrue(camera.stream_path)
         self.assertTrue(camera.ai_camera_id)
         self.assertTrue(AIRuntimeRegistration.objects.filter(camera=camera).exists())
+        self.assertFalse(AIRuntimeRegistration.objects.get(camera=camera).desired_enabled)
         self.assertTrue(MediaMTXDesiredPath.objects.filter(camera=camera).exists())
+        self.assertFalse(response.data["is_ai_synced"])
 
     def test_create_entity_entry_persists_when_ai_unavailable(self):
         with patch("requests.post", side_effect=Exception("AI unavailable")), patch(

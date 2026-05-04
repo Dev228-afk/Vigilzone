@@ -201,6 +201,56 @@ class StreamWorkerManager:
         self._lock = threading.Lock()
         self._workers: dict[int, StreamWorker] = {}
 
+    def _resolve_camera_source(self, camera: Any) -> str:
+        from api.models import AIRuntimeRegistration, MediaMTXDesiredPath, MediaMTXObservedPathState
+        from api.services.mediamtx_helpers import (
+            _is_publisher_source_type,
+            get_mediamtx_loopback_url,
+            is_self_referential,
+            sanitize_stream_url,
+        )
+
+        direct_source = sanitize_stream_url(getattr(camera, "rtsp_url", "") or "")
+        stream_path = (getattr(camera, "stream_path", "") or "").strip()
+
+        if _is_publisher_source_type(camera):
+            return get_mediamtx_loopback_url(stream_path) if stream_path else (direct_source or "0")
+
+        direct_source_safe = bool(direct_source) and not is_self_referential(direct_source)
+
+        runtime_registration = getattr(camera, "runtime_registration", None)
+        if runtime_registration is None:
+            runtime_registration = AIRuntimeRegistration.objects.filter(camera=camera).only("desired_enabled").first()
+        ai_synced = bool(runtime_registration and runtime_registration.desired_enabled)
+
+        desired_path = getattr(camera, "mediamtx_desired_path", None)
+        if desired_path is None:
+            desired_path = MediaMTXDesiredPath.objects.filter(camera=camera).only("id", "desired_enabled").first()
+
+        observed_state = getattr(desired_path, "observed_state", None) if desired_path else None
+        if desired_path is not None and observed_state is None:
+            observed_state = MediaMTXObservedPathState.objects.filter(desired_path=desired_path).only(
+                "observed_enabled",
+                "last_error",
+            ).first()
+
+        relay_ready = bool(
+            stream_path
+            and desired_path
+            and desired_path.desired_enabled
+            and observed_state
+            and observed_state.observed_enabled
+            and not (observed_state.last_error or "").strip()
+        )
+
+        if direct_source_safe and (not ai_synced or not relay_ready):
+            return direct_source
+
+        if stream_path:
+            return get_mediamtx_loopback_url(stream_path)
+
+        return direct_source or "0"
+
     def _prune(self) -> None:
         with self._lock:
             dead = [cid for cid, w in self._workers.items() if not w.running and w.health().viewers <= 0]
@@ -209,12 +259,7 @@ class StreamWorkerManager:
 
     def ensure_running(self, camera: Any, *, fps: int, max_width: int, jpeg_quality: int, idle_ttl_s: int, ffmpeg_capture_options: str) -> StreamWorker:
         camera_id = int(camera.pk)
-        
-        from api.services.mediamtx_helpers import get_mediamtx_loopback_url
-        if camera.stream_path:
-            source = get_mediamtx_loopback_url(camera.stream_path)
-        else:
-            source = (camera.rtsp_url or "").strip() or "0"
+        source = self._resolve_camera_source(camera)
 
         with self._lock:
             worker = self._workers.get(camera_id)

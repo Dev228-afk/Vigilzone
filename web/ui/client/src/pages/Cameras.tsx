@@ -30,6 +30,7 @@ interface Camera {
   rtsp_url?: string;
   ai_camera_id: string;
   stream_path?: string;
+  is_ai_synced?: boolean;
   enabled_lanes?: string[];
   created_at: string;
   tenant?: number;
@@ -80,13 +81,8 @@ export default function Cameras() {
         enabled_lanes: cam.enabled_lanes,
         status: "active",
       });
-      if (cam.rtsp_url && data?.id) {
-        try {
-          await api.post(`/cameras/${data.id}/sync_to_ai/`);
-        } catch {
-          // Camera created but AI sync failed; user can retry manually.
-        }
-      }
+      // AI Sync is now manually triggered via the "Sync AI" button in the table actions
+      // to prevent severe hardware utilization from auto-syncing upon camera creation.
       return data;
     },
     onSuccess: () => {
@@ -300,6 +296,7 @@ export default function Cameras() {
               <TableHead>Location</TableHead>
               <TableHead>AI Camera ID</TableHead>
               <TableHead>Stream Path</TableHead>
+              <TableHead>AI Status</TableHead>
               <TableHead>Status</TableHead>
               <TableHead>Added On</TableHead>
               <TableHead className="text-right">Actions</TableHead>
@@ -319,6 +316,13 @@ export default function Cameras() {
                 <TableCell>{camera.site || "—"}</TableCell>
                 <TableCell>{camera.ai_camera_id ? <Badge variant="outline">{camera.ai_camera_id}</Badge> : "—"}</TableCell>
                 <TableCell>{camera.stream_path ? <Badge variant="outline">{camera.stream_path}</Badge> : "—"}</TableCell>
+                <TableCell>
+                  {camera.is_ai_synced ? (
+                    <Badge variant="default" className="bg-blue-500/10 text-blue-600 hover:bg-blue-500/20 border-blue-500/20">Synced</Badge>
+                  ) : (
+                    <Badge variant="outline" className="text-muted-foreground">Unsynced</Badge>
+                  )}
+                </TableCell>
                 <TableCell>
                   <div className="flex items-center gap-2">
                     {camera.status === "active" ? (

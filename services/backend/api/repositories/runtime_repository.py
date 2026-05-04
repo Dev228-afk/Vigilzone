@@ -31,7 +31,7 @@ class RuntimeRepository:
 
     def get_or_create_ai_runtime_registration(self, *, camera: Camera) -> AIRuntimeRegistration:
         defaults = {
-            "desired_enabled": camera.status == Camera.Status.ACTIVE,
+            "desired_enabled": False,
             "desired_ingest_backend": "opencv",
             "desired_sample_hz": 2.0,
             "desired_lanes": list(camera.enabled_lanes or []),

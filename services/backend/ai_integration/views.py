@@ -22,10 +22,14 @@ from api.models import (
     Camera,
     KnownEntity,
     KnownEntityEmbedding,
-    MediaMTXDesiredPath,
     SchemaBootstrapState,
     ServiceWebhook,
     Tenant,
+)
+from api.services.ai_runtime_control_service import (
+    RelayNotReadyError,
+    start_ai_runtime,
+    stop_ai_runtime,
 )
 from api.services.camera_config_service import CameraConfigService
 from api.services.outbox_service import OutboxService
@@ -116,101 +120,32 @@ def _resolve_control_camera(request, raw_camera_id):
 
 
 def _set_camera_runtime(camera: Camera, enabled: bool) -> dict:
-    import requests as http_client
-
-    ai_base = os.getenv("AI_BASE_INTERNAL", "http://127.0.0.1:8080").rstrip("/")
-    stream_id = camera.ai_camera_id or get_canonical_camera_id(camera)
-
-    runtime_registration_service.register_ai_camera_desired_state(
-        camera=camera,
-        enabled=bool(enabled),
-        ingest_backend="opencv",
-        sample_hz=2.0,
-        lanes=list(camera.enabled_lanes or []),
-        policy_version=1,
-        metadata={
-            "tenant_id": str(camera.tenant.id) if camera.tenant else None,
-            "community_id": str(camera.tenant.id) if camera.tenant else None,
-            "stream_path": stream_id,
-        },
-    )
-
     if enabled:
-        # Read canonical relay state from Postgres — the reconciler
-        # ensures the MediaMTX path exists; we just read it.
-        desired_path = MediaMTXDesiredPath.objects.filter(
-            camera=camera, desired_enabled=True
-        ).first()
-        if desired_path:
-            stream_id = desired_path.stream_path
-
-        register_payload = {
-            "camera_id": stream_id,
-            "camera_name": camera.name,
-            "rtsp_url": get_mediamtx_loopback_url(stream_id),
-            "stream_path": stream_id,
-            "ingest_backend": "opencv",
-            "enabled_lanes": ["rt_detr", "yolov8_fallback", "fire_smoke_yolo", "person_zone"],
-            "sample_hz": 2.0,
-            "tenant_id": str(camera.tenant.id) if camera.tenant else None,
-            "community_id": str(camera.tenant.id) if camera.tenant else None,
-            "policy_version": 1,
-        }
-        register_resp = http_client.post(
-            f"{ai_base}/api/v1/cameras/register",
-            json=register_payload,
-            timeout=15,
+        result = start_ai_runtime(
+            camera,
+            ingest_backend="opencv",
+            enabled_lanes=list(camera.enabled_lanes or ["rt_detr", "yolov8_fallback", "fire_smoke_yolo", "person_zone"]),
+            sample_hz=2.0,
+            policy_version=1,
         )
-        if register_resp.status_code not in (200, 201):
-            raise RuntimeError(
-                f"AI register failed: {register_resp.status_code} {register_resp.text[:200]}"
-            )
-
-    runtime_resp = http_client.post(
-        f"{ai_base}/api/v1/cameras/{stream_id}/runtime-control",
-        json=bool(enabled),
-        timeout=10,
-    )
-    if runtime_resp.status_code >= 400:
-        raise RuntimeError(
-            f"AI runtime-control failed: {runtime_resp.status_code} {runtime_resp.text[:200]}"
+    else:
+        result = stop_ai_runtime(
+            camera,
+            ingest_backend="opencv",
+            enabled_lanes=list(camera.enabled_lanes or ["rt_detr", "yolov8_fallback", "fire_smoke_yolo", "person_zone"]),
+            sample_hz=2.0,
+            policy_version=1,
         )
-
-    runtime_status = {"running": enabled}
-    try:
-        status_resp = http_client.get(
-            f"{ai_base}/api/v1/cameras/{stream_id}/runtime-status",
-            timeout=5,
-        )
-        if status_resp.ok:
-            runtime_status = status_resp.json() or runtime_status
-    except Exception:
-        pass
-
-    camera_config_service.update_camera(
-        camera=camera,
-        attrs={
-            "ai_camera_id": stream_id,
-            "stream_path": camera.stream_path or stream_id,
-            "status": Camera.Status.ACTIVE if runtime_status.get("running") else Camera.Status.INACTIVE,
-        },
-    )
-    runtime_registration_service.mark_ai_camera_observed_state(
-        camera=camera,
-        running=bool(runtime_status.get("running")),
-        ingest_backend="opencv",
-        sample_hz=2.0,
-        lanes=list(camera.enabled_lanes or []),
-    )
 
     return {
+        **result,
         "camera_db_id": camera.id,
-        "camera_id": camera.ai_camera_id,
+        "camera_id": result["camera_id"],
         "name": camera.name,
-        "stream_path": camera.stream_path,
-        "loopback_rtsp_url": get_mediamtx_loopback_url(camera.ai_camera_id or camera.stream_path),
-        "running": bool(runtime_status.get("running")),
-        "runtime": runtime_status,
+        "stream_path": result["stream_path"],
+        "loopback_rtsp_url": result["loopback_rtsp_url"],
+        "running": bool(result["running"]),
+        "runtime": result["runtime"],
     }
 
 
@@ -545,6 +480,17 @@ def ai_start(request):
 
     try:
         payload = _set_camera_runtime(camera, enabled=True)
+    except RelayNotReadyError as exc:
+        logger.info("AI start deferred for camera %s: %s", camera.id, exc.detail)
+        return Response(
+            {
+                "error": exc.detail,
+                "code": exc.code,
+                "retryable": exc.retryable,
+                "waited_seconds": exc.waited_seconds,
+            },
+            status=exc.status_code,
+        )
     except Exception as exc:
         logger.warning("Failed to start AI runtime for camera %s: %s", camera.id, exc)
         return Response({"error": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
@@ -568,6 +514,17 @@ def ai_stop(request):
 
     try:
         payload = _set_camera_runtime(camera, enabled=False)
+    except RelayNotReadyError as exc:
+        logger.info("AI stop deferred for camera %s: %s", camera.id, exc.detail)
+        return Response(
+            {
+                "error": exc.detail,
+                "code": exc.code,
+                "retryable": exc.retryable,
+                "waited_seconds": exc.waited_seconds,
+            },
+            status=exc.status_code,
+        )
     except Exception as exc:
         logger.warning("Failed to stop AI runtime for camera %s: %s", camera.id, exc)
         return Response({"error": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)

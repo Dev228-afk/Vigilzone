@@ -303,7 +303,6 @@ export function useNotifications(): UseNotificationsReturn {
               throw new Error("unauthorized");
             }
             if (response.ok && response.headers.get('content-type')?.includes('text/event-stream')) {
-              console.log('[SSE] Connected to:', sseUrl);
               setIsConnected(true);
               setError(null);
             } else {

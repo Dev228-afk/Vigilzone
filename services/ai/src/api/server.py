@@ -54,7 +54,7 @@ class AlertServer:
 
         # Shared state — set by main app
         self.alert_buffer: List[Dict[str, Any]] = []
-        self._camera_processors = []   # set externally for live frame
+        self._camera_processors = {}   # set externally for live frame
         self._aggregator = None  # live aggregator reference
 
         # §A1 — staging uploads directory
@@ -318,7 +318,7 @@ class AlertServer:
 
     def set_camera_processors(self, processors):
         """Accept list of CameraProcessor for live frame endpoint."""
-        self._camera_processors = processors
+        self._camera_processors = {proc.camera_id: proc for proc in processors}
 
     def set_app_context(self, ctx: dict):
         """
@@ -330,10 +330,7 @@ class AlertServer:
         self._app_context = ctx
 
     def _find_camera_processor(self, camera_id: str):
-        for proc in self._camera_processors:
-            if proc.camera_id == camera_id:
-                return proc
-        return None
+        return self._camera_processors.get(camera_id)
 
     def _start_camera_processor(self, cam_cfg: Dict[str, Any]) -> bool:
         """Start one camera processor at runtime; returns True when started."""
@@ -371,7 +368,7 @@ class AlertServer:
                 frame_store=self._frame_store,
             )
             proc.start()
-            self._camera_processors.append(proc)
+            self._camera_processors[camera_id] = proc
             self.logger.info("Hot-loaded camera processor for %s", camera_id)
             return True
         except Exception as exc:
@@ -388,8 +385,8 @@ class AlertServer:
         except Exception as exc:
             self.logger.warning("Camera stop error for %s: %s", camera_id, exc)
         try:
-            self._camera_processors.remove(proc)
-        except ValueError:
+            del self._camera_processors[camera_id]
+        except KeyError:
             pass
         return True
 
@@ -485,7 +482,7 @@ class AlertServer:
         async def cameras():
             """List active cameras with stats."""
             result = []
-            for proc in self._camera_processors:
+            for proc in self._camera_processors.values():
                 result.append(proc.get_stats())
             return result
 
@@ -502,7 +499,7 @@ class AlertServer:
             frame — this only affects the served JPEG.
             """
             # Verify camera exists
-            proc_found = any(p.camera_id == camera_id for p in self._camera_processors)
+            proc_found = camera_id in self._camera_processors
             if not proc_found:
                 return JSONResponse(status_code=404, content={"error": f"Camera '{camera_id}' not found"})
 
@@ -515,7 +512,7 @@ class AlertServer:
             # Fallback: consumptive reader (only useful before first process-loop iteration)
             if frame is None:
                 source = "reader_fallback"
-                for proc in self._camera_processors:
+                for proc in self._camera_processors.values():
                     if proc.camera_id == camera_id:
                         frame, ts = proc.reader.get_latest()
                         break
@@ -565,7 +562,7 @@ class AlertServer:
                 metrics["cameras"] = self._auto_throttle.get_metrics()
 
             # Camera processor stats
-            for proc in self._camera_processors:
+            for proc in self._camera_processors.values():
                 cam_id = proc.camera_id
                 if cam_id not in metrics["cameras"]:
                     metrics["cameras"][cam_id] = {}
@@ -580,7 +577,7 @@ class AlertServer:
         async def fire_debug():
             """Return top N detections from fire lane for FP debugging."""
             result = []
-            for proc in self._camera_processors:
+            for proc in self._camera_processors.values():
                 fire_lane = proc.lanes.get("fire_smoke_yolo")
                 if fire_lane and hasattr(fire_lane, "last_debug_detections"):
                     result.append({
@@ -1387,7 +1384,7 @@ class AlertServer:
         @self.app.get("/debug/fall_state")
         async def debug_fall_state(camera_id: str = Query(...)):
             """Return last per-track fall features (angle, hip_drop, stillness, pose_conf)."""
-            for proc in self._camera_processors:
+            for proc in self._camera_processors.values():
                 if proc.camera_id == camera_id:
                     fall_lane = proc.lanes.get("fall_candidate")
                     if fall_lane and hasattr(fall_lane, "last_fall_state"):
@@ -1442,7 +1439,7 @@ class AlertServer:
                 result["incident_registry"] = diag.get("incident_registry", {})
 
             # Lane status from camera processors
-            for proc in self._camera_processors:
+            for proc in self._camera_processors.values():
                 cam_id = proc.camera_id
                 enabled_cfg = proc.camera_cfg.get("enabled_lanes", [])
                 active_lanes = list(proc.lanes.keys())
@@ -1638,7 +1635,7 @@ class AlertServer:
         async def api_cameras():
             """List cameras with their current status and config summary."""
             result = []
-            for proc in self._camera_processors:
+            for proc in self._camera_processors.values():
                 stats = proc.get_stats()
                 result.append({
                     "camera_id": stats.get("camera_id"),
@@ -1773,7 +1770,7 @@ class AlertServer:
             over a long-lived connection.
             """
             # Verify camera exists
-            proc_found = any(p.camera_id == camera_id for p in self._camera_processors)
+            proc_found = camera_id in self._camera_processors
             if not proc_found:
                 return JSONResponse(status_code=404, content={"error": f"Camera '{camera_id}' not found"})
 
@@ -1838,29 +1835,6 @@ class AlertServer:
             Register or Update a runtime camera.
             Handles upserts (Objective 2): restarts processor if config changed.
             """
-            # 1. Load active state
-            existing_proc = self._find_camera_processor(camera_id)
-            
-            # 2. Check for changes if already running
-            config_changed = False
-            if existing_proc:
-                stats = existing_proc.get_stats()
-                if (stats.get("rtsp_url") != rtsp_url or
-                    stats.get("ingest_backend") != ingest_backend or
-                    set(stats.get("enabled_lanes", [])) != set(enabled_lanes) or
-                    stats.get("sample_hz") != sample_hz):
-                    config_changed = True
-                    self.logger.info(f"Re-registering camera {camera_id}: config changed. Restarting processor.")
-                    self._stop_camera_processor(camera_id)
-                else:
-                    return {
-                        "status": "already_registered",
-                        "camera_id": camera_id,
-                        "message": f"Camera {camera_id} is already active with same config",
-                        "hot_loaded": True,
-                    }
-
-            # 4. Start/Restart processor
             cam_cfg = {
                 "camera_id": camera_id,
                 "rtsp_url": rtsp_url,
@@ -1877,19 +1851,10 @@ class AlertServer:
                 "stream_path": stream_path,
                 "policy_version": policy_version,
             }
-            
-            # 5. In-memory config map update (if applicable, ensuring we keep camera_configs matching)
-            ctx = self._app_context if isinstance(self._app_context, dict) else {}
-            camera_configs_by_id = ctx.get("camera_configs_by_id")
-            if isinstance(camera_configs_by_id, dict):
-                camera_configs_by_id[camera_id] = cam_cfg
-                
-            hot_loaded = self._start_camera_processor(cam_cfg)
 
-            self._sync_runtime_to_backend({
+            sync_payload = {
                 "camera_id": camera_id,
                 "enabled": True,
-                "running": bool(hot_loaded),
                 "rtsp_url": rtsp_url,
                 "ingest_backend": ingest_backend,
                 "enabled_lanes": enabled_lanes,
@@ -1902,6 +1867,59 @@ class AlertServer:
                 "camera_name": camera_name,
                 "stream_path": stream_path,
                 "policy_version": policy_version,
+            }
+
+            ctx = self._app_context if isinstance(self._app_context, dict) else {}
+            camera_configs_by_id = ctx.get("camera_configs_by_id")
+
+            existing_proc = self._find_camera_processor(camera_id)
+            config_changed = False
+            metadata_only_changed = False
+            if existing_proc:
+                current_cfg = dict(getattr(existing_proc, "camera_cfg", {}) or {})
+                restart_required = any((
+                    str(current_cfg.get("rtsp_url", "")) != rtsp_url,
+                    str(current_cfg.get("ingest_backend", "opencv")) != ingest_backend,
+                    set(current_cfg.get("enabled_lanes", []) or []) != set(enabled_lanes),
+                    current_cfg.get("sample_hz") != sample_hz,
+                    bool(current_cfg.get("entity_detection_enabled", True)) != bool(entity_detection_enabled),
+                    bool(current_cfg.get("identity_runtime_enabled", True)) != bool(identity_runtime_enabled),
+                ))
+                if restart_required:
+                    config_changed = True
+                    self.logger.info(
+                        "Re-registering camera %s: ingest config changed. Restarting processor.",
+                        camera_id,
+                    )
+                    self._stop_camera_processor(camera_id)
+                else:
+                    metadata_only_changed = current_cfg != cam_cfg
+                    existing_proc.camera_cfg.update(cam_cfg)
+                    if isinstance(camera_configs_by_id, dict):
+                        camera_configs_by_id[camera_id] = cam_cfg
+                    self._sync_runtime_to_backend({
+                        **sync_payload,
+                        "running": True,
+                    })
+                    return {
+                        "status": "already_registered",
+                        "camera_id": camera_id,
+                        "message": (
+                            f"Camera {camera_id} is already active; metadata refreshed."
+                            if metadata_only_changed
+                            else f"Camera {camera_id} is already active with same config"
+                        ),
+                        "hot_loaded": True,
+                    }
+
+            if isinstance(camera_configs_by_id, dict):
+                camera_configs_by_id[camera_id] = cam_cfg
+
+            hot_loaded = self._start_camera_processor(cam_cfg)
+
+            self._sync_runtime_to_backend({
+                **sync_payload,
+                "running": bool(hot_loaded),
             })
 
             return {
@@ -1919,7 +1937,7 @@ class AlertServer:
             maxw: Optional[int] = Query(None, ge=160, le=3840),
         ):
             """Get latest JPEG snapshot from a camera (for embedding in main-drive UI)."""
-            proc_found = any(p.camera_id == camera_id for p in self._camera_processors)
+            proc_found = camera_id in self._camera_processors
             if not proc_found:
                 return JSONResponse(status_code=404, content={"error": f"Camera '{camera_id}' not found"})
 
@@ -1930,7 +1948,7 @@ class AlertServer:
 
             if frame is None:
                 source = "reader_fallback"
-                for proc in self._camera_processors:
+                for proc in self._camera_processors.values():
                     if proc.camera_id == camera_id:
                         frame, ts = proc.reader.get_latest()
                         break
@@ -2004,7 +2022,7 @@ class AlertServer:
                     "gpu_name": dev.device_name,
                     "gpu_usable": dev.gpu_usable,
                 }
-            for proc in self._camera_processors:
+            for proc in self._camera_processors.values():
                 result["cameras"].append({
                     "camera_id": proc.camera_id,
                     "active": True,

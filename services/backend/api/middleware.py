@@ -14,3 +14,20 @@ class ActiveTenantMiddleware(MiddlewareMixin):
             or request.META.get("HTTP_X_TENANT_ID")
         )
         request.tenant_id = tid
+
+class QueryCountMiddleware(MiddlewareMixin):
+    """
+    Middleware that prints the total number of DB queries executed during a request
+    when running in DEBUG mode. Helps track down N+1 problems.
+    """
+    def process_response(self, request, response):
+        from django.conf import settings
+        from django.db import connection
+        
+        if getattr(settings, "DEBUG", False):
+            queries = len(connection.queries)
+            path = request.path
+            if queries > 0:
+                print(f"[QueryCount] {path} executed {queries} database queries")
+        
+        return response

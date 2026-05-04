@@ -6,6 +6,7 @@ from .models import (
     normalize_instant_notification_levels,
 )
 from django.contrib.auth.models import User
+from api.services.mediamtx_helpers import sanitize_stream_url
 
 class TenantSerializer(serializers.ModelSerializer):
     role = serializers.SerializerMethodField()
@@ -16,10 +17,10 @@ class TenantSerializer(serializers.ModelSerializer):
 
     def get_role(self, obj):
         user = self.context["request"].user
-        memberships = Membership.objects.filter(tenant=obj)
-        if memberships.exists():
-            membership = memberships.first()
-            return membership.role
+        # Avoid N+1 by iterating over prefetched memberships instead of querying
+        for m in obj.memberships.all():
+            if m.user_id == user.id:
+                return m.role
         return None
 
 class MyTenantSerializer(serializers.Serializer):
@@ -51,6 +52,8 @@ class MembershipSerializer(serializers.ModelSerializer):
         print("USING NESTED MEMBERSHIP SERIALIZER")
         return super().to_representation(instance)
 class CameraSafeSerializer(serializers.ModelSerializer):
+    is_ai_synced = serializers.SerializerMethodField()
+
     class Meta:
         model = Camera
         fields = [
@@ -60,9 +63,18 @@ class CameraSafeSerializer(serializers.ModelSerializer):
             "min_confidence", "min_bbox_area", "k_of_n_k", "k_of_n_n", "cooldown_s",
             "enabled_lanes",
             "entity_detection_enabled",
+            "is_ai_synced",
             "created_at", "updated_at", "tenant",
         ]
         read_only_fields = ["created_at", "updated_at", "tenant"]
+
+    def get_is_ai_synced(self, obj):
+        # Prevent N+1 if ai_registration is prefetched, otherwise query
+        if hasattr(obj, 'runtime_registration'):
+            return obj.runtime_registration.desired_enabled
+        from api.models import AIRuntimeRegistration
+        reg = AIRuntimeRegistration.objects.filter(camera=obj).first()
+        return reg.desired_enabled if reg else False
 
 
 class CameraStreamSerializer(serializers.ModelSerializer):
@@ -92,12 +104,15 @@ class CameraWriteSerializer(serializers.ModelSerializer):
     location = serializers.CharField(required=False, write_only=True)
     streamUrl = serializers.CharField(required=False, write_only=True)
 
+    is_ai_synced = serializers.SerializerMethodField()
+
     class Meta:
         model = Camera
         fields = [
             "id", "name", "site", "rtsp_url", "ai_camera_id", "stream_path", "status",
             "camera_type", "source_type", "min_confidence", "min_bbox_area",
             "k_of_n_k", "k_of_n_n", "cooldown_s", "enabled_lanes", "entity_detection_enabled",
+            "is_ai_synced",
             "created_at", "updated_at", "tenant",
             # legacy aliases
             "location", "streamUrl",
@@ -114,6 +129,13 @@ class CameraWriteSerializer(serializers.ModelSerializer):
         mapping = {"offline": "inactive", "online": "active"}
         return mapping.get(value, value)
 
+    def get_is_ai_synced(self, obj):
+        if hasattr(obj, 'runtime_registration'):
+            return obj.runtime_registration.desired_enabled
+        from api.models import AIRuntimeRegistration
+        reg = AIRuntimeRegistration.objects.filter(camera=obj).first()
+        return reg.desired_enabled if reg else False
+
     def validate(self, attrs):
         # Merge legacy aliases into canonical fields
         if "location" in attrs and not attrs.get("site"):
@@ -124,6 +146,9 @@ class CameraWriteSerializer(serializers.ModelSerializer):
             attrs["rtsp_url"] = attrs.pop("streamUrl")
         else:
             attrs.pop("streamUrl", None)
+
+        if "rtsp_url" in attrs:
+            attrs["rtsp_url"] = sanitize_stream_url(attrs.get("rtsp_url", ""))
 
         # ── Auto-derive stream_path when empty ──────────────────────
         if not attrs.get("stream_path"):
@@ -244,13 +269,15 @@ class KnownEntitySerializer(serializers.ModelSerializer):
         ]
 
     def get_cameras(self, obj):
+        # Sort in Python to preserve any prefetch_related cache
+        cameras = sorted(list(obj.cameras.all()), key=lambda c: c.name)
         return [
             {
                 "id": cam.id,
                 "name": cam.name,
                 "ai_camera_id": cam.ai_camera_id,
             }
-            for cam in obj.cameras.all().order_by("name")
+            for cam in cameras
         ]
 
     def validate_camera_ids(self, value):

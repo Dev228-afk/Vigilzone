@@ -23,11 +23,14 @@ class FFmpegReader(IngestBackend):
                  width: int = 640, height: int = 480):
         super().__init__(camera_id, source)
         
-        # FORCE underlying OpenCV FFmpeg wrappers to drop dead connections
-        # 5000000 microseconds = 5 seconds
-        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|stimeout;5000000"
-
         self.reconnect_delay = reconnect_delay
+        self._backoff_delay = max(2.0, reconnect_delay)
+        self._backoff_max = 60.0
+        self._backoff_multiplier = 1.5
+        self._capture_options = os.getenv(
+            "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+            "rtsp_transport;tcp|stimeout;5000000",
+        ).strip()
         self.width = width
         self.height = height
         self.logger = setup_logger(f"FFmpegReader-{camera_id}")
@@ -39,6 +42,19 @@ class FFmpegReader(IngestBackend):
         self._latest_ts = None
         self._connected = False
         self._use_opencv_fallback = True  # Use OpenCV by default (simpler on Windows)
+        self._frame_seq = 0
+        self._prev_returned_seq = 0
+        self._new_frame = threading.Event()
+
+    def _configure_capture(self, cap) -> None:
+        if cap is None:
+            return
+        buffer_size_prop = getattr(cv2, "CAP_PROP_BUFFERSIZE", None)
+        if buffer_size_prop is not None:
+            try:
+                cap.set(buffer_size_prop, 1)
+            except Exception:
+                pass
     
     def start(self):
         """Start the reader thread"""
@@ -62,9 +78,16 @@ class FFmpegReader(IngestBackend):
     def get_latest(self) -> Tuple[Optional[np.ndarray], Optional[str]]:
         """Get the latest frame (non-blocking)"""
         with self._lock:
-            if self._latest_frame is not None:
-                return self._latest_frame.copy(), self._latest_ts
+            if self._latest_frame is not None and self._frame_seq != self._prev_returned_seq:
+                self._prev_returned_seq = self._frame_seq
+                return self._latest_frame, self._latest_ts
             return None, None
+
+    def wait_for_frame(self, timeout: float = 0.5) -> bool:
+        """Block until the reader thread has a new frame (or timeout)."""
+        got = self._new_frame.wait(timeout=timeout)
+        self._new_frame.clear()
+        return got
     
     def is_connected(self) -> bool:
         """Check if connected"""
@@ -77,7 +100,10 @@ class FFmpegReader(IngestBackend):
                 self._cap.release()
             
             # Use OpenCV with FFmpeg backend (easier on Windows)
+            if "://" in self.source and self._capture_options:
+                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = self._capture_options
             self._cap = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
+            self._configure_capture(self._cap)
             
             if self._cap.isOpened():
                 ret, frame = self._cap.read()
@@ -88,6 +114,9 @@ class FFmpegReader(IngestBackend):
                     with self._lock:
                         self._latest_frame = frame
                         self._latest_ts = now_iso_utc()
+                        self._frame_seq += 1
+                    self._new_frame.set()
+                    self._backoff_delay = max(2.0, self.reconnect_delay)
                     
                     return True
             
@@ -107,8 +136,10 @@ class FFmpegReader(IngestBackend):
                 if self._connect():
                     self.logger.info(f"Successfully connected")
                 else:
-                    self.logger.warning(f"Connection failed, retrying in {self.reconnect_delay}s")
-                    time.sleep(self.reconnect_delay)
+                    wait_s = self._backoff_delay
+                    self.logger.warning(f"Connection failed, retrying in {wait_s:.1f}s")
+                    time.sleep(wait_s)
+                    self._backoff_delay = min(self._backoff_delay * self._backoff_multiplier, self._backoff_max)
                     continue
             
             try:
@@ -117,16 +148,23 @@ class FFmpegReader(IngestBackend):
                 if not ret or frame is None:
                     self.logger.warning(f"Failed to read frame, reconnecting...")
                     self._connected = False
-                    time.sleep(self.reconnect_delay)
+                    wait_s = self._backoff_delay
+                    time.sleep(wait_s)
+                    self._backoff_delay = min(self._backoff_delay * self._backoff_multiplier, self._backoff_max)
                     continue
                 
                 with self._lock:
                     self._latest_frame = frame
                     self._latest_ts = now_iso_utc()
+                    self._frame_seq += 1
+                self._new_frame.set()
+                self._backoff_delay = max(2.0, self.reconnect_delay)
                 
-                time.sleep(0.01)
+                time.sleep(0.001)
                 
             except Exception as e:
                 self.logger.error(f"Read error: {e}")
                 self._connected = False
-                time.sleep(self.reconnect_delay)
+                wait_s = self._backoff_delay
+                time.sleep(wait_s)
+                self._backoff_delay = min(self._backoff_delay * self._backoff_multiplier, self._backoff_max)

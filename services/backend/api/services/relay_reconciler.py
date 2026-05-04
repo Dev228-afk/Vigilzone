@@ -117,19 +117,23 @@ class RelayReconciler:
         result = ReconcileResult()
 
         # Single-writer lock: skip gracefully if another reconciler is running
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT pg_try_advisory_lock(%s)", [_ADVISORY_LOCK_ID])
-            acquired = cursor.fetchone()[0]
+        # Only use advisory locks if the backend is PostgreSQL
+        acquired = True
+        if connection.vendor == "postgresql":
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT pg_try_advisory_lock(%s)", [_ADVISORY_LOCK_ID])
+                acquired = cursor.fetchone()[0]
 
-        if not acquired:
-            logger.debug("Reconciler lock held by another process, skipping sweep")
-            return result
+            if not acquired:
+                logger.debug("Reconciler lock held by another process, skipping sweep")
+                return result
 
         try:
             result = self._do_reconcile_all()
         finally:
-            with connection.cursor() as cursor:
-                cursor.execute("SELECT pg_advisory_unlock(%s)", [_ADVISORY_LOCK_ID])
+            if connection.vendor == "postgresql" and acquired:
+                with connection.cursor() as cursor:
+                    cursor.execute("SELECT pg_advisory_unlock(%s)", [_ADVISORY_LOCK_ID])
 
         return result
 
@@ -324,17 +328,20 @@ class RelayReconciler:
         # Verify applied state
         verified_state = self._get_runtime_path(api_base, stream_path)
 
-        # Stamp convergence fields
         now = timezone.now()
-        desired.last_applied_payload_hash = desired_hash
-        desired.last_applied_generation = desired.path_generation
-        desired.last_verified_at = now
-        desired.save(update_fields=[
-            "last_applied_payload_hash",
-            "last_applied_generation",
-            "last_verified_at",
-            "updated_at",
-        ])
+        if verified_state is not None:
+            # Stamp convergence fields only if MediaMTX confirms existence
+            desired.last_applied_payload_hash = desired_hash
+            desired.last_applied_generation = desired.path_generation
+            desired.last_verified_at = now
+            desired.save(update_fields=[
+                "last_applied_payload_hash",
+                "last_applied_generation",
+                "last_verified_at",
+                "updated_at",
+            ])
+        else:
+            logger.warning("Applied path %s but verification returned None. Skipping stamp.", stream_path)
 
         self._write_observed(
             desired,
@@ -409,9 +416,41 @@ class RelayReconciler:
 
     # ── MediaMTX API interactions ────────────────────────────────
 
+    def _config_path_exists(self, api_base: str, stream_path: str) -> bool | None:
+        """Return whether a path exists in MediaMTX config without emitting 404 noise."""
+        try:
+            resp = self.http_session.get(
+                f"{api_base}/v3/config/paths/list",
+                timeout=5,
+            )
+            if resp.status_code != 200:
+                logger.warning(
+                    "Unexpected MediaMTX response for LIST paths: %s",
+                    resp.status_code,
+                )
+                return None
+
+            data = resp.json() or {}
+            items = data.get("items") or []
+            for item in items:
+                name = str(item.get("name") or item.get("confName") or "")
+                if name == stream_path:
+                    return True
+            return False
+        except (http_client.ConnectionError, http_client.Timeout) as exc:
+            logger.warning(
+                "MediaMTX unreachable at %s while listing paths: %s",
+                api_base, type(exc).__name__,
+            )
+            return None
+
     def _get_runtime_path(self, api_base: str, stream_path: str) -> dict | None:
         """GET current path config from MediaMTX. Returns None if not found or unreachable."""
         try:
+            exists = self._config_path_exists(api_base, stream_path)
+            if exists is False:
+                return None
+
             resp = self.http_session.get(
                 f"{api_base}/v3/config/paths/get/{stream_path}",
                 timeout=5,

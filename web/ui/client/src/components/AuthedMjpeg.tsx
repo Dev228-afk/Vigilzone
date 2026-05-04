@@ -20,6 +20,34 @@ interface AuthedMjpegProps extends React.ImgHTMLAttributes<HTMLImageElement> {
  * Works in plain `<img>` (no JS fetch needed) because auth is in the
  * query-string rather than the Authorization header.
  */
+const tokenCache = new Map<number, { token: string; expiresAt: number; promise?: Promise<string> }>();
+
+async function getCachedToken(cameraId: number): Promise<string> {
+  const now = Date.now();
+  const cached = tokenCache.get(cameraId);
+  if (cached && cached.expiresAt > now) {
+    if (cached.promise) return cached.promise;
+    return cached.token;
+  }
+
+  const promise = api.get(`/streams/${cameraId}/signed_stream_token/`).then(res => {
+    const token = res.data.token;
+    tokenCache.set(cameraId, { token, expiresAt: now + 45000 }); // Cache for 45s
+    return token;
+  }).catch(err => {
+    tokenCache.delete(cameraId);
+    throw err;
+  }).finally(() => {
+    const current = tokenCache.get(cameraId);
+    if (current && current.promise === promise) {
+      current.promise = undefined;
+    }
+  });
+
+  tokenCache.set(cameraId, { token: "", expiresAt: now + 45000, promise });
+  return promise;
+}
+
 export default function AuthedMjpeg({
   cameraId,
   onStarted,
@@ -80,9 +108,8 @@ export default function AuthedMjpeg({
 
     async function fetchToken() {
       try {
-        const { data } = await api.get(`/streams/${cameraId}/signed_stream_token/`);
+        const token = await getCachedToken(cameraId);
         if (cancelled) return;
-        const token: string = data.token;
         versionRef.current += 1;
         setSrc(`/api/streams/${cameraId}/mjpeg/?token=${encodeURIComponent(token)}&v=${versionRef.current}`);
         setError(false);

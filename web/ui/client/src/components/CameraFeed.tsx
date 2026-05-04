@@ -3,11 +3,13 @@ import { Video, Wifi, WifiOff, Sparkles } from "lucide-react";
 import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { useMediamtxHealth } from "@/hooks/use-mediamtx-health";
+import SnapshotStream from "@/components/SnapshotStream";
 
 interface CameraFeedProps {
   name: string;
   location: string;
   status: "active" | "offline";
+  isAiSynced?: boolean;
   /** Camera DB id — needed for MJPEG fallback */
   cameraId?: number;
   /** Static image or API snapshot URL (legacy fallback) */
@@ -48,6 +50,7 @@ export default function CameraFeed({
   name,
   location,
   status,
+  isAiSynced = false,
   cameraId,
   imageUrl,
   streamUrl,
@@ -89,6 +92,11 @@ export default function CameraFeed({
 
   const needsAuth = imageUrl ? isApiUrl(imageUrl) : false;
   const displaySrc = needsAuth ? null : imageUrl;
+  const hasLiveFeed = Boolean(
+    health?.connected ||
+    (streamUrl && activeMethod === 'webrtc-iframe' && mtxReachable) ||
+    activeMethod === 'static'
+  );
 
   // Compute the optimal method based on capabilities, URL, and failures
   const computeNextMethod = useCallback((): StreamMethod => {
@@ -124,7 +132,7 @@ export default function CameraFeed({
     }
 
     // 2. Static image
-    if (displaySrc && !failed.has('static')) {
+    if (imageUrl && !failed.has('static')) {
       return 'static';
     }
 
@@ -173,13 +181,27 @@ export default function CameraFeed({
 
       case 'static':
         return (
-          <img
-            src={displaySrc!}
-            alt={name}
-            className="w-full h-full object-cover"
-            loading="lazy"
-            onError={() => handleMethodFailed('static')}
-          />
+          needsAuth && cameraId ? (
+            <SnapshotStream
+              cameraId={cameraId}
+              pollInterval={isFocused ? 1500 : 2500}
+              className="w-full h-full object-cover"
+              alt={name}
+              fallback={
+                <div className="w-full h-full flex items-center justify-center">
+                  <Video className="w-12 h-12 text-muted-foreground animate-pulse" />
+                </div>
+              }
+            />
+          ) : (
+            <img
+              src={displaySrc!}
+              alt={name}
+              className="w-full h-full object-cover"
+              loading="lazy"
+              onError={() => handleMethodFailed('static')}
+            />
+          )
         );
 
       case 'error':
@@ -206,20 +228,20 @@ export default function CameraFeed({
         {renderMedia()}
         <div className="absolute top-2 left-2 flex items-start gap-1.5 p-1">
           <Badge
-            variant={(mtxReachable && streamUrl) || displaySrc ? "default" : "destructive"}
+            variant={hasLiveFeed ? "default" : "destructive"}
             className={`${isFocused ? 'h-6 px-2.5 gap-1.5' : 'h-4 px-1.4 gap-1.4'} shadow-lg backdrop-blur-md opacity-95 transition-all`}
           >
-            {(mtxReachable && streamUrl) || displaySrc ? (
+            {hasLiveFeed ? (
               <Wifi className={`${isFocused ? 'w-3.5 h-3.5' : 'w-2.5 h-2.5'} animate-pulse`} />
             ) : (
               <WifiOff className={isFocused ? 'w-3.5 h-3.5' : 'w-2.5 h-2.5'} />
             )}
             <span className={`font-bold ${isFocused ? 'text-[10px]' : 'text-[7px]'} tracking-tight grayscale-0`}>
-              {(mtxReachable && streamUrl) || displaySrc ? "LIVE FEED" : "OFFLINE"}
+              {hasLiveFeed ? "LIVE FEED" : "OFFLINE"}
             </span>
           </Badge>
 
-          {status === "active" && (
+          {isAiSynced && (
             <Badge
               variant="secondary"
               className={` ${isFocused ? 'h-6 px-2.5 gap-1.5' : 'h-4 px-1.4 gap-1.5'} bg-sky-500/90 text-white border-0 shadow-lg backdrop-blur-md opacity-95`}

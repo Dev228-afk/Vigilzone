@@ -51,9 +51,15 @@ from .services.probe_service import ProbeService
 from .services.mediamtx_helpers import (
     classify_camera_source,
     get_canonical_camera_id,
+    get_ai_base_url,
     get_mediamtx_api_base,
     get_mediamtx_loopback_url,
     build_mediamtx_path_payload,
+)
+from .services.ai_runtime_control_service import (
+    RelayNotReadyError,
+    start_ai_runtime,
+    stop_ai_runtime,
 )
 
 
@@ -280,215 +286,103 @@ class CameraViewSet(TenantScopedViewSet):
 
     @action(detail=True, methods=["post"], url_path="sync_to_ai")
     def sync_to_ai(self, request, pk=None):
-        """POST /api/cameras/{id}/sync_to_ai/ — register camera with AI module."""
-        import requests as http_client
-        from api.models import MediaMTXDesiredPath
-
+        """POST /api/cameras/{id}/sync_to_ai/ — explicitly enable AI ingestion."""
         self._assert_camera_write_access(request)
         camera = self.get_object()
-        from api.services.mediamtx_helpers import get_ai_base_url
-        ai_base = get_ai_base_url()
-
-        # Read canonical relay state from Postgres instead of provisioning inline
-        desired_path = MediaMTXDesiredPath.objects.filter(
-            camera=camera, desired_enabled=True
-        ).first()
-        if not desired_path:
-            return Response(
-                {
-                    "error": "No active MediaMTX relay path for this camera. "
-                    "Wait for the reconciler to provision it, or create/update the camera first."
-                },
-                status=status.HTTP_409_CONFLICT,
-            )
-
-        stream_id = desired_path.stream_path
-        source_kind = desired_path.source_kind
-
-        loopback_url = _get_mediamtx_loopback_url(stream_id)
-
-        payload = {
-            "camera_id": stream_id,
-            "camera_name": camera.name,
-            "rtsp_url": loopback_url,
-            "stream_path": stream_id,
-            "ingest_backend": request.data.get("ingest_backend", "opencv"),
-            "enabled_lanes": request.data.get(
-                "enabled_lanes",
-                camera.enabled_lanes if camera.enabled_lanes else ["rt_detr", "person_zone"],
-            ),
-            "sample_hz": request.data.get("sample_hz", 2.0),
-            "tenant_id": str(camera.tenant.id) if camera.tenant else None,
-            "community_id": str(camera.tenant.id) if camera.tenant else None,
-            "policy_version": 1,
-        }
-
-        runtime_registration_service.register_ai_camera_desired_state(
-            camera=camera,
-            enabled=True,
-            ingest_backend=str(payload["ingest_backend"]),
-            sample_hz=float(payload["sample_hz"]),
-            lanes=list(payload["enabled_lanes"]),
-            policy_version=int(payload["policy_version"]),
-            metadata={
-                "tenant_id": payload.get("tenant_id"),
-                "community_id": payload.get("community_id"),
-                "stream_path": payload.get("stream_path"),
-            },
-        )
-
         try:
-            resp = http_client.post(
-                f"{ai_base}/api/v1/cameras/register",
-                json=payload,
-                timeout=3.0,
+            result = start_ai_runtime(
+                camera,
+                ingest_backend=str(request.data.get("ingest_backend", "opencv")),
+                enabled_lanes=request.data.get(
+                    "enabled_lanes",
+                    camera.enabled_lanes if camera.enabled_lanes else ["rt_detr", "person_zone"],
+                ),
+                sample_hz=float(request.data.get("sample_hz", 2.0)),
+                policy_version=int(request.data.get("policy_version", 1)),
             )
-        except http_client.ConnectionError:
-            return Response({"error": "AI service unavailable"}, status=status.HTTP_502_BAD_GATEWAY)
-        except http_client.Timeout:
+        except RelayNotReadyError as exc:
             return Response(
                 {
-                    "error": "AI service is busy or starting up.", 
-                    "suggestion": "The request was sent, please refresh in a few moments."
-                }, 
-                status=status.HTTP_504_GATEWAY_TIMEOUT
+                    "error": exc.detail,
+                    "code": exc.code,
+                    "retryable": exc.retryable,
+                    "waited_seconds": exc.waited_seconds,
+                },
+                status=exc.status_code,
             )
-
-        if resp.status_code not in (200, 201):
-            camera.status = Camera.Status.INACTIVE
-            camera.save(update_fields=["status", "updated_at"])
-            runtime_registration_service.mark_ai_camera_observed_state(
-                camera=camera,
-                running=False,
-                ingest_backend=str(payload["ingest_backend"]),
-                sample_hz=float(payload["sample_hz"]),
-                lanes=list(payload["enabled_lanes"]),
-                error=f"AI returned {resp.status_code}",
-            )
+        except Exception as exc:
             return Response(
-                {"error": f"AI returned {resp.status_code}", "detail": resp.text[:500]},
+                {"error": str(exc)},
                 status=status.HTTP_502_BAD_GATEWAY,
             )
 
-        ai_data = resp.json()
-        camera.ai_camera_id = ai_data.get("camera_id", stream_id)
-        camera.status = Camera.Status.ACTIVE
-        camera.source_type = Camera.SourceType.REGISTERED
-        update_fields = ["ai_camera_id", "status", "source_type", "updated_at"]
-
-        camera.save(update_fields=update_fields)
-        runtime_registration_service.mark_ai_camera_observed_state(
-            camera=camera,
-            running=True,
-            ingest_backend=str(payload["ingest_backend"]),
-            sample_hz=float(payload["sample_hz"]),
-            lanes=list(payload["enabled_lanes"]),
-        )
-
         return Response({
             "status": "synced",
-            "ai_camera_id": camera.ai_camera_id,
-            "stream_path": camera.stream_path,
-            "hot_loaded": ai_data.get("hot_loaded", False),
-            "rtsp_url_sent": payload["rtsp_url"],
-            "path_name": stream_id,
+            "ai_camera_id": result["camera_id"],
+            "stream_path": result["stream_path"],
+            "hot_loaded": result.get("hot_loaded", False),
+            "rtsp_url_sent": result["rtsp_url_sent"],
+            "path_name": result["path_name"],
             "db_rtsp_url": camera.rtsp_url,
-            "loopback_rtsp_url": payload["rtsp_url"],
+            "loopback_rtsp_url": result["loopback_rtsp_url"],
+            "running": result["running"],
+            "waited_seconds": result.get("waited_seconds", 0.0),
         })
 
     @action(detail=True, methods=["post"], url_path="runtime_control")
     def runtime_control(self, request, pk=None):
         """POST /api/cameras/{id}/runtime_control/ — start/stop AI task (Phase 3)."""
-        import requests as http_client
         self._assert_camera_write_access(request)
         camera = self.get_object()
         enabled = request.data.get("enabled")
         if enabled is None:
             return Response({"error": "Field 'enabled' (bool) is required"}, status=status.HTTP_400_BAD_REQUEST)
 
-        from api.services.mediamtx_helpers import get_ai_base_url
-        ai_base = get_ai_base_url()
-        cam_id = camera.ai_camera_id or _get_canonical_camera_id(camera)
-
-        # If enabling, ensure registered first (ensure AI knows about loopback)
-        if enabled:
-            sync_payload = {
-                "camera_id": cam_id,
-                "camera_name": camera.name,
-                "rtsp_url": _get_mediamtx_loopback_url(cam_id),
-                "stream_path": cam_id,
-                "enabled_lanes": camera.enabled_lanes if camera.enabled_lanes else ["rt_detr", "person_zone"],
-                "tenant_id": str(camera.tenant.id) if camera.tenant else None,
-                "community_id": str(camera.tenant.id) if camera.tenant else None,
-                "policy_version": 1,
-            }
-            runtime_registration_service.register_ai_camera_desired_state(
-                camera=camera,
-                enabled=True,
-                ingest_backend="opencv",
-                sample_hz=2.0,
-                lanes=list(sync_payload["enabled_lanes"]),
-                policy_version=int(sync_payload["policy_version"]),
-                metadata={
-                    "tenant_id": sync_payload.get("tenant_id"),
-                    "community_id": sync_payload.get("community_id"),
-                    "stream_path": sync_payload.get("stream_path"),
-                },
-            )
-            try:
-                http_client.post(f"{ai_base}/api/v1/cameras/register", json=sync_payload, timeout=5)
-            except Exception:
-                pass
-        else:
-            runtime_registration_service.register_ai_camera_desired_state(
-                camera=camera,
-                enabled=False,
-                ingest_backend="opencv",
-                sample_hz=2.0,
-                lanes=list(camera.enabled_lanes if camera.enabled_lanes else ["rt_detr", "person_zone"]),
-                policy_version=1,
-                metadata={
-                    "tenant_id": str(camera.tenant.id) if camera.tenant else None,
-                    "community_id": str(camera.tenant.id) if camera.tenant else None,
-                    "stream_path": camera.stream_path,
-                },
-            )
-
         try:
-            # Fix: AI endpoint expects a raw boolean Body, not an object (Objective 4)
-            resp = http_client.post(
-                f"{ai_base}/api/v1/cameras/{cam_id}/runtime-control",
-                json=bool(enabled),
-                timeout=10,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                camera.status = Camera.Status.ACTIVE if data.get("running") else Camera.Status.INACTIVE
-                camera.save(update_fields=["status", "updated_at"])
-                runtime_registration_service.mark_ai_camera_observed_state(
-                    camera=camera,
-                    running=bool(data.get("running")),
-                    ingest_backend="opencv",
-                    sample_hz=2.0,
-                    lanes=list(camera.enabled_lanes if camera.enabled_lanes else ["rt_detr", "person_zone"]),
+            if bool(enabled):
+                result = start_ai_runtime(
+                    camera,
+                    ingest_backend=str(request.data.get("ingest_backend", "opencv")),
+                    enabled_lanes=request.data.get(
+                        "enabled_lanes",
+                        camera.enabled_lanes if camera.enabled_lanes else ["rt_detr", "person_zone"],
+                    ),
+                    sample_hz=float(request.data.get("sample_hz", 2.0)),
+                    policy_version=int(request.data.get("policy_version", 1)),
                 )
-                return Response(data)
-            runtime_registration_service.mark_ai_camera_observed_state(
-                camera=camera,
-                running=None,
-                error=f"AI returned {resp.status_code}",
-            )
+            else:
+                result = stop_ai_runtime(
+                    camera,
+                    ingest_backend=str(request.data.get("ingest_backend", "opencv")),
+                    enabled_lanes=request.data.get(
+                        "enabled_lanes",
+                        camera.enabled_lanes if camera.enabled_lanes else ["rt_detr", "person_zone"],
+                    ),
+                    sample_hz=float(request.data.get("sample_hz", 2.0)),
+                    policy_version=int(request.data.get("policy_version", 1)),
+                )
+        except RelayNotReadyError as exc:
             return Response(
-                {"error": f"AI returned {resp.status_code}", "detail": resp.text[:500]},
-                status=status.HTTP_502_BAD_GATEWAY,
+                {
+                    "error": exc.detail,
+                    "code": exc.code,
+                    "retryable": exc.retryable,
+                    "waited_seconds": exc.waited_seconds,
+                },
+                status=exc.status_code,
             )
         except Exception as exc:
-            runtime_registration_service.mark_ai_camera_observed_state(
-                camera=camera,
-                running=None,
-                error=str(exc),
-            )
             return Response({"error": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+
+        return Response(
+            {
+                "running": result["running"],
+                "camera_id": result["camera_id"],
+                "stream_path": result["stream_path"],
+                "waited_seconds": result.get("waited_seconds", 0.0),
+            },
+            status=status.HTTP_200_OK,
+        )
 
     # ── Zone CRUD ────────────────────────────────────────────
     @action(detail=True, methods=["get", "post"], url_path="zones")
@@ -853,7 +747,8 @@ class ProfileViewSet(viewsets.ModelViewSet):
 def dashboard_summary(request):
     """Single endpoint for all dashboard data."""
     import datetime
-    from django.db.models import Count
+    from django.db.models import Count, Q
+    from django.core.cache import cache
 
     tenant = get_active_tenant(request)
     if not assert_member(request, tenant):
@@ -871,22 +766,36 @@ def dashboard_summary(request):
     cameras_qs = Camera.objects.filter(tenant=tenant).values(
         "id", "name", "site", "status", "ai_camera_id", "source_type", "stream_path", "rtsp_url"
     )
+    from api.models import AIRuntimeRegistration
+    ai_sync_state = {
+        row["camera_id"]: bool(row["desired_enabled"])
+        for row in AIRuntimeRegistration.objects.filter(camera__tenant=tenant).values("camera_id", "desired_enabled")
+    }
     
     cameras = []
     for cam in cameras_qs:
         # Convert rtsp_url presence to a safe boolean for the UI (hide credentials)
         cam["has_stream"] = bool(cam.pop("rtsp_url", None))
+        cam["is_ai_synced"] = ai_sync_state.get(cam["id"], False)
         cameras.append(cam)
 
     active_cameras = sum(1 for cam in cameras if cam.get("status") == Camera.Status.ACTIVE)
 
-    # Incident counts
+    # Incident counts - collapsed into single DB query
+    aggs = incidents.aggregate(
+        today=Count('id', filter=Q(started_at__gte=today_start)),
+        week=Count('id', filter=Q(started_at__gte=week_start)),
+        month=Count('id', filter=Q(started_at__gte=month_start)),
+        open=Count('id', filter=Q(status=Incident.Status.OPEN)),
+        critical=Count('id', filter=Q(severity__gte=4, started_at__gte=today_start)),
+    )
+
     stats = {
-        "today": incidents.filter(started_at__gte=today_start).count(),
-        "week": incidents.filter(started_at__gte=week_start).count(),
-        "month": incidents.filter(started_at__gte=month_start).count(),
-        "open": incidents.filter(status=Incident.Status.OPEN).count(),
-        "critical": incidents.filter(severity__gte=4, started_at__gte=today_start).count(),
+        "today": aggs["today"],
+        "week": aggs["week"],
+        "month": aggs["month"],
+        "open": aggs["open"],
+        "critical": aggs["critical"],
         "camera_total": len(cameras),
         "camera_live": active_cameras,
     }
@@ -910,21 +819,35 @@ def dashboard_summary(request):
         .values("id", "action", "target_type", "target_id", "created_at", "actor__username")
     )
 
-    # AI health check (non-blocking, best effort)
-    ai_healthy = False
-    try:
-        import requests as http_client
-        from requests.exceptions import RequestException
-        import logging
-        
-        from api.services.mediamtx_helpers import get_ai_base_url
-        ai_base = get_ai_base_url()
-        resp = http_client.get(f"{ai_base}/api/v1/health", timeout=3)
-        ai_healthy = resp.status_code == 200
-    except RequestException as exc:
-        import logging
-        logging.getLogger(__name__).warning("AI Engine health check failed: %s", exc)
-        # Continue silently for the user, but now we have an audit trail
+    # AI health check (cached to avoid blocking dashboard polling)
+    ai_healthy = cache.get("dashboard_ai_health")
+    if ai_healthy is None:
+        try:
+            import requests as http_client
+            from api.services.mediamtx_helpers import get_ai_base_url
+            ai_base = get_ai_base_url()
+            resp = http_client.get(f"{ai_base}/api/v1/health", timeout=1.0)
+            ai_healthy = resp.status_code == 200
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("AI Engine health check failed: %s", exc)
+            ai_healthy = False
+        cache.set("dashboard_ai_health", ai_healthy, 15)  # Cache for 15s
+
+    # Fetch streams health
+    camera_ids = [cam["id"] for cam in cameras]
+    cfg = _stream_preview_config()
+    streams_health = STREAM_WORKERS.health_for_cameras(camera_ids, default_fps=cfg["fps"])
+
+    # Fetch known entities for household/neighbor
+    recent_entities = list(
+        KnownEntity.objects.filter(
+            tenant=tenant, 
+            group__in=[KnownEntity.Group.HOUSEHOLD, KnownEntity.Group.NEIGHBOR]
+        ).exclude(status=KnownEntity.Status.DELETED).order_by("-created_at")[:8].values(
+            "id", "name", "category", "group"
+        )
+    )
 
     return Response({
         "cameras": cameras,
@@ -935,6 +858,8 @@ def dashboard_summary(request):
             {**a, "actor": a.pop("actor__username", None)} for a in recent_audit
         ],
         "ai_healthy": ai_healthy,
+        "streams_health": streams_health,
+        "entities": recent_entities,
     })
 
 @api_view(["GET"])
@@ -996,7 +921,7 @@ class KnownEntityViewSet(TenantScopedViewSet):
         return assert_role_in(request, tenant, allowed_roles={"owner", "admin"})
 
     def get_queryset(self):
-        qs = super().get_queryset().order_by("-created_at")
+        qs = super().get_queryset().prefetch_related("cameras").order_by("-created_at")
         cat = self.request.query_params.get("category")
         group = self.request.query_params.get("group")
         status_filter = self.request.query_params.get("status")
@@ -1030,8 +955,14 @@ class KnownEntityViewSet(TenantScopedViewSet):
         )
 
         uploaded_files = request.FILES.getlist("files")
+        if len(uploaded_files) > 10:
+            return Response({"error": "Maximum 10 files allowed per entity."}, status=status.HTTP_400_BAD_REQUEST)
+
         saved_assets = 0
         for upload in uploaded_files:
+            if upload.size > 5 * 1024 * 1024:
+                return Response({"error": f"File {upload.name} exceeds 5MB limit."}, status=status.HTTP_400_BAD_REQUEST)
+
             upload.seek(0)
             content = upload.read()
             upload.seek(0)
@@ -1045,8 +976,14 @@ class KnownEntityViewSet(TenantScopedViewSet):
                 import io
                 img = Image.open(io.BytesIO(content))
                 img_width, img_height = img.size
-            except Exception:
-                pass  # Pillow not available or file not a valid image
+                if img_width < 64 or img_height < 64:
+                    return Response({"error": f"Image {upload.name} dimensions too small (min 64x64)."}, status=status.HTTP_400_BAD_REQUEST)
+                if img_width > 4096 or img_height > 4096:
+                    return Response({"error": f"Image {upload.name} dimensions too large (max 4096x4096)."}, status=status.HTTP_400_BAD_REQUEST)
+            except Exception as e:
+                # If Pillow failed to parse, we might reject or allow.
+                if isinstance(e, ValueError) or "cannot identify image file" in str(e).lower():
+                    return Response({"error": f"File {upload.name} is not a valid image."}, status=status.HTTP_400_BAD_REQUEST)
 
             asset = KnownEntityAsset.objects.create(
                 tenant=tenant,
@@ -1403,7 +1340,97 @@ def _stream_preview_config() -> dict:
         "ffmpeg_capture_options": str(
             getattr(settings, "OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp|stimeout;3000000")
         ),
+        "prefer_ai_snapshots": bool(
+            getattr(settings, "STREAM_PREVIEW_PREFER_AI_SNAPSHOTS", True)
+        ),
+        "rtsp_fallback_enabled": bool(
+            getattr(settings, "STREAM_PREVIEW_RTSP_FALLBACK_ENABLED", True)
+        ),
+        "ai_snapshot_timeout_s": float(
+            getattr(settings, "STREAM_PREVIEW_AI_SNAPSHOT_TIMEOUT_SECONDS", 2.0)
+        ),
     }
+
+
+def _camera_ai_sync_enabled(camera: Camera) -> bool:
+    from api.models import AIRuntimeRegistration
+
+    registration = getattr(camera, "runtime_registration", None)
+    if registration is None:
+        registration = AIRuntimeRegistration.objects.filter(camera=camera).only("desired_enabled").first()
+    return bool(registration and registration.desired_enabled)
+
+
+def _should_allow_preview_worker(camera: Camera, cfg: dict) -> bool:
+    if cfg["rtsp_fallback_enabled"]:
+        return True
+
+    from api.services.mediamtx_helpers import is_self_referential
+
+    source_url = (camera.rtsp_url or "").strip()
+    if not source_url or is_self_referential(source_url):
+        return False
+
+    return not _camera_ai_sync_enabled(camera)
+
+
+def _ai_snapshot_candidate_ids(camera: Camera) -> list[str]:
+    candidates: list[str] = []
+    for raw in (camera.ai_camera_id, camera.stream_path, f"cam_{camera.pk}"):
+        candidate = str(raw or "").strip()
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
+
+
+def _fetch_ai_snapshot(
+    camera: Camera,
+    *,
+    timeout_s: float,
+    quality: int,
+    max_width: int,
+) -> tuple[bytes | None, str | None, str, str]:
+    """Fetch a snapshot from the AI service without opening a new RTSP reader.
+
+    Returns ``(jpeg_bytes, frame_ts, source_label, error_message)``.
+    """
+    import requests as http_client
+
+    ai_base = get_ai_base_url().rstrip("/")
+    last_error = ""
+    params = {"quality": int(quality), "maxw": int(max_width)}
+
+    for candidate in _ai_snapshot_candidate_ids(camera):
+        for path in (
+            f"/api/v1/cameras/{candidate}/snapshot",
+            f"/frame/{candidate}",
+        ):
+            url = f"{ai_base}{path}"
+            try:
+                resp = http_client.get(url, params=params, timeout=timeout_s)
+            except http_client.Timeout:
+                last_error = f"ai_snapshot_timeout:{candidate}"
+                continue
+            except http_client.RequestException as exc:
+                last_error = f"ai_snapshot_error:{type(exc).__name__}"
+                continue
+
+            content_type = str(resp.headers.get("Content-Type", ""))
+            if resp.status_code == 200 and "image" in content_type and resp.content:
+                frame_ts = str(
+                    resp.headers.get("X-Frame-Timestamp")
+                    or resp.headers.get("X-Timestamp")
+                    or ""
+                )
+                return resp.content, frame_ts, f"ai:{candidate}", ""
+
+            if resp.status_code == 404:
+                last_error = f"ai_snapshot_not_found:{candidate}"
+                continue
+
+            last_error = f"ai_snapshot_http_{resp.status_code}:{candidate}"
+
+    return None, None, "", last_error
 
 
 def _build_stream_token(camera_id: int, ttl_s: int = 60) -> tuple[str, int]:
@@ -1503,21 +1530,49 @@ def streams_snapshot(request, camera_id):
         raise NotAuthenticated("Provide Authorization header or ?token= parameter")
 
     cfg = _stream_preview_config()
-    worker = STREAM_WORKERS.ensure_running(camera, **cfg)
-    worker.touch()
-    jpeg, frame_ts, last_error = STREAM_WORKERS.get_latest_jpeg(int(camera.pk))
+    last_error = ""
 
-    if jpeg:
-        resp = HttpResponse(jpeg, content_type="image/jpeg")
-        resp["Cache-Control"] = "no-store"
-        resp["X-Frame-Timestamp"] = str(frame_ts or "")
-        resp["X-Stream-Status"] = "connected"
-        return resp
+    if cfg["prefer_ai_snapshots"]:
+        jpeg, frame_ts, preview_source, last_error = _fetch_ai_snapshot(
+            camera,
+            timeout_s=float(cfg["ai_snapshot_timeout_s"]),
+            quality=int(cfg["jpeg_quality"]),
+            max_width=int(cfg["max_width"]),
+        )
+        if jpeg:
+            resp = HttpResponse(jpeg, content_type="image/jpeg")
+            resp["Cache-Control"] = "no-store"
+            resp["X-Frame-Timestamp"] = str(frame_ts or "")
+            resp["X-Stream-Status"] = "connected"
+            resp["X-Preview-Source"] = preview_source
+            return resp
+
+    jpeg = None
+    frame_ts = None
+    if _should_allow_preview_worker(camera, cfg):
+        worker = STREAM_WORKERS.ensure_running(
+            camera,
+            fps=int(cfg["fps"]),
+            max_width=int(cfg["max_width"]),
+            jpeg_quality=int(cfg["jpeg_quality"]),
+            idle_ttl_s=int(cfg["idle_ttl_s"]),
+            ffmpeg_capture_options=str(cfg["ffmpeg_capture_options"]),
+        )
+        worker.touch()
+        jpeg, frame_ts, last_error = STREAM_WORKERS.get_latest_jpeg(int(camera.pk))
+
+        if jpeg:
+            resp = HttpResponse(jpeg, content_type="image/jpeg")
+            resp["Cache-Control"] = "no-store"
+            resp["X-Frame-Timestamp"] = str(frame_ts or "")
+            resp["X-Stream-Status"] = "connected"
+            resp["X-Preview-Source"] = "backend_rtsp_worker"
+            return resp
 
     return Response(
         {
             "status": "warming_up",
-            "last_error": last_error,
+            "last_error": last_error or "preview_unavailable",
         },
         status=status.HTTP_503_SERVICE_UNAVAILABLE,
     )

@@ -1,4 +1,4 @@
-import { useMemo, useState, lazy, Suspense } from "react";
+import { useMemo, useState, lazy, Suspense, useEffect } from "react";
 import { useLocation } from "wouter";
 import { useQuery } from "@tanstack/react-query";
 import { Activity, AlertTriangle, Clock3, Dog, Grid2x2, Maximize2, Shield, TrendingUp, User, Car, Video, Sparkles, Loader2 } from "lucide-react";
@@ -59,67 +59,30 @@ export default function Dashboard() {
   const [zoneFilter, setZoneFilter] = useState("all");
   const [selectedCameraId, setSelectedCameraId] = useState<number | null>(null);
   const [isFullscreenOpen, setIsFullscreenOpen] = useState(false);
+  const [isDocumentVisible, setIsDocumentVisible] = useState(!document.hidden);
+  
+  useEffect(() => {
+    const handleVisibilityChange = () => setIsDocumentVisible(!document.hidden);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => document.removeEventListener("visibilitychange", handleVisibilityChange);
+  }, []);
 
   const dashboardQ = useQuery({
     queryKey: ["dashboard-summary"],
     queryFn: async () => {
       const { data } = await api.get("/dashboard/summary/");
       return data as {
-        cameras: Array<{ id: number; name: string; site: string; status: string; ai_camera_id: string; stream_path?: string; source_type?: string }>;
+        cameras: Array<{ id: number; name: string; site: string; status: string; ai_camera_id: string; stream_path?: string; source_type?: string; is_ai_synced?: boolean }>;
         stats: { today: number; week: number; month: number; open?: number; critical?: number; camera_total?: number; camera_live?: number };
-        recent_incidents: Array<{
-          id: number;
-          type: string;
-          status: string;
-          severity: number;
-          started_at: string;
-          camera__name: string;
-          camera__source_type?: "registered" | "webcam";
-          details: Record<string, unknown>;
-        }>;
+        recent_incidents: Array<any>;
         type_breakdown: Array<{ type: string; count: number }>;
         recent_audit: Array<{ id: number; action: string; actor: string; created_at: string }>;
         ai_healthy?: boolean;
+        entities?: Array<{ id: string; name: string; category: string; group: string }>;
+        streams_health?: Record<string, any>;
       };
     },
-    refetchInterval: 5000,
-    retry: false,
-  });
-
-  const entitiesQ = useQuery({
-    queryKey: ["ai-entities-dash"],
-    queryFn: async () => {
-      const { data } = await api.get("/ai/entities/");
-      const list = Array.isArray(data) ? data : data?.entities ?? [];
-      return list as Array<{ entity_id?: string; id?: string; name?: string; label?: string; category?: string; group?: string }>;
-    },
-    refetchInterval: 30000,
-    retry: false,
-  });
-
-  const activityQ = useQuery({
-    queryKey: ["community-activity", { limit: 10 }],
-    queryFn: async () => {
-      const { data } = await api.get("/community/activity/", { params: { limit: 10 } });
-      return Array.isArray(data) ? data : [];
-    },
-    refetchInterval: 10000,
-    retry: false,
-  });
-
-  const healthQ = useQuery({
-    queryKey: ["streams-health"],
-    queryFn: async () => {
-      const { data } = await api.get("/streams/health/");
-      return (data ?? {}) as Record<string, {
-        connected: boolean;
-        last_frame_ts: number | null;
-        last_error: string;
-        fps_config: number;
-        viewers: number;
-      }>;
-    },
-    refetchInterval: 10000,
+    refetchInterval: isDocumentVisible ? 5000 : false,
     retry: false,
   });
 
@@ -129,13 +92,14 @@ export default function Dashboard() {
     name: camera.name,
     location: camera.site || "Unknown zone",
     status: (camera.status === "active" ? "active" : "offline") as "active" | "offline",
+    isAiSynced: Boolean(camera.is_ai_synced),
     ai_camera_id: camera.ai_camera_id,
     streamUrl: buildWebRtcViewerUrl(camera.stream_path, camera.ai_camera_id),
     imageUrl: camera.id ? `/streams/${camera.id}/snapshot/` : frontDoorImg,
     sourceLabel: camera.source_type === "webcam" ? "Webcam" : "Registered",
     stream_path: camera.stream_path as string,
-    health: healthQ.data?.[String(camera.id)],
-  })), [data?.cameras, healthQ.data]);
+    health: data?.streams_health?.[String(camera.id)],
+  })), [data?.cameras, data?.streams_health]);
 
   const zoneValues = Array.from(new Set(cameras.map((cam) => cam.location?.trim()).filter(Boolean)));
   const filteredCameras = cameras.filter((camera) => zoneFilter === "all" || camera.location === zoneFilter);
@@ -164,18 +128,18 @@ export default function Dashboard() {
     };
   });
 
-  const knownEntities = (entitiesQ.data ?? []).map((entity) => ({
-    name: String(entity.name ?? entity.label ?? "Unknown"),
+  const knownEntities = (data?.entities ?? []).map((entity) => ({
+    name: String(entity.name ?? "Unknown"),
     type: (entity.category === "pet" ? "pet" : entity.category === "vehicle" ? "vehicle" : "person") as "person" | "pet" | "vehicle",
     group: String(entity.group ?? "household"),
   })).filter((entity) => entity.group === "household" || entity.group === "neighbor").slice(0, 8);
 
-  const communityActivity = (activityQ.data ?? []).slice(0, 10).map((activity: any) => ({
-    time: activity.timestamp ? new Date(activity.timestamp).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "",
-    title: String(activity.title ?? "Activity"),
-    description: String(activity.description ?? ""),
+  const communityActivity = (data?.recent_audit ?? []).slice(0, 10).map((activity: any) => ({
+    time: activity.created_at ? new Date(activity.created_at).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "",
+    title: String(activity.action ?? "Activity"),
+    description: "",
     actor: activity.actor ? String(activity.actor) : "System",
-    type: String(activity.type ?? "activity"),
+    type: "activity",
   }));
 
   const getEntityIcon = (type: string) => {
@@ -221,6 +185,7 @@ export default function Dashboard() {
                       name={selectedCamera.name}
                       location={selectedCamera.location}
                       status={selectedCamera.status}
+                      isAiSynced={selectedCamera.isAiSynced}
                       cameraId={selectedCamera.id}
                       streamPath={selectedCamera.stream_path}
                       imageUrl={selectedCamera.imageUrl}
@@ -249,6 +214,7 @@ export default function Dashboard() {
                             name={camera.name}
                             location={camera.location}
                             status={camera.status}
+                            isAiSynced={camera.isAiSynced}
                             cameraId={camera.id}
                             imageUrl={camera.imageUrl}
                             streamUrl={camera.streamUrl}
@@ -261,7 +227,7 @@ export default function Dashboard() {
                 </div>
               ) : (
                 <div className="grid grid-cols-1 gap-4 md:grid-cols-2 2xl:grid-cols-3">
-                  {(filteredCameras.length > 0 ? filteredCameras : [{ id: 0, name: 'No cameras', location: '-', status: 'offline' as const, imageUrl: frontDoorImg, streamUrl: undefined, health: undefined }]).map((camera, index) => (
+                  {(filteredCameras.length > 0 ? filteredCameras : [{ id: 0, name: 'No cameras', location: '-', status: 'offline' as const, isAiSynced: false, imageUrl: frontDoorImg, streamUrl: undefined, health: undefined }]).map((camera, index) => (
                     <button
                       key={camera.id || index}
                       className="text-left"
@@ -271,6 +237,7 @@ export default function Dashboard() {
                         name={camera.name}
                         location={camera.location}
                         status={camera.status}
+                        isAiSynced={camera.isAiSynced}
                         cameraId={camera.id || undefined}
                         imageUrl={camera.imageUrl}
                         streamUrl={camera.streamUrl}

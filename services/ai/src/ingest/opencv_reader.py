@@ -2,6 +2,7 @@
 OpenCV-based video reader (supports RTSP and local files)
 """
 import cv2
+import os
 import threading
 import time
 import numpy as np
@@ -20,6 +21,10 @@ class OpenCVReader(IngestBackend):
         self._backoff_delay = max(2.0, reconnect_delay)
         self._backoff_max = 60.0
         self._backoff_multiplier = 1.5
+        self._capture_options = os.getenv(
+            "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+            "rtsp_transport;tcp|stimeout;5000000",
+        ).strip()
         self.logger = setup_logger(f"OpenCVReader-{camera_id}")
         
         self._cap = None
@@ -31,6 +36,16 @@ class OpenCVReader(IngestBackend):
         self._frame_seq = 0              # monotonic frame counter
         self._prev_returned_seq = 0      # last seq returned by get_latest
         self._new_frame = threading.Event()  # signalled on new frame
+
+    def _configure_capture(self, cap) -> None:
+        if cap is None:
+            return
+        buffer_size_prop = getattr(cv2, "CAP_PROP_BUFFERSIZE", None)
+        if buffer_size_prop is not None:
+            try:
+                cap.set(buffer_size_prop, 1)
+            except Exception:
+                pass
     
     def start(self):
         """Start the reader thread"""
@@ -61,7 +76,9 @@ class OpenCVReader(IngestBackend):
         with self._lock:
             if self._latest_frame is not None and self._frame_seq != self._prev_returned_seq:
                 self._prev_returned_seq = self._frame_seq
-                return self._latest_frame.copy(), self._latest_ts
+                # Return the frame reference directly to reduce memory bandwidth
+                # Callers MUST treat this array as immutable
+                return self._latest_frame, self._latest_ts
             return None, None
 
     def wait_for_frame(self, timeout: float = 0.5) -> bool:
@@ -81,11 +98,15 @@ class OpenCVReader(IngestBackend):
                 self._cap.release()
             
             # Try to open with CAP_FFMPEG backend
+            if "://" in self.source and self._capture_options:
+                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = self._capture_options
             self._cap = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
+            self._configure_capture(self._cap)
             
             if not self._cap.isOpened():
                 # Fallback to default backend
                 self._cap = cv2.VideoCapture(self.source)
+                self._configure_capture(self._cap)
             
             if self._cap.isOpened():
                 # Test read
@@ -98,6 +119,8 @@ class OpenCVReader(IngestBackend):
                     with self._lock:
                         self._latest_frame = frame
                         self._latest_ts = now_iso_utc()
+                        self._frame_seq += 1
+                    self._new_frame.set()
 
                     # Reset reconnect backoff after successful reconnect.
                     self._backoff_delay = max(2.0, self.reconnect_delay)

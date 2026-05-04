@@ -6,7 +6,7 @@ from django.utils.text import slugify
 from api.models import Camera, CameraZone, MediaMTXDesiredPath, Tenant
 from api.repositories.camera_repository import CameraConfigRepository
 from api.repositories.runtime_repository import RuntimeRepository
-from api.services.mediamtx_helpers import is_self_referential
+from api.services.mediamtx_helpers import is_self_referential, sanitize_stream_url
 from api.services.outbox_service import OutboxService
 
 
@@ -34,7 +34,7 @@ class CameraConfigService:
         """
         if camera.source_type == Camera.SourceType.WEBCAM:
             return ""
-        url = (camera.rtsp_url or "").strip()
+        url = sanitize_stream_url(camera.rtsp_url)
         if not url or is_self_referential(url):
             return ""
         return url
@@ -88,9 +88,10 @@ class CameraConfigService:
     def update_camera(self, *, camera: Camera, attrs: dict) -> Camera:
         camera = self.camera_repository.update_camera(camera=camera, attrs=attrs)
         camera = self._ensure_stream_identity(camera)
+        runtime_registration = self.runtime_repository.get_or_create_ai_runtime_registration(camera=camera)
         self.runtime_repository.set_ai_runtime_desired_state(
             camera=camera,
-            enabled=camera.status == Camera.Status.ACTIVE,
+            enabled=bool(runtime_registration.desired_enabled),
             ingest_backend="opencv",
             sample_hz=2.0,
             lanes=list(camera.enabled_lanes or []),

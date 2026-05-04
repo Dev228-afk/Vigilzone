@@ -541,10 +541,17 @@ class CameraProcessor:
                 self.stats["last_frame_ts"] = ts
                 if frame_count % 30 == 0:
                     elapsed = time.time() - t_start
-                    self.stats["fps"] = frame_count / max(elapsed, 1)
-
-                # Yield briefly — only needed when loop ran faster than source
-                time.sleep(0.001)
+                    fps = frame_count / max(elapsed, 1)
+                    self.stats["fps"] = fps
+                    
+                    try:
+                        import psutil
+                        process = psutil.Process()
+                        cpu_percent = process.cpu_percent()
+                        mem_mb = process.memory_info().rss / (1024 * 1024)
+                        self.logger.debug(f"Performance [Camera {self.camera_id}]: FPS={fps:.1f}, CPU={cpu_percent:.1f}%, Mem={mem_mb:.1f}MB")
+                    except ImportError:
+                        pass
 
             except Exception as e:
                 self.logger.error(f"Processing error: {e}")
@@ -658,6 +665,10 @@ class CameraProcessor:
     def get_stats(self) -> Dict[str, Any]:
         return {
             "camera_id": self.camera_id,
+            "rtsp_url": self.camera_cfg.get("rtsp_url", ""),
+            "ingest_backend": self.camera_cfg.get("ingest_backend", "opencv"),
+            "enabled_lanes": list(self.camera_cfg.get("enabled_lanes", [])),
+            "sample_hz": self.camera_cfg.get("sample_hz", 2.0),
             "source_type": self.camera_cfg.get("source_type", "rtsp"),
             "connected": self.reader.is_connected(),
             "active": self.reader.is_connected(),

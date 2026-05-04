@@ -74,8 +74,9 @@ class OutboxStreamPublisherProcessor(WorkerProcessor):
     def run_once(self) -> int:
         r = self._get_client()
 
-        # Version Check: Redis Streams (XADD) require Redis 5.0+
-        # The user's system was found running Redis 3.0.504, which does not support XADD.
+        # Version Check: Redis Streams (XADD) require Redis 5.0+.
+        # This is a live runtime check against the connected Redis server,
+        # not a static assumption about the local environment.
         info = r.info("server")
         ver_str = info.get("redis_version", "0.0.0")
         major_ver = int(ver_str.split(".")[0])

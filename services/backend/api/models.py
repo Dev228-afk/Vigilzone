@@ -166,11 +166,12 @@ class Camera(TimeStamped):
         the relay reconciler.
         """
         from django.core.exceptions import ValidationError
-        from api.services.mediamtx_helpers import is_self_referential
+        from api.services.mediamtx_helpers import is_self_referential, sanitize_stream_url
 
         super().clean()
 
-        url = (self.rtsp_url or "").strip()
+        url = sanitize_stream_url(self.rtsp_url)
+        self.rtsp_url = url
 
         # Webcam / managed sources never need an external pull URL.
         # If one was set, silently clear it — the reconciler will
@@ -268,6 +269,14 @@ class Incident(TimeStamped):
     details = models.JSONField(default=dict, blank=True)       # extra info
     media_key = models.CharField(max_length=512, blank=True)   # S3/MinIO key or path
 
+    class Meta:
+        indexes = [
+            models.Index(fields=["tenant", "started_at"]),
+            models.Index(fields=["tenant", "status", "started_at"]),
+            models.Index(fields=["tenant", "severity", "started_at"]),
+            models.Index(fields=["camera", "type", "status", "started_at"]),
+        ]
+
 class Detection(TimeStamped):
     """
     Lightweight per-interval summary (e.g., 1s/5s) of model output.
@@ -285,6 +294,7 @@ class Detection(TimeStamped):
 
 class Alert(TimeStamped):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="alerts", null=True, blank=True)
     incident = models.ForeignKey(Incident, on_delete=models.CASCADE, related_name="alerts")
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="alerts", null=True, blank=True)
     channel = models.CharField(max_length=32, default="email")   # realtime|email|webhook|sms|push
@@ -292,7 +302,9 @@ class Alert(TimeStamped):
     delivered_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
+        unique_together = [("incident", "user", "channel")]
         indexes = [
+            models.Index(fields=["tenant", "user", "delivered_at", "created_at"]),
             models.Index(fields=["user", "created_at"]),
             models.Index(fields=["user", "delivered_at"]),
         ]
@@ -304,6 +316,11 @@ class AuditLog(TimeStamped):
     target_type = models.CharField(max_length=64)  # e.g., incident, camera
     target_id = models.CharField(max_length=64, blank=True)
     meta = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["tenant", "created_at"]),
+        ]
 
 class KnownEntity(TimeStamped):
     """Source-of-truth for enrolled entities (persons / pets / vehicles)."""
@@ -676,7 +693,7 @@ class AIRuntimeRegistration(TimeStamped):
         on_delete=models.CASCADE,
         related_name="runtime_registration",
     )
-    desired_enabled = models.BooleanField(default=True)
+    desired_enabled = models.BooleanField(default=False)
     desired_ingest_backend = models.CharField(max_length=64, default="opencv")
     desired_sample_hz = models.FloatField(default=2.0)
     desired_lanes = models.JSONField(default=list, blank=True)

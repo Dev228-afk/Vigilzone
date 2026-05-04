@@ -60,7 +60,14 @@ export default defineConfig({
       "/mediamtx_api": {
         target: process.env.VITE_MEDIAMTX_API_TARGET || "http://127.0.0.1:9997",
         changeOrigin: true,
-        rewrite: (path) => path.replace(/^\/mediamtx_api/, '')
+        rewrite: (path) => path.replace(/^\/mediamtx_api/, ''),
+        configure: (proxy, _options) => {
+          proxy.on('error', (err, _req, _res) => {
+            // Suppress the ECONNREFUSED logs since the frontend handles the healthcheck fallback gracefully.
+            if (err.message.includes('ECONNREFUSED')) return;
+            console.error('proxy error', err);
+          });
+        }
       },
     },
   },

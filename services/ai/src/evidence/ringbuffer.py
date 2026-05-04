@@ -40,8 +40,8 @@ class FrameRingBuffer:
             ts_utc: ISO UTC timestamp
         """
         try:
-            # Encode to JPEG to save memory
-            _, jpeg_bytes = cv2.imencode('.jpg', frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            # Encode to JPEG to save memory. Lower quality (60) saves significant RAM.
+            _, jpeg_bytes = cv2.imencode('.jpg', frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 60])
             jpeg_data = jpeg_bytes.tobytes()
             
             with self._lock:
@@ -66,6 +66,25 @@ class FrameRingBuffer:
             for frame_ts, jpeg_data in self.buffer:
                 diff = timestamp_diff_seconds(frame_ts, ts_utc)
                 if -seconds <= diff <= 0:
+                    result.append((frame_ts, jpeg_data))
+            return result
+
+    def get_frames_after(self, ts_utc: str, seconds: float = 8.0) -> List[Tuple[str, bytes]]:
+        """
+        Get frames from specified seconds after a timestamp
+        Args:
+            ts_utc: Reference timestamp
+            seconds: How many seconds after to retrieve
+        Returns:
+            List of (timestamp, jpeg_bytes) tuples
+        """
+        from ..common.timeutil import timestamp_diff_seconds
+        
+        with self._lock:
+            result = []
+            for frame_ts, jpeg_data in self.buffer:
+                diff = timestamp_diff_seconds(frame_ts, ts_utc)
+                if 0 <= diff <= seconds:
                     result.append((frame_ts, jpeg_data))
             return result
     

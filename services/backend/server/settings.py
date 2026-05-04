@@ -90,6 +90,7 @@ else:
 MIDDLEWARE = [
     "corsheaders.middleware.CorsMiddleware",
     "api.middleware.ActiveTenantMiddleware",  
+    "api.middleware.QueryCountMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
@@ -236,6 +237,17 @@ OPENCV_FFMPEG_CAPTURE_OPTIONS = os.getenv(
     "OPENCV_FFMPEG_CAPTURE_OPTIONS",
     "rtsp_transport;tcp|stimeout;3000000",
 )
+STREAM_PREVIEW_PREFER_AI_SNAPSHOTS = os.getenv(
+    "STREAM_PREVIEW_PREFER_AI_SNAPSHOTS",
+    "1",
+).strip().lower() in ("1", "true", "yes", "on")
+STREAM_PREVIEW_RTSP_FALLBACK_ENABLED = os.getenv(
+    "STREAM_PREVIEW_RTSP_FALLBACK_ENABLED",
+    "0",
+).strip().lower() in ("1", "true", "yes", "on")
+STREAM_PREVIEW_AI_SNAPSHOT_TIMEOUT_SECONDS = float(
+    os.getenv("STREAM_PREVIEW_AI_SNAPSHOT_TIMEOUT_SECONDS", "2.0")
+)
 
 # ── MediaMTX Relay Identity ─────────────────────────────────
 # The canonical hostname and port that THIS deployment's MediaMTX
@@ -259,6 +271,55 @@ _extra = os.getenv("RELAY_RTSP_ALIASES", "").strip()
 if _extra:
     _relay_aliases.update(a.strip().lower() for a in _extra.split(",") if a.strip())
 RELAY_RTSP_ALIASES: frozenset[str] = frozenset(_relay_aliases)
+
+
+def _host_looks_local(hostname: str) -> bool:
+    host = str(hostname or "").strip().lower()
+    return host in {"127.0.0.1", "localhost", "0.0.0.0", "::1", "[::1]"}
+
+
+def _validate_runtime_service_urls() -> None:
+    """Fail fast when production-like deployments still point at localhost."""
+    allow_local = os.getenv("ALLOW_LOCALHOST_SERVICE_URLS", "").strip().lower() in {"1", "true", "yes", "on"}
+    strict_raw = os.getenv("STRICT_SERVICE_URL_VALIDATION", "").strip().lower()
+    strict_validation = (strict_raw in {"1", "true", "yes", "on"}) or (not DEBUG and strict_raw not in {"0", "false", "no", "off"})
+
+    if not strict_validation or allow_local:
+        return
+
+    checks: list[tuple[str, str, tuple[str, ...]]] = [
+        ("AI_BASE_INTERNAL", os.getenv("AI_BASE_INTERNAL", "").strip(), ("http", "https")),
+        ("MEDIAMTX_API_URL", os.getenv("MEDIAMTX_API_URL", "").strip(), ("http", "https")),
+        (
+            "MEDIAMTX_INTERNAL_RTSP_URL",
+            (os.getenv("MEDIAMTX_INTERNAL_RTSP_URL") or os.getenv("MEDIAMTX_RTSP_BASE") or "").strip(),
+            ("rtsp", "rtsps"),
+        ),
+    ]
+
+    problems: list[str] = []
+    for env_name, raw_value, schemes in checks:
+        if not raw_value:
+            problems.append(f"{env_name} is missing")
+            continue
+
+        from urllib.parse import urlparse
+        parsed = urlparse(raw_value)
+        if not parsed.scheme or parsed.scheme.lower() not in schemes:
+            problems.append(f"{env_name} has an invalid URL: {raw_value}")
+            continue
+
+        if _host_looks_local(parsed.hostname or ""):
+            problems.append(
+                f"{env_name} points to localhost ({raw_value}). "
+                "Set the real internal service address or ALLOW_LOCALHOST_SERVICE_URLS=1 for single-host deployments."
+            )
+
+    if problems:
+        raise ImproperlyConfigured("Service URL validation failed: " + " | ".join(problems))
+
+
+_validate_runtime_service_urls()
 
 
 

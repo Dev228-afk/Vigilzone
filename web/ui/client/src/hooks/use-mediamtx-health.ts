@@ -1,4 +1,5 @@
-import { useState, useEffect } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { getWebRtcViewerBaseUrl, isWebRtcEnabled } from "@/lib/streaming";
 
 interface UseMediamtxHealthResult {
   reachable: boolean;
@@ -12,40 +13,24 @@ interface UseMediamtxHealthResult {
  * an iframe for a stream that is not publishing (prevents "stream not found" error).
  */
 export function useMediamtxHealth(): UseMediamtxHealthResult {
-  const [reachable, setReachable] = useState(false);
-  const [checked, setChecked] = useState(false);
-  const [activePaths, setActivePaths] = useState<Set<string>>(new Set());
+  const webrtcEnabled = isWebRtcEnabled();
+  const apiHealthcheckEnabled = String(import.meta.env.VITE_ENABLE_MEDIAMTX_API_HEALTHCHECK ?? "true").toLowerCase() === "true";
+  const baseUrl = getWebRtcViewerBaseUrl();
 
-  useEffect(() => {
-    let cancelled = false;
-
-    const webrtcEnabled = String(import.meta.env.VITE_ENABLE_WEBRTC ?? "false").toLowerCase() === "true";
-    const apiHealthcheckEnabled = String(import.meta.env.VITE_ENABLE_MEDIAMTX_API_HEALTHCHECK ?? "true").toLowerCase() === "true";
-    const baseUrl = String(import.meta.env.VITE_WEBRTC_VIEWER_BASE_URL ?? "").trim();
-
-    if (!webrtcEnabled || !baseUrl) {
-      if (!cancelled) {
-        setReachable(false);
-        setChecked(true);
-      }
-      return;
-    }
-
-    (async () => {
+  const query = useQuery({
+    queryKey: ["mediamtx-health"],
+    queryFn: async () => {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 3000);
 
       try {
-        let pathsReady = false;
-
-        // Optionally fetch active paths via Vite proxy to MediaMTX API
         if (apiHealthcheckEnabled) {
           try {
             const pathsRes = await fetch("/mediamtx_api/v3/paths/list", {
               signal: controller.signal,
             });
 
-            if (!cancelled && pathsRes.ok) {
+            if (pathsRes.ok) {
               const data = await pathsRes.json();
               const paths = new Set<string>();
               if (data && data.items) {
@@ -55,44 +40,37 @@ export function useMediamtxHealth(): UseMediamtxHealthResult {
                   }
                 });
               }
-              setActivePaths(paths);
-              setReachable(true);
-              pathsReady = true;
+              return { reachable: true, activePaths: paths };
             }
           } catch (apiErr) {
             console.debug("MediaMTX API health check failed, falling back to reachability", apiErr);
           }
         }
 
-        if (cancelled) return;
-
         // Fallback or lightweight check if API check is disabled or failed
-        if (!pathsReady) {
-          const fallbackRes = await fetch(`${baseUrl.replace(/\/$/, "")}/`, {
-            method: "HEAD",
-            mode: "no-cors",
-            signal: controller.signal,
-          });
-          setReachable(true);
-        }
+        const fallbackRes = await fetch(`${baseUrl.replace(/\/$/, "")}/`, {
+          method: "HEAD",
+          mode: "no-cors",
+          signal: controller.signal,
+        });
+        return { reachable: true, activePaths: new Set<string>() };
       } catch (err) {
-        if (!cancelled) {
-          // Even if both fail, don't crash; just mark as unreachable
-          setReachable(false);
-          setActivePaths(new Set());
-        }
+        return { reachable: false, activePaths: new Set<string>() };
       } finally {
         clearTimeout(timeoutId);
-        if (!cancelled) {
-          setChecked(true);
-        }
       }
-    })();
+    },
+    enabled: webrtcEnabled && !!baseUrl,
+    staleTime: 5000, // Cache for 5s to avoid proxy storm
+  });
 
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  if (!webrtcEnabled || !baseUrl) {
+    return { reachable: false, checked: true, activePaths: new Set() };
+  }
 
-  return { reachable, checked, activePaths };
+  return {
+    reachable: query.data?.reachable ?? false,
+    checked: !query.isPending,
+    activePaths: query.data?.activePaths ?? new Set(),
+  };
 }

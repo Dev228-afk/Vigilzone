@@ -10,7 +10,8 @@ import json
 
 from api.models import (
     Tenant, Membership, Camera, Incident, Detection, Alert, 
-    AuditLog, Profile, Invitation
+    AuditLog, Profile, Invitation, AIRuntimeRegistration,
+    MediaMTXDesiredPath, MediaMTXObservedPathState
 )
 
 
@@ -499,6 +500,64 @@ class CameraTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data['name'], 'Front Door')
 
+    def test_create_camera_defaults_to_unsynced_ai(self):
+        response = self.client.post(
+            '/api/cameras/',
+            {
+                'name': 'Main Door',
+                'status': 'active',
+                'source_type': 'registered',
+                'rtsp_url': 'rtsp://example.local/main-door',
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        camera = Camera.objects.get(tenant=self.tenant, name='Main Door')
+        reg = AIRuntimeRegistration.objects.get(camera=camera)
+        self.assertFalse(reg.desired_enabled)
+        self.assertFalse(response.data['is_ai_synced'])
+
+    def test_update_camera_preserves_unsynced_ai_state(self):
+        create_response = self.client.post(
+            '/api/cameras/',
+            {
+                'name': 'Patio Camera',
+                'status': 'active',
+                'source_type': 'registered',
+                'rtsp_url': 'rtsp://example.local/patio',
+            },
+            format='json',
+        )
+        self.assertEqual(create_response.status_code, status.HTTP_201_CREATED)
+        camera = Camera.objects.get(tenant=self.tenant, name='Patio Camera')
+
+        patch_response = self.client.patch(
+            f'/api/cameras/{camera.id}/',
+            {'site': 'Rear Patio'},
+            format='json',
+        )
+
+        self.assertEqual(patch_response.status_code, status.HTTP_200_OK)
+        self.assertFalse(patch_response.data['is_ai_synced'])
+        self.assertFalse(AIRuntimeRegistration.objects.get(camera=camera).desired_enabled)
+
+    def test_create_camera_sanitizes_wrapped_stream_url(self):
+        response = self.client.post(
+            '/api/cameras/',
+            {
+                'name': 'Quoted URL Camera',
+                'status': 'active',
+                'source_type': 'registered',
+                'rtsp_url': "\"'http://67.53.46.161:65123/mjpg/video.mjpg'\"",
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        camera = Camera.objects.get(tenant=self.tenant, name='Quoted URL Camera')
+        self.assertEqual(camera.rtsp_url, 'http://67.53.46.161:65123/mjpg/video.mjpg')
+
 
 @override_settings(
     REST_FRAMEWORK={
@@ -660,6 +719,8 @@ class NotificationSettingsTests(APITestCase):
         ],
     },
     STREAM_PREVIEW_FPS=3,
+    STREAM_PREVIEW_PREFER_AI_SNAPSHOTS=False,
+    STREAM_PREVIEW_RTSP_FALLBACK_ENABLED=True,
 )
 class StreamEndpointTests(APITestCase):
     """Test signed-token snapshot/MJPEG stream endpoints."""
@@ -714,6 +775,62 @@ class StreamEndpointTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
         self.assertEqual(response.data['status'], 'warming_up')
 
+    @override_settings(
+        STREAM_PREVIEW_PREFER_AI_SNAPSHOTS=True,
+        STREAM_PREVIEW_RTSP_FALLBACK_ENABLED=False,
+    )
+    @patch('requests.get')
+    def test_snapshot_prefers_ai_snapshot(self, mock_get):
+        ai_resp = MagicMock(status_code=200, content=b'aijpeg')
+        ai_resp.headers = {
+            'Content-Type': 'image/jpeg',
+            'X-Frame-Timestamp': '2026-05-03T17:42:04Z',
+        }
+        mock_get.return_value = ai_resp
+
+        response = self.client.get(f'/api/streams/{self.camera.id}/snapshot/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.content, b'aijpeg')
+        self.assertEqual(response['X-Preview-Source'], 'ai:front-door')
+
+    @override_settings(
+        STREAM_PREVIEW_PREFER_AI_SNAPSHOTS=True,
+        STREAM_PREVIEW_RTSP_FALLBACK_ENABLED=False,
+    )
+    @patch('api.views.STREAM_WORKERS.get_latest_jpeg', return_value=(b'directjpeg', 321.0, ''))
+    @patch('api.views.STREAM_WORKERS.ensure_running')
+    @patch('requests.get')
+    def test_snapshot_allows_direct_preview_fallback_for_unsynced_camera(self, mock_get, mock_ensure, _mock_latest):
+        ai_resp = MagicMock(status_code=404, content=b'')
+        ai_resp.headers = {'Content-Type': 'application/json'}
+        mock_get.return_value = ai_resp
+
+        response = self.client.get(f'/api/streams/{self.camera.id}/snapshot/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.content, b'directjpeg')
+        self.assertEqual(response['X-Preview-Source'], 'backend_rtsp_worker')
+        mock_ensure.assert_called_once()
+
+    @override_settings(
+        STREAM_PREVIEW_PREFER_AI_SNAPSHOTS=True,
+        STREAM_PREVIEW_RTSP_FALLBACK_ENABLED=False,
+    )
+    @patch('api.views.STREAM_WORKERS.ensure_running')
+    @patch('requests.get')
+    def test_snapshot_keeps_rtsp_fallback_disabled_for_synced_camera(self, mock_get, mock_ensure):
+        AIRuntimeRegistration.objects.create(camera=self.camera, desired_enabled=True)
+        ai_resp = MagicMock(status_code=404, content=b'')
+        ai_resp.headers = {'Content-Type': 'application/json'}
+        mock_get.return_value = ai_resp
+
+        response = self.client.get(f'/api/streams/{self.camera.id}/snapshot/')
+
+        self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+        self.assertEqual(response.data['status'], 'warming_up')
+        mock_ensure.assert_not_called()
+
     @patch('api.views.STREAM_WORKERS.add_viewer')
     @patch('api.views.STREAM_WORKERS.ensure_running')
     def test_mjpeg_requires_valid_token(self, _mock_ensure, _mock_add_viewer):
@@ -758,7 +875,26 @@ class AiControlPlaneTests(APITestCase):
             rtsp_url='rtsp://camera.local/stream',
             ai_camera_id='cam_hallway',
             stream_path='cam_hallway',
-            status='inactive',
+            status='active',
+        )
+        self.desired_path = MediaMTXDesiredPath.objects.create(
+            camera=self.camera,
+            stream_path='cam_hallway',
+            desired_enabled=True,
+            source_uri='rtsp://camera.local/stream',
+            source_kind='native',
+            path_generation=1,
+            last_applied_generation=1,
+            last_error='',
+            last_verified_at=timezone.now(),
+        )
+        MediaMTXObservedPathState.objects.create(
+            desired_path=self.desired_path,
+            observed_enabled=True,
+            observed_source='rtsp://camera.local/stream',
+            observed_payload={"source": "rtsp://camera.local/stream"},
+            observed_at=timezone.now(),
+            last_error='',
         )
 
         response = self.client.post('/api/auth/token/', {'username': 'aiuser', 'password': 'password123'}, format='json')
@@ -768,26 +904,9 @@ class AiControlPlaneTests(APITestCase):
             HTTP_X_TENANT_ID=str(self.tenant.id),
         )
 
-    @patch('ai_integration.views.MediaMTXDesiredPath.objects')
-    @patch('ai_integration.views.camera_config_service.update_camera')
     @patch('requests.get')
     @patch('requests.post')
-    def test_ai_start_uses_tenant_scoped_camera_and_updates_status(self, mock_post, mock_get, mock_update_camera, mock_desired_qs):
-        # Configure mock desired path for the reconciler-driven flow
-        mock_desired_path = MagicMock()
-        mock_desired_path.stream_path = 'cam_hallway'
-        mock_desired_path.source_kind = 'native'
-        mock_desired_qs.filter.return_value.first.return_value = mock_desired_path
-
-        # Mock update_camera to apply the status change without triggering
-        # the full service-layer chain (set_desired_mediamtx_path etc.)
-        def _mock_update(*, camera, attrs):
-            for k, v in attrs.items():
-                setattr(camera, k, v)
-            camera.save(update_fields=list(attrs.keys()))
-            return camera
-        mock_update_camera.side_effect = _mock_update
-
+    def test_ai_start_uses_tenant_scoped_camera_and_marks_runtime_synced(self, mock_post, mock_get):
         register_resp = MagicMock(status_code=201, text='ok')
         register_resp.json.return_value = {'camera_id': 'cam_hallway', 'hot_loaded': True}
 
@@ -808,12 +927,18 @@ class AiControlPlaneTests(APITestCase):
         self.assertTrue(response.data['running'])
         self.assertEqual(response.data['camera_db_id'], self.camera.id)
 
-        self.camera.refresh_from_db()
-        self.assertEqual(self.camera.status, 'active')
+        reg = AIRuntimeRegistration.objects.get(camera=self.camera)
+        self.assertTrue(reg.desired_enabled)
+        self.assertTrue(reg.observed_enabled)
 
     @patch('requests.get')
     @patch('requests.post')
     def test_ai_stop_turns_runtime_off(self, mock_post, mock_get):
+        AIRuntimeRegistration.objects.create(
+            camera=self.camera,
+            desired_enabled=True,
+            observed_enabled=True,
+        )
         runtime_resp = MagicMock(status_code=200, text='ok')
         runtime_resp.json.return_value = {'running': False}
 
@@ -830,8 +955,9 @@ class AiControlPlaneTests(APITestCase):
         self.assertEqual(response.data['status'], 'stopped')
         self.assertFalse(response.data['running'])
 
-        self.camera.refresh_from_db()
-        self.assertEqual(self.camera.status, 'inactive')
+        reg = AIRuntimeRegistration.objects.get(camera=self.camera)
+        self.assertFalse(reg.desired_enabled)
+        self.assertFalse(reg.observed_enabled)
 
     @patch('requests.get')
     @patch('requests.post')
@@ -957,3 +1083,141 @@ class AiControlPlaneTests(APITestCase):
 
         response = self.client.get(f'/api/ai/frame/{other_camera.ai_camera_id}/')
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+
+@override_settings(
+    REST_FRAMEWORK={
+        'DEFAULT_AUTHENTICATION_CLASSES': [
+            'rest_framework_simplejwt.authentication.JWTAuthentication',
+        ],
+        'DEFAULT_PERMISSION_CLASSES': [
+            'rest_framework.permissions.IsAuthenticated',
+        ],
+    },
+)
+class CameraAISyncFlowTests(APITestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.user = User.objects.create_user(username='camera-owner', password='password123')
+        self.tenant = Tenant.objects.create(name='Camera Sync Tenant')
+        Membership.objects.create(user=self.user, tenant=self.tenant, role='owner')
+        token_resp = self.client.post(
+            '/api/auth/token/',
+            {'username': 'camera-owner', 'password': 'password123'},
+            format='json',
+        )
+        self.client.credentials(
+            HTTP_AUTHORIZATION=f"Bearer {token_resp.data['access']}",
+            HTTP_X_TENANT_ID=str(self.tenant.id),
+        )
+        self.camera = Camera.objects.create(
+            tenant=self.tenant,
+            name='Main Door',
+            site='Entrance',
+            rtsp_url='rtsp://camera.local/main-door',
+            ai_camera_id='main-door',
+            stream_path='main-door',
+            status=Camera.Status.ACTIVE,
+        )
+
+    def _make_ready_path(self):
+        desired_path = MediaMTXDesiredPath.objects.create(
+            camera=self.camera,
+            stream_path='main-door',
+            desired_enabled=True,
+            source_uri='rtsp://camera.local/main-door',
+            source_kind='native',
+            path_generation=1,
+            last_applied_generation=1,
+            last_error='',
+            last_verified_at=timezone.now(),
+        )
+        MediaMTXObservedPathState.objects.create(
+            desired_path=desired_path,
+            observed_enabled=True,
+            observed_source='rtsp://camera.local/main-door',
+            observed_payload={"source": "rtsp://camera.local/main-door"},
+            observed_at=timezone.now(),
+            last_error='',
+        )
+        return desired_path
+
+    @patch('requests.get')
+    @patch('requests.post')
+    def test_sync_to_ai_requires_ready_relay(self, mock_post, mock_get):
+        MediaMTXDesiredPath.objects.create(
+            camera=self.camera,
+            stream_path='main-door',
+            desired_enabled=True,
+            source_uri='rtsp://camera.local/main-door',
+            source_kind='native',
+            path_generation=2,
+            last_applied_generation=1,
+        )
+
+        response = self.client.post(f'/api/cameras/{self.camera.id}/sync_to_ai/', {}, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+        self.assertEqual(response.data['code'], 'relay_apply_pending')
+        self.assertFalse(AIRuntimeRegistration.objects.filter(camera=self.camera, desired_enabled=True).exists())
+        mock_post.assert_not_called()
+        mock_get.assert_not_called()
+
+    @patch('requests.get')
+    @patch('requests.post')
+    def test_sync_to_ai_marks_camera_synced_only_after_runtime_starts(self, mock_post, mock_get):
+        self._make_ready_path()
+
+        register_resp = MagicMock(status_code=201, text='ok')
+        register_resp.json.return_value = {'camera_id': 'main-door', 'hot_loaded': True}
+        runtime_resp = MagicMock(status_code=200, text='ok')
+        runtime_resp.json.return_value = {'running': True}
+        status_resp = MagicMock()
+        status_resp.ok = True
+        status_resp.json.return_value = {'running': True}
+
+        mock_post.side_effect = [register_resp, runtime_resp]
+        mock_get.return_value = status_resp
+
+        response = self.client.post(f'/api/cameras/{self.camera.id}/sync_to_ai/', {}, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['status'], 'synced')
+        self.assertTrue(response.data['running'])
+
+        reg = AIRuntimeRegistration.objects.get(camera=self.camera)
+        self.assertTrue(reg.desired_enabled)
+        self.assertTrue(reg.observed_enabled)
+
+    @patch('requests.get')
+    @patch('requests.post')
+    def test_runtime_control_disable_keeps_camera_active_for_monitoring(self, mock_post, mock_get):
+        self._make_ready_path()
+        AIRuntimeRegistration.objects.create(
+            camera=self.camera,
+            desired_enabled=True,
+            observed_enabled=True,
+        )
+
+        runtime_resp = MagicMock(status_code=200, text='ok')
+        runtime_resp.json.return_value = {'running': False}
+        status_resp = MagicMock()
+        status_resp.ok = True
+        status_resp.json.return_value = {'running': False}
+
+        mock_post.return_value = runtime_resp
+        mock_get.return_value = status_resp
+
+        response = self.client.post(
+            f'/api/cameras/{self.camera.id}/runtime_control/',
+            {'enabled': False},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data['running'])
+
+        self.camera.refresh_from_db()
+        self.assertEqual(self.camera.status, Camera.Status.ACTIVE)
+        reg = AIRuntimeRegistration.objects.get(camera=self.camera)
+        self.assertFalse(reg.desired_enabled)

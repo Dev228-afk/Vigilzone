@@ -18,6 +18,23 @@ from api.models import Camera
 MEDIAMTX_PAYLOAD_RENDERER_VERSION = 4
 
 
+def sanitize_stream_url(url: str) -> str:
+    """Trim whitespace and accidental wrapping quotes from camera URLs."""
+    value = str(url or "").strip()
+    while len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"', "`"}:
+        value = value[1:-1].strip()
+    while value and value[0] in {"'", '"', "`"}:
+        value = value[1:].strip()
+    while value and value[-1] in {"'", '"', "`"}:
+        value = value[:-1].strip()
+    return value
+
+
+def host_looks_local(hostname: str) -> bool:
+    host = str(hostname or "").strip().lower()
+    return host in {"127.0.0.1", "localhost", "0.0.0.0", "::1", "[::1]"}
+
+
 def hash_mediamtx_payload(payload: dict) -> str:
     """Stable hash of meaningful MediaMTX config fields.
 
@@ -33,6 +50,11 @@ def hash_mediamtx_payload(payload: dict) -> str:
         "runOnInitRestart": payload.get("runOnInitRestart"),
         "runOnDemandRestart": payload.get("runOnDemandRestart"),
         "rtspTransport": payload.get("rtspTransport", ""),
+        "runOnDemandStartTimeout": payload.get("runOnDemandStartTimeout"),
+        "runOnDemandCloseAfter": payload.get("runOnDemandCloseAfter"),
+        "sourceOnDemandStartTimeout": payload.get("sourceOnDemandStartTimeout"),
+        "sourceOnDemandCloseAfter": payload.get("sourceOnDemandCloseAfter"),
+        "sourceFingerprint": payload.get("sourceFingerprint"),
     }
     # Remove None values for stable serialization
     significant = {k: v for k, v in significant.items() if v is not None}
@@ -92,10 +114,10 @@ def normalize_stream_url(url: str) -> str:
     - Removes default ports (554 for rtsp, 80 for http, 443 for https)
     - Normalizes empty paths
     """
+    url = sanitize_stream_url(url)
     if not url:
         return ""
-    
-    url = url.strip()
+
     try:
         parsed = urlparse(url)
     except Exception:
@@ -133,9 +155,10 @@ def is_self_referential(url: str) -> bool:
     Works in local dev, Docker, and cloud environments because it
     checks against ``RELAY_RTSP_ALIASES`` (driven by settings/env).
     """
+    url = sanitize_stream_url(url)
     if not url:
         return False
-    parsed = urlparse(url.strip())
+    parsed = urlparse(url)
     hostname = (parsed.hostname or "").lower()
     port = parsed.port  # None when not specified in the URL
 
@@ -163,7 +186,7 @@ def get_mediamtx_loopback_url(stream_path: str) -> str:
 
 def classify_camera_source(url: str) -> str:
     """Classify a camera source URL into a source kind string."""
-    lowered = url.strip().lower()
+    lowered = sanitize_stream_url(url).lower()
     if lowered.startswith((
         "rtsp://", "rtsps://", "rtmp://", "rtmps://",
         "srt://", "whep://", "wheps://"
@@ -267,14 +290,14 @@ def build_mediamtx_path_payload(
     # ── Gate 2: Native RTSP / HLS pull ────────────────────────────
     if source_kind in ("native", "hls"):
         payload = {
-            "source": camera.rtsp_url,
+            "source": sanitize_stream_url(camera.rtsp_url),
             "sourceOnDemand": not persistent,
         }
         if not persistent:
             payload["sourceOnDemandStartTimeout"] = "30s"
             payload["sourceOnDemandCloseAfter"] = "10s"
 
-        if source_kind == "native" and camera.rtsp_url.strip().lower().startswith("rtsp"):
+        if source_kind == "native" and sanitize_stream_url(camera.rtsp_url).lower().startswith("rtsp"):
             payload["rtspTransport"] = "tcp"
         if camera.source_fingerprint:
             payload["sourceFingerprint"] = camera.source_fingerprint
@@ -282,7 +305,7 @@ def build_mediamtx_path_payload(
 
     # ── Gate 3: MJPEG / Snapshot (FFmpeg Bridge) ──────────────────
     elif source_kind in ("mjpeg", "snapshot"):
-        escaped_url = camera.rtsp_url.replace('"', '\\"')
+        escaped_url = sanitize_stream_url(camera.rtsp_url).replace('"', '\\"')
         input_url = escaped_url
 
         ffmpeg_cmd = 'ffmpeg -nostdin -loglevel warning '
